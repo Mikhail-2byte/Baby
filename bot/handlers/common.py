@@ -39,7 +39,7 @@ async def show_panel(message: Message, bot: Bot, family: Family) -> None:
 
     Идёт мимо дебаунса: человек попросил явно и ждёт результата сейчас.
     """
-    await panel.refresh(bot, family.id, last_message_id=message.message_id + 1000)
+    await panel.refresh(bot, family.id, force_new=True)
 
 
 @router.message(IN_GROUP, Command("cancel"))

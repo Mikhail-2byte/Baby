@@ -85,11 +85,17 @@ async def refresh(
     family_id: int,
     last_message_id: int | None = None,
     now: datetime | None = None,
+    *,
+    force_new: bool = False,
 ) -> None:
     """Пересобрать панель семьи: отредактировать или выпустить новую.
 
     `last_message_id` — самое свежее сообщение чата, какое мы видели. По нему
     считается, далеко ли уехала панель.
+
+    `force_new` — выпустить новую, не пытаясь править старую. Нужен `/panel`:
+    человек попросил панель явно, значит он её не видит, и правка невидимого
+    сообщения выглядела бы как «бот не ответил».
     """
     # Сначала лок, потом сессия: стоять в очереди, держа соединение SQLite,
     # незачем — тикер пишет в ту же базу
@@ -97,7 +103,10 @@ async def refresh(
         family = await repo.get_family_by_id(session, family_id)
         if family is None:
             return
-        await _redraw(bot, session, family, last_message_id, now or tu.now_utc())
+        await _redraw(
+            bot, session, family, last_message_id, now or tu.now_utc(),
+            force_new=force_new,
+        )
 
 
 async def refresh_stale(
@@ -156,10 +165,13 @@ async def _redraw(
     family: Family,
     last_message_id: int | None,
     now: datetime,
+    *,
+    force_new: bool = False,
 ) -> None:
     text, markup = await _build(session, family, now)
 
-    if family.panel_message_id is not None and not _outdated(family, now, last_message_id):
+    stale = force_new or _outdated(family, now, last_message_id)
+    if family.panel_message_id is not None and not stale:
         status = await sending.edit(bot, family, family.panel_message_id, text, markup)
         if status in (sending.OK, sending.RETRY, sending.BROKEN):
             # Единственный внешний признак, что дебаунс сработал: на серию

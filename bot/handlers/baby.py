@@ -183,4 +183,4 @@ async def _finish(
 
     log.info("Заведён ребёнок #%s в семье #%s", child.id, family.id)
     await message.answer(texts.BABY_SAVED)
-    await panel.refresh(bot, family.id, last_message_id=message.message_id + 1000)
+    await panel.refresh(bot, family.id, force_new=True)

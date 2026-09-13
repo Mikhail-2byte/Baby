@@ -201,3 +201,20 @@ async def test_shutdown_cancels_pending_debounce(
     await panel.shutdown()
     assert panel._tasks == {}
     assert bot.sent == []
+
+
+@pytest.mark.asyncio
+async def test_force_new_issues_a_fresh_panel(
+    session_maker, family, child, bot, monkeypatch
+):
+    """`/panel` выпускает новую, а не правит старую.
+
+    Человек попросил панель явно — значит он её не видит, и правка невидимого
+    сообщения выглядела бы как «бот не ответил».
+    """
+    monkeypatch.setattr(panel, "Session", session_maker)
+    await panel.refresh(bot, family.id)
+    await panel.refresh(bot, family.id, force_new=True)
+
+    assert len(bot.sent) == 2
+    assert bot.edited == []
