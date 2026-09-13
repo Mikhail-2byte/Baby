@@ -17,7 +17,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from bot.db import repo
 from bot.db.models import Base
-from bot.services import backup, panel, pending, ticker
+from bot.services import backup, panel, pending, qa_log, ticker
 
 
 @pytest.fixture(autouse=True)
@@ -42,6 +42,19 @@ def _backup_dir(tmp_path, monkeypatch):
     monkeypatch.setattr(backup, "DIR", tmp_path / "backups")
     monkeypatch.setattr(backup, "TMP", tmp_path / "backups" / "snapshot.part")
     monkeypatch.setattr(backup, "_failed_on", None)
+
+
+@pytest.fixture(autouse=True)
+def _qa_log(tmp_path, monkeypatch):
+    """Лог вопросов и счётчик квоты уводятся в tmp.
+
+    Счётчик живёт в модуле и переживает тест, а путь вычисляется на импорте от
+    `settings.db_path` — без подмены тесты писали бы в боевой `data/qa.log`.
+    """
+    monkeypatch.setattr(qa_log, "PATH", tmp_path / "qa.log")
+    qa_log.reset()
+    yield
+    qa_log.reset()
 
 
 @pytest.fixture(autouse=True)

@@ -59,6 +59,15 @@ class StatsCB(CallbackData, prefix="st"):
     period: str
 
 
+class AskCB(CallbackData, prefix="ask"):
+    """Кнопка «Вопрос» на панели.
+
+    Полей нет и не предвидится: вопрос приходит следующей репликой, а не
+    кнопкой. Отдельный класс всё равно свой — см. докстроку модуля про то,
+    как стареют кнопки в истории чата.
+    """
+
+
 class SexCB(CallbackData, prefix="sex"):
     value: str
 
@@ -122,6 +131,9 @@ def panel(*, running_kind: str | None) -> InlineKeyboardMarkup:
         ),
         InlineKeyboardButton(
             text="📊 Сутки", callback_data=StatsCB(period="today").pack()
+        ),
+        InlineKeyboardButton(
+            text="❓ Вопрос", callback_data=AskCB().pack()
         ),
         InlineKeyboardButton(
             text="🔄", callback_data=PanelCB(action="refresh").pack()
