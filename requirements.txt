@@ -1,0 +1,21 @@
+# Telegram
+aiogram>=3.31,<4
+# Без него aiogram не соберёт AiohttpSession с прокси, и TELEGRAM_PROXY
+# окажется мёртвой настройкой. Прокси здесь не опция: api.telegram.org
+# из России не открывается
+aiohttp-socks>=0.10
+
+# БД
+SQLAlchemy[asyncio]>=2.0,<2.1
+aiosqlite>=0.20
+alembic>=1.14
+
+# Настройки
+pydantic-settings>=2.6
+
+# Время. tzdata обязателен на Windows: zoneinfo там не находит системную базу
+python-dateutil>=2.9
+tzdata>=2024.2
+
+# HTTP к LLM и STT (этапы 6-7)
+httpx>=0.28

@@ -1,0 +1,52 @@
+﻿<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Description>Family planer: Telegram-bot semejnogo planirovshchika. Zapusk cherez run-baby-hidden.vbs (bez okna konsoli) -&gt; run.cmd (migracii + long polling), log v data\bot.log. Vtoroj trigger kazhdye 5 minut - storozh: esli process umer, on podnimetsya sam; poka rabotaet, IgnoreNew ne daet zapustit vtoroj ekzemplyar.</Description>
+    <URI>\BabyBot</URI>
+  </RegistrationInfo>
+  <Principals>
+    <Principal id="Author">
+      <UserId>S-1-5-21-626813700-3579368893-4055733449-1002</UserId>
+      <LogonType>InteractiveToken</LogonType>
+    </Principal>
+  </Principals>
+  <Settings>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <RestartOnFailure>
+      <Count>999</Count>
+      <Interval>PT1M</Interval>
+    </RestartOnFailure>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <IdleSettings>
+      <StopOnIdleEnd>false</StopOnIdleEnd>
+      <RestartOnIdle>false</RestartOnIdle>
+    </IdleSettings>
+    <UseUnifiedSchedulingEngine>true</UseUnifiedSchedulingEngine>
+  </Settings>
+  <Triggers>
+    <LogonTrigger>
+      <Delay>PT1M</Delay>
+      <UserId>DESKTOP-4LF56KM\Михаил</UserId>
+    </LogonTrigger>
+    <CalendarTrigger>
+      <StartBoundary>2026-08-29T00:02:00</StartBoundary>
+      <Repetition>
+        <Interval>PT5M</Interval>
+        <Duration>P1D</Duration>
+      </Repetition>
+      <ScheduleByDay>
+        <DaysInterval>1</DaysInterval>
+      </ScheduleByDay>
+    </CalendarTrigger>
+  </Triggers>
+  <Actions Context="Author">
+    <Exec>
+      <Command>wscript.exe</Command>
+      <Arguments>"C:\Projeck\_quiet\run-baby-hidden.vbs"</Arguments>
+      <WorkingDirectory>C:\Projeck\Baby</WorkingDirectory>
+    </Exec>
+  </Actions>
+</Task>
