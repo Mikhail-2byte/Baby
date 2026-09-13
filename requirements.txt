@@ -13,6 +13,14 @@ alembic>=1.14
 # Настройки
 pydantic-settings>=2.6
 
+# Всё медицинское содержание — данные, а не код: redflags.yaml и weeks.yaml
+# читаются на импорте `services/redflags.py` и `services/stage.py`, а те лежат
+# на пути импорта из `__main__`. Без PyYAML бот не стартует вовсе.
+#
+# Был пропущен: пакет стоял в .venv транзитивно, и локально всё работало,
+# а чистая установка по этому файлу давала ImportError на старте
+PyYAML>=6.0
+
 # Время. tzdata обязателен на Windows: zoneinfo там не находит системную базу
 python-dateutil>=2.9
 tzdata>=2024.2

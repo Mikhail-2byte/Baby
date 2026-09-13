@@ -167,7 +167,7 @@ Aiogram переподключается сам, но логи от этого �
 
 ```cmd
 .venv\Scripts\python -m pytest -q
-.venv\Scripts\python -m ruff check bot tests
+.venv\Scripts\python -m ruff check bot tests kb
 .venv\Scripts\python -m mypy
 ```
 

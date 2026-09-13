@@ -72,7 +72,7 @@ async def test_weight_points_use_corrected_age(session, child, mother, born, who
         taken_at=born + timedelta(days=30), value=3600.0,
     )
 
-    points, _, _ = await charts.collect_weight(session, child, tu.now_utc())
+    points, _, _ = await charts.collect_weight(session, child)
     assert points[0][0] == 30 - 21
 
 
@@ -86,7 +86,7 @@ async def test_bands_extend_past_the_last_point(session, child, mother, born, wh
     await repo.add_measurement(
         session, child.id, mother.id, WEIGHT, taken_at=born, value=3420.0
     )
-    points, bands, _ = await charts.collect_weight(session, child, tu.now_utc())
+    points, bands, _ = await charts.collect_weight(session, child)
     assert bands[-1].day > points[-1][0]
 
 
@@ -96,7 +96,7 @@ async def test_bands_are_ordered(session, child, mother, born, who_table):
     await repo.add_measurement(
         session, child.id, mother.id, WEIGHT, taken_at=born, value=3420.0
     )
-    _, bands, _ = await charts.collect_weight(session, child, tu.now_utc())
+    _, bands, _ = await charts.collect_weight(session, child)
     for band in bands:
         assert band.sd2neg < band.sd1neg < band.median < band.sd1 < band.sd2
 

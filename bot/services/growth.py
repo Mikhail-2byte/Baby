@@ -121,8 +121,33 @@ async def lms_at(
     )
 
 
-def _sd_at(l: float, m: float, s: float, n: float) -> float:  # noqa: E741
-    """Значение показателя на `n` стандартных отклонений от медианы."""
+async def lms_range(
+    session: AsyncSession, sex: str, indicator: str, from_days: int, to_days: int
+) -> dict[int, tuple[float, float, float]]:
+    """Коэффициенты на весь отрезок сразу — один запрос вместо запроса на день.
+
+    Нужна графику: центильные коридоры рисуются по каждому дню диапазона, и
+    `lms_at` в цикле давала около четырёхсот обращений к базе на одну картинку.
+    Интерполяции здесь нет намеренно — таблицы идут по дням, а дырки на
+    графике честнее выдуманной точки.
+    """
+    rows = await session.scalars(
+        select(WhoLms).where(
+            WhoLms.sex == sex,
+            WhoLms.indicator == indicator,
+            WhoLms.age_days >= from_days,
+            WhoLms.age_days <= to_days,
+        )
+    )
+    return {row.age_days: (row.l, row.m, row.s) for row in rows}
+
+
+def sd_at(l: float, m: float, s: float, n: float) -> float:  # noqa: E741
+    """Значение показателя на `n` стандартных отклонений от медианы.
+
+    Публичная: по ней `charts.py` строит центильные коридоры. Имя без
+    подчёркивания именно поэтому — приватным оно было только на вид.
+    """
     if l == 0:
         return m * math.exp(s * n)
     return m * (1 + l * s * n) ** (1 / l)
@@ -153,9 +178,9 @@ def zscore(
         return z
 
     if z > 3:
-        sd3, sd2 = _sd_at(l, m, s, 3), _sd_at(l, m, s, 2)
+        sd3, sd2 = sd_at(l, m, s, 3), sd_at(l, m, s, 2)
         return 3 + (value_who - sd3) / (sd3 - sd2)
-    sd3, sd2 = _sd_at(l, m, s, -3), _sd_at(l, m, s, -2)
+    sd3, sd2 = sd_at(l, m, s, -3), sd_at(l, m, s, -2)
     return -3 + (value_who - sd3) / (sd2 - sd3)
 
 

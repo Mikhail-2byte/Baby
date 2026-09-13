@@ -37,6 +37,29 @@ CONTENT = Path(__file__).resolve().parent.parent / "content" / "redflags.yaml"
 
 EMERGENCY = "emergency"
 URGENT = "urgent"
+LEVELS = frozenset({EMERGENCY, URGENT})
+
+# Пороги, которые читает код. Список нужен затем, чтобы опечатка в имени ключа
+# или выпавшая строка в YAML роняли бота на старте, а не давали `KeyError` на
+# первом тревожном сообщении — то есть ночью и у семьи. Это ровно то, что
+# обещает докстринг `_load`, и чего он до сих пор не делал: проверялось только
+# «флагов не ноль».
+REQUIRED_THRESHOLDS = frozenset({
+    "fever_c",
+    "fever_c_watch",
+    "fever_c_older",
+    "fever_age_days",
+    "hypothermia_c",
+    "temp_min_c",
+    "temp_max_c",
+    "temp_normal_c",
+    "min_wet_diapers",
+    "wet_diapers_from_day",
+    "weight_loss_percent",
+    "weight_loss_max_age_days",
+    "feeding_gap_hours",
+    "feeding_gap_age_days",
+})
 
 # Слова, отменяющие найденный признак. Ищутся в окне вокруг совпадения.
 #
@@ -55,10 +78,34 @@ NEGATIONS = frozenset({"не", "нет", "без", "прошла", "прошел
 NEGATION_WINDOW = 2
 
 # Числа, похожие на температуру: 38, 38.2, 36,5. Дробная часть необязательна,
-# но от неё зависит, нужно ли рядом слово «температура» — см. `find_temperature`
+# но от неё зависит, нужно ли в сообщении слово о температуре — см.
+# `find_temperatures`
 NUMBER = re.compile(r"\b(\d{2})(?:[.,](\d))?\b")
 
 TEMP_WORDS = ("температур", "темпа", "градус", "°", "жар", "лихорад")
+
+# Единицы, после которых число температурой не является. Это язык, а не
+# медицина: ни симптомов, ни порогов здесь нет, поэтому список живёт в коде,
+# а не в YAML.
+#
+# Появился он не из осторожности впрок. Пока его не было, слово о температуре
+# искалось по ВСЕМУ сообщению, и любое двузначное число в 34–43 становилось
+# температурой: «температура нормальная, съела 40 мл» поднимало EMERGENCY со
+# словами «звоните 103». Достижимо буквально — бот сам спрашивает «сколько мл?».
+#
+# Слова перечислены ЦЕЛИКОМ, а не основами, и сравниваются на равенство.
+# Основы здесь опасны: «гр» как основа съедает «градуса», и «35.4 градуса»
+# переставало быть температурой. Поймано тестом в тот же прогон
+NOT_TEMPERATURE_AFTER = frozenset({
+    "мл", "ml", "мг", "г", "гр", "грамм", "граммов", "кг", "килограмм",
+    "мин", "минут", "минута", "минуты", "минуту",
+    "час", "часа", "часов", "сек", "секунд",
+    "дн", "день", "дня", "дней", "суток", "сутки",
+    "недель", "неделя", "недели", "неделю",
+    "мес", "месяц", "месяца", "месяцев",
+    "раз", "раза", "шт", "капель", "капли", "капля",
+    "процент", "процента", "процентов", "мм", "см",
+})
 
 
 @dataclass(frozen=True)
@@ -111,6 +158,15 @@ def _load() -> tuple[dict[str, float], tuple[Flag, ...]]:
     )
     if not flags:
         raise ValueError("В redflags.yaml нет ни одного признака")
+
+    missing = sorted(REQUIRED_THRESHOLDS - set(thresholds))
+    if missing:
+        raise ValueError(f"В redflags.yaml не хватает порогов: {missing}")
+
+    wrong = sorted({f.id for f in flags if f.level not in LEVELS})
+    if wrong:
+        raise ValueError(f"В redflags.yaml неизвестный level у признаков: {wrong}")
+
     return thresholds, flags
 
 
@@ -174,15 +230,31 @@ def _age_fits(flag: Flag, age_days: int | None) -> bool:
     return not (flag.age_max_days is not None and age_days > flag.age_max_days)
 
 
-def find_temperature(text: str) -> float | None:
-    """Температура, названная в тексте, или `None`.
+def _unit_follows(text: str, end: int) -> bool:
+    """Сразу за числом стоит единица измерения, и это не градусы."""
+    after = _words(text[end:])
+    return bool(after) and after[0] in NOT_TEMPERATURE_AFTER
 
-    Целое число принимаем только рядом со словом о температуре: «38» само по
-    себе в этом боте с равным успехом означает миллилитры в бутылочке. Дробное
-    в диапазоне 34–43 берём и без слова — «38.2 мл» никто не пишет.
+
+def find_temperatures(text: str) -> list[float]:
+    """Все числа в тексте, похожие на температуру. Порядок — как в сообщении.
+
+    Целое число принимаем только при слове о температуре в сообщении: «38» само
+    по себе в этом боте с равным успехом означает миллилитры в бутылочке.
+    Дробное в диапазоне 34–43 берём и без слова — «38.2 мл» никто не пишет.
+
+    Но слова в сообщении мало. «Температура нормальная, съела 40 мл» содержит и
+    слово, и число 40 в диапазоне — и раньше поднимало EMERGENCY. Поэтому число,
+    за которым стоит чужая единица, отбрасывается: см. `NOT_TEMPERATURE_AFTER`.
+
+    Возвращаем список, а не первое найденное. Раньше функция выходила на первом
+    же подходящем числе, и «утром было 36,6 а сейчас 39,5» разбиралось как 36.6
+    — то есть молчанием. Пропуск в опасную сторону, ровно тот, ради которого
+    здесь стоит поиск подстроки, а не модель.
     """
     haystack = normalize(text)
     has_word = any(word in haystack for word in TEMP_WORDS)
+    found: list[float] = []
 
     for match in NUMBER.finditer(haystack):
         whole, fraction = match.group(1), match.group(2)
@@ -191,10 +263,25 @@ def find_temperature(text: str) -> float | None:
             continue
         if fraction is None and not has_word:
             continue
+        if _unit_follows(haystack, match.end()):
+            continue
         if _negated(haystack, match.start(), match.end()):
             continue
-        return value
-    return None
+        found.append(value)
+    return found
+
+
+def find_temperature(text: str) -> float | None:
+    """Самое далёкое от нормы из названных чисел, или `None`.
+
+    Из нескольких названных температур интересна крайняя: сообщение про рост
+    («было 36,6, стало 39,5») описывает 39,5, а не 36,6. Какая из них тяжелее
+    по порогам, решает уже `temperature_hit` — здесь только выбор числа.
+    """
+    values = find_temperatures(text)
+    if not values:
+        return None
+    return max(values, key=lambda value: abs(value - THRESHOLDS["temp_normal_c"]))
 
 
 def temperature_hit(value: float, age_days: int | None) -> Hit | None:
@@ -204,7 +291,15 @@ def temperature_hit(value: float, age_days: int | None) -> Hit | None:
     всём боте: это консенсус AAP, NHS и NICE, и он срабатывает даже тогда,
     когда в остальном ребёнок выглядит спокойным.
     """
-    young = age_days is not None and age_days <= THRESHOLDS["fever_age_days"]
+    # Возраст неизвестен — считаем младенцем, а не отменяем проверку.
+    #
+    # Раньше здесь стояло `age_days is not None and …`, и без заполненной
+    # карточки ребёнка обе младенческие ветки (38.0 и 37.5) пропускались:
+    # «температура 38» не поднимала ничего вовсе. Это прямо противоречило
+    # `handlers/alarm.py`, где записано «молчать из-за незаполненной анкеты
+    # нельзя», и `_age_fits`, который так и устроен. Отказ обязан идти в
+    # сторону лишней тревоги, а не пропущенной
+    young = age_days is None or age_days <= THRESHOLDS["fever_age_days"]
 
     if value <= THRESHOLDS["hypothermia_c"] and young:
         return Hit(
@@ -289,13 +384,31 @@ def triage(text: str, age_days: int | None = None) -> list[Hit]:
     """
     hits = list(find_phrases(text, age_days))
 
-    value = find_temperature(text)
-    if value is not None:
-        hit = temperature_hit(value, age_days)
-        if hit is not None:
-            # Температура идёт первой: из всех признаков у неё самый чёткий порог
-            hits.insert(0, hit)
+    hit = _worst_temperature_hit(find_temperatures(text), age_days)
+    if hit is not None:
+        # Температура идёт первой: из всех признаков у неё самый чёткий порог
+        hits.insert(0, hit)
     return hits
+
+
+def _worst_temperature_hit(values: list[float], age_days: int | None) -> Hit | None:
+    """Самый тяжёлый из порогов, на которые попали названные температуры.
+
+    Считаем по каждому числу, а не только по крайнему: пороги несимметричны
+    (36.0 снизу и 38.0 сверху), и «крайнее от нормы» не обязано быть самым
+    тяжёлым по уровню. При равном уровне побеждает то, что дальше от нормы —
+    в сообщении про рост говорить надо о верхнем числе.
+    """
+    best: Hit | None = None
+    best_key = (False, -1.0)
+    for value in values:
+        hit = temperature_hit(value, age_days)
+        if hit is None:
+            continue
+        key = (hit.flag.level == EMERGENCY, abs(value - THRESHOLDS["temp_normal_c"]))
+        if key > best_key:
+            best, best_key = hit, key
+    return best
 
 
 def worst(hits: list[Hit]) -> str | None:
@@ -351,9 +464,17 @@ def check_wet_diapers(count: int, age_days: int, has_records: bool) -> Watch | N
     )
 
 
-def check_weight_loss(percent: float | None) -> Watch | None:
-    """Потеря массы больше 10% от веса при рождении."""
+def check_weight_loss(percent: float | None, reading_age_days: float) -> Watch | None:
+    """Потеря массы больше порога от веса при рождении.
+
+    `reading_age_days` — давность самого взвешивания. Судить по старому нельзя:
+    тревога поднимается раз в сутки, и единственное измерение недельной
+    давности слало бы одно и то же сообщение каждый день до следующего
+    взвешивания. Про сегодняшнего ребёнка оно при этом уже ничего не говорит.
+    """
     if percent is None or percent < THRESHOLDS["weight_loss_percent"]:
+        return None
+    if reading_age_days > THRESHOLDS["weight_loss_max_age_days"]:
         return None
     return Watch(
         id="weight_loss",

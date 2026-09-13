@@ -6,6 +6,7 @@
 """
 
 import csv
+import re
 from datetime import timedelta
 
 import pytest
@@ -113,6 +114,21 @@ def test_plain_keeps_labels_that_came_as_words():
     assert export._plain(line) == line
 
 
+# Объекты страниц. «(?![s])» отсекает узел дерева «/Type /Pages», который иначе
+# считался бы ещё одной страницей.
+#
+# Отдельная функция появилась не от любви к аккуратности. Раньше здесь стояло
+# «count(b"/Type /Page" + перевод строки) >= 3 or count(b"/Page") >= 3»: левая
+# часть не находит ничего вообще (после «/Page» перевода строки нет), а правая
+# даёт 3 уже на одностраничном PDF. Тест с именем «has_three_pages» не мог
+# упасть никогда, и пропажа обоих графиков прошла бы мимо него.
+_PAGE = re.compile(rb"/Type\s*/Page(?![s])")
+
+
+def _pages(payload: bytes) -> int:
+    return len(_PAGE.findall(payload))
+
+
 @pytest.mark.asyncio
 async def test_pdf_has_three_pages(session, child, mother, family, now):
     """Сводка, вес, ритм. Страницы без данных просто не появляются."""
@@ -128,8 +144,7 @@ async def test_pdf_has_three_pages(session, child, mother, family, now):
 
     payload = await export._pdf(session, child, family, now)
     assert payload.startswith(b"%PDF-")
-    # Три страницы: обложка + два графика. Считаем по объектам страниц
-    assert payload.count(b"/Type /Page\n") >= 3 or payload.count(b"/Page") >= 3
+    assert _pages(payload) == 3, "обложка + вес + ритм"
 
 
 @pytest.mark.asyncio
@@ -137,6 +152,7 @@ async def test_pdf_survives_without_any_charts(session, child, family, now):
     """Нет ни взвешиваний, ни событий — остаётся одна обложка, и это нормально."""
     payload = await export._pdf(session, child, family, now)
     assert payload.startswith(b"%PDF-")
+    assert _pages(payload) == 1, "только обложка"
 
 
 @pytest.mark.asyncio
@@ -154,3 +170,37 @@ async def test_export_window_is_bounded(session, child, mother, family, now):
     assert tu.to_local(events[0].started_at, family.tz).date() == tu.local_today(
         family.tz, now
     )
+
+
+@pytest.mark.asyncio
+async def test_export_window_bounds_measurements_too(
+    session, child, mother, family, now
+):
+    """Окно ограничивает и взвешивания, а не только события.
+
+    `repo.measurements` отдаёт всё за всю жизнь, и в выгрузке получалась
+    таблица, где события за год, а взвешивания с рождения. Тест на границы
+    проверял только события и этого не видел.
+    """
+    ancient = now - timedelta(days=export.WINDOW_DAYS + 10)
+    await repo.add_measurement(
+        session, child.id, mother.id, WEIGHT, taken_at=ancient, value=3400.0
+    )
+    await repo.add_measurement(
+        session, child.id, mother.id, WEIGHT, taken_at=now, value=5100.0
+    )
+
+    sent: list[bytes] = []
+
+    class Reply:
+        async def answer(self, *args, **kwargs):
+            return None
+
+        async def answer_document(self, document, **kwargs):
+            sent.append(document.data)
+
+    await export.export(Reply(), session, family, child)
+
+    rows = _decode(sent[0]).splitlines()[1:]
+    assert len(rows) == 1, "старое взвешивание в выгрузку попасть не должно"
+    assert "5100" in rows[0]

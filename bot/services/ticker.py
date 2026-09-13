@@ -24,6 +24,7 @@ from bot import texts
 from bot.config import settings
 from bot.db import repo
 from bot.db.models import (
+    DIAPER_KINDS,
     DIAPER_MIXED,
     DIAPER_WET,
     FEED_KINDS,
@@ -335,9 +336,14 @@ async def _watch_child(
     bot: Bot, session: AsyncSession, family: Family, child: Child, now: datetime
 ) -> None:
     today = tu.local_today(family.tz, now)
+    # Возраст здесь ХРОНОЛОГИЧЕСКИЙ, и это не упущение. Пороги этих проверок
+    # отсчитываются от рождения, а не от предполагаемого срока родов: «с пятого
+    # дня жизни подгузников обычно шесть и больше» — про прожитые сутки.
+    # Скорректированный возраст нужен там, где сравнивают с ровесниками, — это
+    # центили и вехи развития, и там он и берётся
     age = growth.age_days(child, now)
 
-    for watch in await _collect_watches(session, family, child, now, age):
+    for watch in await _collect_watches(session, child, now, age):
         if await repo.alert_raised(session, child.id, watch.id, today):
             continue
         status = await sending.deliver(bot, family, texts.watch_alert(watch))
@@ -349,7 +355,7 @@ async def _watch_child(
 
 
 async def _collect_watches(
-    session: AsyncSession, family: Family, child: Child, now: datetime, age: int
+    session: AsyncSession, child: Child, now: datetime, age: int
 ) -> list[redflags.Watch]:
     """Что нашлось в данных. Порядок — по убыванию срочности.
 
@@ -357,22 +363,39 @@ async def _collect_watches(
     решает, хватает ли данных, чтобы судить, и `None` от неё — нормальный
     ответ, а не сбой.
     """
-    start, end = tu.day_bounds(tu.local_today(family.tz, now), family.tz)
     found: list[redflags.Watch | None] = []
 
-    # Потеря веса — по последнему взвешиванию, а не по среднему: важен факт
+    # Потеря веса — по последнему взвешиванию, а не по среднему: важен факт.
+    # Давность измерения передаём отдельно: взвешивание трёхмесячной давности
+    # про сегодняшнего ребёнка уже ничего не говорит, а тревога по нему
+    # поднималась бы каждые сутки до следующего взвешивания
     last_weight = await repo.last_measurement(session, child.id, WEIGHT)
     if last_weight is not None:
-        found.append(growth_watch(child, last_weight.value))
+        age_of_reading = (now - last_weight.taken_at).total_seconds() / 86400
+        found.append(growth_watch(child, last_weight.value, age_of_reading))
 
-    # Подгузники считаем за прошедшую часть суток, но судим только если сутки
-    # уже прошли: в девять утра «мало подгузников» — это не тревога, а утро
-    if end <= now:
-        wet = await repo.count_events(session, child.id, start, end, WET_KINDS)
-        any_wet = await repo.last_event(session, child.id, WET_KINDS)
-        found.append(
-            redflags.check_wet_diapers(wet, age, has_records=any_wet is not None)
-        )
+    # Подгузники считаем за СКОЛЬЗЯЩИЕ сутки, а не за календарные.
+    #
+    # Раньше здесь стояли границы календарного дня и условие «судим, только
+    # если сутки уже прошли» — оно защищало от «мало подгузников» в девять
+    # утра, когда день просто ещё не начался. Беда в том, что `end` — это
+    # конец СЕГОДНЯШНИХ суток, а `now` всегда внутри них: условие было ложно
+    # всегда, и проверка не вызывалась в бою ни разу.
+    #
+    # У скользящих суток проблемы неполного дня нет вовсе: окно всегда ровно
+    # 24 часа, в какой бы час его ни считали. Поэтому и условие больше не нужно
+    wet_from = now - timedelta(hours=24)
+    wet = await repo.count_events_since(session, child.id, wet_from, WET_KINDS)
+    # «Записи есть» — про ЭТО окно, а не «когда-либо». Разница не
+    # теоретическая: семья, записавшая подгузники один раз и бросившая, при
+    # проверке «когда-либо» получала бы «за сутки отмечено мокрых: 0» каждый
+    # день до конца года. Та же болезнь, от которой заведена граница свежести
+    # у взвешивания.
+    #
+    # Считаем подгузники ЛЮБЫЕ, а мокрые — отдельно: если за сутки записаны
+    # три грязных и ни одного мокрого, это не забывчивость, а сам признак
+    logged = await repo.count_events_since(session, child.id, wet_from, DIAPER_KINDS)
+    found.append(redflags.check_wet_diapers(wet, age, has_records=logged > 0))
 
     last_feed = await repo.last_event(session, child.id, FEED_KINDS)
     if last_feed is not None:
@@ -382,5 +405,9 @@ async def _collect_watches(
     return [watch for watch in found if watch is not None]
 
 
-def growth_watch(child: Child, grams: float) -> redflags.Watch | None:
-    return redflags.check_weight_loss(growth.loss_from_birth(child, grams))
+def growth_watch(
+    child: Child, grams: float, reading_age_days: float
+) -> redflags.Watch | None:
+    return redflags.check_weight_loss(
+        growth.loss_from_birth(child, grams), reading_age_days
+    )

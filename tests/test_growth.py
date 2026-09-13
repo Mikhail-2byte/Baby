@@ -70,11 +70,11 @@ def test_median_gives_zero():
 def test_sd_points_round_trip(n):
     """Значение на n стандартных отклонений даёт ровно z = n.
 
-    Проверяет согласованность прямого и обратного преобразования: `_sd_at`
+    Проверяет согласованность прямого и обратного преобразования: `sd_at`
     считает по формуле Бокса–Кокса, `zscore` разворачивает её обратно. Ошибка
     в любой из двух сломала бы равенство.
     """
-    value = growth._sd_at(L0, M0, S0, n)
+    value = growth.sd_at(L0, M0, S0, n)
     assert growth.zscore(value, L0, M0, S0, WEIGHT) == pytest.approx(n, abs=1e-9)
 
 
@@ -92,7 +92,7 @@ def test_upper_tail_becomes_linear(k):
     распределения ведёт себя непредсказуемо, поэтому стандарт заменяет её на
     линейную с шагом, равным расстоянию между третьим и вторым отклонением.
     """
-    sd3, sd2 = growth._sd_at(L0, M0, S0, 3), growth._sd_at(L0, M0, S0, 2)
+    sd3, sd2 = growth.sd_at(L0, M0, S0, 3), growth.sd_at(L0, M0, S0, 2)
     value = sd3 + k * (sd3 - sd2)
     assert growth.zscore(value, L0, M0, S0, WEIGHT) == pytest.approx(3 + k)
 
@@ -104,7 +104,7 @@ def test_lower_tail_becomes_linear(k):
     Знаменатель здесь другой, и перепутать их легко: в тексте стандарта это
     два разных выражения, а не одно со сменой знака.
     """
-    sd3, sd2 = growth._sd_at(L0, M0, S0, -3), growth._sd_at(L0, M0, S0, -2)
+    sd3, sd2 = growth.sd_at(L0, M0, S0, -3), growth.sd_at(L0, M0, S0, -2)
     value = sd3 - k * (sd2 - sd3)
     assert growth.zscore(value, L0, M0, S0, WEIGHT) == pytest.approx(-3 - k)
 
@@ -115,7 +115,7 @@ def test_length_is_not_capped():
     Это не упущение, а текст стандарта, и тест существует затем, чтобы
     «заодно» её сюда не добавили.
     """
-    huge = growth._sd_at(L0, M0, S0, 3) * 2
+    huge = growth.sd_at(L0, M0, S0, 3) * 2
     raw = ((huge / M0) ** L0 - 1) / (L0 * S0)
     assert growth.zscore(huge, L0, M0, S0, "length") == pytest.approx(raw)
 
@@ -245,3 +245,31 @@ async def test_garbage_measurement_gives_no_percentile(session, child, born, gar
     session.add(WhoLms(sex="f", indicator=WEIGHT, age_days=0, l=L0, m=M0, s=S0))
     await session.commit()
     assert await growth.evaluate(session, child, WEIGHT, garbage, born) is None
+
+
+def test_corrected_age_keeps_the_fever_window_open_for_preterm():
+    """Недоношенный дольше остаётся «младше трёх месяцев» — и это правильно.
+
+    Тест сторожит выбор возраста в `handlers/alarm.py`. Там стоял
+    хронологический, и у ребёнка с 34 недель гестации окно порога 38.0
+    закрывалось на три недели раньше срока. Ошибка шла в сторону молчания.
+    """
+    from datetime import datetime
+    from types import SimpleNamespace
+
+    born = datetime(2026, 9, 1, 4, 20)
+    preterm = SimpleNamespace(born_at=born, gestation_weeks=34)
+    term = SimpleNamespace(born_at=born, gestation_weeks=40)
+
+    at = born + timedelta(days=95)
+    assert growth.age_days(preterm, at) == 95
+    # Доношенным считается срок от 37 полных недель, поэтому поправка —
+    # 37 − 34 = три недели, а не «до сорока»
+    assert growth.corrected_age_days(preterm, at) == 95 - 21
+    assert growth.corrected_age_days(term, at) == 95
+
+    from bot.services import redflags as rf
+
+    limit = rf.THRESHOLDS["fever_age_days"]
+    assert growth.age_days(preterm, at) > limit, "по паспорту окно уже закрыто"
+    assert growth.corrected_age_days(preterm, at) <= limit, "по сроку — ещё открыто"

@@ -107,3 +107,51 @@ def test_missed_summary_truncates_long_lists(family):
     assert "30 напоминаний" in text
     assert "и ещё 20" in text
     assert len(text) < 4096
+
+
+# --- Меню команд ----------------------------------------------------------
+
+
+def _registered_commands() -> set[str]:
+    """Все команды, у которых в проекте действительно есть обработчик."""
+    from aiogram.filters import Command
+
+    from bot.handlers import routers
+
+    found: set[str] = set()
+    for router in routers:
+        for handler in router.message.handlers:
+            for item in handler.filters or ():
+                if isinstance(item.callback, Command):
+                    found |= {str(c) for c in item.callback.commands}
+    return found
+
+
+def test_menu_promises_only_what_exists():
+    """Всё из `COMMANDS` обязано иметь обработчик.
+
+    Тест заведён по факту: `/remind` больше года стоял в `COMMANDS`, уезжал в
+    меню группы через `set_my_commands`, а обработчика не было — тап по пункту
+    меню проваливался мимо всех роутеров и не отвечал ничего. Молчание бота на
+    им же предложенную кнопку хуже отсутствия кнопки.
+
+    Обратное неверно и проверяться не должно: `/ping` и `/sos` работают, но в
+    меню им делать нечего — одно диагностическое, второе синоним.
+    """
+    promised = {name for name, _ in texts.COMMANDS}
+    missing = promised - _registered_commands()
+    assert not missing, (
+        f"в меню обещаны команды без обработчика: {sorted(missing)}. "
+        "Либо напишите обработчик, либо уберите из COMMANDS"
+    )
+
+
+def test_help_mentions_only_what_exists():
+    """То же для /help: текст помощи — тоже обещание."""
+    import re
+
+    # Отрицательный просмотр назад на «<» отсекает закрывающие теги
+    # разметки Telegram: «</b>» — это не команда /b
+    mentioned = set(re.findall(r"(?<!<)/([a-z_]+)", texts.HELP))
+    missing = mentioned - _registered_commands()
+    assert not missing, f"/help обещает несуществующее: {sorted(missing)}"

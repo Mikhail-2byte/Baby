@@ -140,13 +140,86 @@ def test_temperature_thresholds(value, age, level):
     assert (hit.flag.level if hit else None) == level
 
 
-def test_temperature_without_known_age_still_fires():
-    """Карточка ребёнка не заполнена — молчать всё равно нельзя.
+@pytest.mark.parametrize(
+    ("value", "level"),
+    [
+        (38.0, rf.EMERGENCY),  # тот самый порог, ради которого всё и затевалось
+        (38.2, rf.EMERGENCY),
+        (37.9, rf.URGENT),
+        (36.0, rf.EMERGENCY),
+        (39.5, rf.EMERGENCY),
+    ],
+)
+def test_temperature_without_known_age_assumes_a_newborn(value, level):
+    """Карточка не заполнена — считаем младенцем, а не отменяем проверку.
 
-    Возраст неизвестен, значит возрастные пороги применить не к чему; но
-    высокая температура остаётся поводом сказать хоть что-то.
+    Тест переписан после находки: раньше он проверял ровно 39.5, то есть
+    проходил вхолостую через ветку «после трёх месяцев» (порог 38.5), а весь
+    диапазон 38.0–38.4 при неизвестном возрасте молчал. «Температура 38» без
+    карточки ребёнка не поднимала ничего вовсе — при том что 38.0 у младше трёх
+    месяцев назван в этом же файле самым важным порогом во всём боте.
+
+    Отсюда и параметры: 38.0 и 38.2 обязаны быть здесь, иначе тест снова станет
+    вхолостую проходящим.
     """
-    assert rf.temperature_hit(39.5, None) is not None
+    hit = rf.temperature_hit(value, None)
+    assert hit is not None
+    assert hit.flag.level == level
+
+
+# --- Разбор температуры: что поймано после аудита -------------------------
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "температура нормальная, съела 40 мл",
+        "спала 40 минут, потом померили температуру",
+        "температура в норме, дали 35 мл смеси",
+    ],
+)
+def test_foreign_units_are_not_a_temperature(text):
+    """Число с чужой единицей — не температура, даже если слово рядом есть.
+
+    Слово о температуре искалось по всему сообщению, и любое двузначное число
+    в 34–43 становилось температурой. «Температура нормальная, съела 40 мл»
+    поднимало EMERGENCY со словами «звоните 103» — в ответ на сообщение, где
+    прямо сказано, что температура нормальная.
+
+    Ложная тревога в три часа ночи стоит доверия ко всем остальным.
+    """
+    assert rf.find_temperatures(text) == []
+    assert rf.triage(text, YOUNG) == []
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("утром было 36,6 а сейчас 39,5", 39.5),
+        ("температура поднялась: 37.2, потом 38.9", 38.9),
+        ("была 38.0, сейчас 36.6", 38.0),
+    ],
+)
+def test_the_worst_of_several_temperatures_wins(text, expected):
+    """Из нескольких названных чисел берём то, что тяжелее, а не первое.
+
+    Функция выходила на первом подходящем числе, и сообщение про РОСТ
+    температуры разбиралось по её началу: «утром было 36,6 а сейчас 39,5» →
+    36.6 → молчание. Пропуск в опасную сторону, ровно тот, ради которого здесь
+    стоит поиск подстроки, а не модель.
+    """
+    assert rf.find_temperature(text) == pytest.approx(expected)
+    assert rf.worst(rf.triage(text, YOUNG)) == rf.EMERGENCY
+
+
+def test_degrees_word_is_not_grams():
+    """«35.4 градуса» — температура, а не 35.4 грамма.
+
+    Список чужих единиц сравнивается на равенство, а не по основе: «гр» как
+    основа съедала «градуса». Поймано тестом в тот же прогон, в который список
+    и появился.
+    """
+    assert rf.find_temperatures("35.4 градуса") == [35.4]
 
 
 # --- Отрицание ------------------------------------------------------------
@@ -337,7 +410,18 @@ def test_wet_diapers_quiet_when_enough():
 )
 def test_weight_loss_threshold(percent, fires):
     """Порог 10% — из клинрекомендаций «Здоровый новорождённый»."""
-    assert (rf.check_weight_loss(percent) is not None) is fires
+    assert (rf.check_weight_loss(percent, reading_age_days=0.0) is not None) is fires
+
+
+def test_weight_loss_ignores_a_stale_reading():
+    """По старому взвешиванию не судят.
+
+    Тревога поднимается раз в сутки, и без этой границы одно измерение с
+    потерей за порогом слало бы одно и то же сообщение каждый день до
+    следующего взвешивания — месяцами, если взвешиваться перестали.
+    """
+    assert rf.check_weight_loss(12.5, reading_age_days=0.5) is not None
+    assert rf.check_weight_loss(12.5, reading_age_days=30.0) is None
 
 
 def test_feeding_gap_only_for_newborns():
@@ -404,11 +488,14 @@ async def test_tracker_watch_speaks_once_a_day(session, family, child, mother, b
     await repo.add_measurement(
         session, child.id, mother.id, WEIGHT, taken_at=now, value=2907.0
     )
-    await repo.add_event(session, child.id, mother.id, DIAPER_WET, started_at=now)
+    # Подгузников достаточно: иначе поднимется вторая, независимая тревога, и
+    # тест перестанет быть про «раз в сутки»
+    for _ in range(6):
+        await repo.add_event(session, child.id, mother.id, DIAPER_WET, started_at=now)
 
     await ticker.watch_tracker(bot, session, now)
     assert len(bot.sent) == 1
-    assert "весе при рождении" in bot.texts[0] or "рождении" in bot.texts[0]
+    assert "рождении" in bot.texts[0]
 
     await ticker.watch_tracker(bot, session, now)
     assert len(bot.sent) == 1, "вторая тревога за те же сутки не нужна"
@@ -416,3 +503,177 @@ async def test_tracker_watch_speaks_once_a_day(session, family, child, mother, b
     # Назавтра признак сохраняется — сказать о нём стоит ещё раз
     await ticker.watch_tracker(bot, session, now + timedelta(days=1))
     assert len(bot.sent) == 2
+
+
+@pytest.mark.asyncio
+async def test_tracker_watch_notices_too_few_wet_diapers(
+    session, family, child, mother, bot
+):
+    """Сторож подгузников доходит до отправки, а не только до юнит-теста.
+
+    Тест заведён по факту: в `_collect_watches` стояло условие
+    `if end <= now`, где `end` — конец СЕГОДНЯШНИХ суток, а `now` всегда внутри
+    них. Условие было ложно всегда, и `check_wet_diapers` в бою не вызывался
+    ни разу — при том что юнит-тесты самой функции были зелёные, а
+    `docs/TASKS.md` числил сторож сделанным.
+
+    Отсюда и форма теста: он идёт через `watch_tracker`, а не через
+    `check_wet_diapers`. Проверять надо стык, он и сломался.
+    """
+    from bot.db import repo
+    from bot.db.models import DIAPER_WET
+    from bot.services import ticker
+    from bot.services import timeutil as tu
+
+    now = tu.now_utc()
+    # Два за сутки при пороге в четыре, начиная с пятого дня жизни
+    for _ in range(2):
+        await repo.add_event(session, child.id, mother.id, DIAPER_WET, started_at=now)
+
+    await ticker.watch_tracker(bot, session, now)
+    assert len(bot.sent) == 1
+    assert "подгузник" in bot.texts[0].lower()
+
+    await ticker.watch_tracker(bot, session, now)
+    assert len(bot.sent) == 1, "вторая тревога за те же сутки не нужна"
+
+
+@pytest.mark.asyncio
+async def test_tracker_watch_counts_a_sliding_day(session, family, child, mother, bot):
+    """Окно — скользящие 24 часа, а не календарный день.
+
+    Шесть подгузников, записанных позавчера, не делают последние сутки
+    благополучными. Именно из-за календарных суток в прежней версии и появилось
+    условие «судим, только если день уже кончился», которое всё и сломало.
+    """
+    from bot.db import repo
+    from bot.db.models import DIAPER_WET
+    from bot.services import ticker
+    from bot.services import timeutil as tu
+
+    now = tu.now_utc()
+    for _ in range(6):
+        await repo.add_event(
+            session, child.id, mother.id, DIAPER_WET,
+            started_at=now - timedelta(hours=30),
+        )
+    # Два внутри окна: семья пишет, и писать есть что
+    for _ in range(2):
+        await repo.add_event(
+            session, child.id, mother.id, DIAPER_WET,
+            started_at=now - timedelta(hours=2),
+        )
+
+    await ticker.watch_tracker(bot, session, now)
+    assert len(bot.sent) == 1, "шесть штук старше суток в счёт идти не должны"
+    assert "подгузник" in bot.texts[0].lower()
+    assert ": 2" in bot.texts[0], "считаться должны только двое свежих"
+
+
+@pytest.mark.asyncio
+async def test_tracker_watch_is_quiet_when_nothing_was_logged(
+    session, family, child, mother, bot
+):
+    """Перестали записывать — это молчание, а не ноль подгузников.
+
+    Без этого сторож превращался бы в машину ежедневного нытья: семья,
+    записавшая подгузники один раз и бросившая, получала бы «за сутки отмечено
+    мокрых: 0» каждый день до конца года. Та же болезнь, от которой заведена
+    граница свежести у взвешивания.
+
+    Проверка «записи вообще были когда-нибудь» здесь не годится именно
+    поэтому — смотреть надо на то же окно, по которому судим.
+    """
+    from bot.db import repo
+    from bot.db.models import DIAPER_WET
+    from bot.services import ticker
+    from bot.services import timeutil as tu
+
+    now = tu.now_utc()
+    for _ in range(6):
+        await repo.add_event(
+            session, child.id, mother.id, DIAPER_WET,
+            started_at=now - timedelta(days=20),
+        )
+
+    await ticker.watch_tracker(bot, session, now)
+    assert bot.sent == []
+
+
+@pytest.mark.asyncio
+async def test_tracker_watch_counts_dirty_as_evidence_of_logging(
+    session, family, child, mother, bot
+):
+    """Грязные записаны, мокрых нет — это признак, а не забывчивость.
+
+    «Записи есть» считаются по подгузникам ЛЮБОГО вида, а сравнивается с
+    порогом счётчик мокрых. Иначе сутки без единого мокрого — то самое, ради
+    чего проверка и заведена, — уходили бы в «наверное, просто не записали».
+    """
+    from bot.db import repo
+    from bot.db.models import DIAPER_DIRTY
+    from bot.services import ticker
+    from bot.services import timeutil as tu
+
+    now = tu.now_utc()
+    for _ in range(3):
+        await repo.add_event(
+            session, child.id, mother.id, DIAPER_DIRTY,
+            started_at=now - timedelta(hours=3),
+        )
+
+    await ticker.watch_tracker(bot, session, now)
+    assert len(bot.sent) == 1
+    assert "подгузник" in bot.texts[0].lower()
+
+
+# --- Содержание проверяется на импорте ------------------------------------
+
+
+def _yaml_without(tmp_path, monkeypatch, drop_threshold=None, break_level=None):
+    """Копия боевого redflags.yaml с одной намеренной порчей."""
+    import yaml
+
+    raw = yaml.safe_load(rf.CONTENT.read_text(encoding="utf-8"))
+    if drop_threshold is not None:
+        del raw["thresholds"][drop_threshold]
+    if break_level is not None:
+        raw["flags"][0]["level"] = break_level
+
+    path = tmp_path / "redflags.yaml"
+    path.write_text(yaml.safe_dump(raw, allow_unicode=True), encoding="utf-8")
+    monkeypatch.setattr(rf, "CONTENT", path)
+    return path
+
+
+def test_missing_threshold_falls_at_import(tmp_path, monkeypatch):
+    """Выпавший порог обязан ронять бота на старте, а не ночью.
+
+    Раньше `_load` проверял только «флагов не ноль». Опечатка в имени ключа
+    или потерянная строка давали `KeyError` на первом тревожном сообщении —
+    то есть у семьи и в три часа ночи. Бот, молча потерявший триаж, опаснее
+    бота, который не запустился: второе заметно сразу.
+    """
+    _yaml_without(tmp_path, monkeypatch, drop_threshold="fever_c")
+    with pytest.raises(ValueError, match="fever_c"):
+        rf._load()
+
+
+def test_unknown_level_falls_at_import(tmp_path, monkeypatch):
+    """Опечатка в `level` не должна молча превращаться в «urgent».
+
+    `worst()` отдаёт EMERGENCY только по точному совпадению строки, а всё
+    остальное считает urgent. Признак, которому написали «emergancy», тихо
+    понижался бы в срочности — то есть «звоните 103» превратилось бы в
+    «свяжитесь с врачом сегодня».
+    """
+    _yaml_without(tmp_path, monkeypatch, break_level="emergancy")
+    with pytest.raises(ValueError, match="level"):
+        rf._load()
+
+
+def test_live_content_passes_its_own_checks():
+    """Боевой файл проходит те же проверки — иначе бот не стартовал бы."""
+    thresholds, flags = rf._load()
+    assert set(thresholds) >= rf.REQUIRED_THRESHOLDS
+    assert {f.level for f in flags} <= rf.LEVELS

@@ -59,14 +59,22 @@ async def export(
     events = await repo.events_between(session, child.id, since, now)
     measures: list[Measurement] = []
     for kind in MEASURE_KINDS:
-        measures.extend(await repo.measurements(session, child.id, kind))
+        # Тем же окном, что и события: врачу нужна одна хронология, а не
+        # таблица, где события за год, а взвешивания за всю жизнь
+        measures.extend(
+            m
+            for m in await repo.measurements(session, child.id, kind)
+            if since <= m.taken_at <= now
+        )
 
     if not events and not measures:
         await message.answer(texts.EXPORT_EMPTY)
         return
 
     stamp = tu.to_local(now, family.tz).strftime("%Y-%m-%d")
-    payload = _csv(child, family.tz, events, measures)
+    # В поток: на четырёхстах днях это тысячи строк плюс сортировка, а
+    # блокировать event loop ради выгрузки незачем — тот же довод, что у графиков
+    payload = await asyncio.to_thread(_csv, child, family.tz, events, measures)
     await message.answer_document(
         BufferedInputFile(payload, f"{_slug(child.name)}-{stamp}.csv"),
         caption=texts.EXPORT_CAPTION.format(
@@ -167,7 +175,7 @@ async def _pdf(
     summary = _plain(texts.week_summary(child, total, days, plain=True))
     header = _plain(texts.baby_card(child, now, family.tz))
 
-    weight_data = await charts.collect_weight(session, child, now)
+    weight_data = await charts.collect_weight(session, child)
     rhythm_data = await charts.collect_rhythm(session, child, family.tz, now)
 
     def build() -> bytes:

@@ -27,9 +27,35 @@ log = logging.getLogger(__name__)
 GROUP_CHATS = {"group", "supergroup"}
 
 
+# Команды, которые мастер обрывать НЕ должны.
+#
+# `/skip` — шаг самого мастера (пропустить вес при рождении); обрыв на нём
+# означал бы, что пропустить шаг вообще нельзя.
+# `/cancel` — чистит состояние сам и сам отвечает; без исключения человек
+# получил бы два сообщения об одной отмене.
+WIZARD_SAFE = frozenset({"skip", "cancel"})
+
+
+def _interrupting_command(event: TelegramObject) -> bool:
+    """Это команда, которая должна прервать мастер?
+
+    Смотрим на текст, а не на фильтры: outer-middleware работает до них, и в
+    этом весь смысл — решение обязано быть одинаковым для всех роутеров, а не
+    зависеть от того, чей фильтр сойдётся первым.
+    """
+    if not isinstance(event, Message):
+        return False
+    text = (event.text or "").strip()
+    if not text.startswith("/"):
+        return False
+    # «/today@BabyBot arg» → «today»
+    name = text[1:].split()[0].split("@")[0].lower()
+    return bool(name) and name not in WIZARD_SAFE
+
+
 async def drop_wizard_state(
     handler: Callable[[TelegramObject, dict[str, Any]], Awaitable[Any]],
-    event: Message,
+    event: TelegramObject,
     data: dict[str, Any],
 ) -> Any:
     """Команда посреди мастера обрывает мастер вслух.
@@ -41,14 +67,22 @@ async def drop_wizard_state(
 
     Ключ состояния — «чат + пользователь», поэтому реплика второго родителя
     чужой мастер не трогает.
+
+    Вешается outer-middleware'ом на `dp.message` (`bot/__main__.py`). Год он
+    пролежал написанным, но не зарегистрированным, и поломка, от которой он
+    придуман, была живой: `/baby` → `/today` → следующая фраза человека молча
+    становилась именем ребёнка.
     """
     state: FSMContext | None = data.get("state")
-    dropped = state is not None and await state.get_state() is not None
-    if dropped and state is not None:  # второе условие — для проверки типов
+    if state is None or not _interrupting_command(event):
+        return await handler(event, data)
+
+    dropped = await state.get_state() is not None
+    if dropped:
         await state.clear()
 
     result = await handler(event, data)
-    if dropped:
+    if dropped and isinstance(event, Message):
         # Ответ на саму команду важнее — уведомление идёт следом
         await event.answer(texts.WIZARD_DROPPED)
     return result

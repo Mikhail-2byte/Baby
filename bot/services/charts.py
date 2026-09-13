@@ -106,7 +106,7 @@ def _style(axes: Axes) -> None:
 
 
 async def collect_weight(
-    session: AsyncSession, child: Child, now: datetime
+    session: AsyncSession, child: Child
 ) -> tuple[list[tuple[int, float]], list[Band], tuple[float, float] | None]:
     """Точки взвешиваний, коридоры ВОЗ на тот же диапазон и центиль последней.
 
@@ -131,19 +131,24 @@ async def collect_weight(
     # так, будто ребёнок дошёл до края нормы. Неделя запаса это снимает
     last_day = max(last_day + 7, first_day + 14)
 
+    # Один запрос на весь диапазон, а не `lms_at` в цикле: на годовалом ребёнке
+    # цикл давал около четырёхсот обращений к базе на одну картинку — и это при
+    # том, что рисование идёт из `asyncio.to_thread`, а запросы из event loop
+    table = await growth.lms_range(session, child.sex, WEIGHT, first_day, last_day)
+
     bands: list[Band] = []
     for day in range(first_day, last_day + 1):
-        lms = await growth.lms_at(session, child.sex, WEIGHT, day)
+        lms = table.get(day)
         if lms is None:
             continue
         bands.append(
             Band(
                 day=day,
-                sd2neg=growth._sd_at(*lms, -2) * 1000,
-                sd1neg=growth._sd_at(*lms, -1) * 1000,
-                median=growth._sd_at(*lms, 0) * 1000,
-                sd1=growth._sd_at(*lms, 1) * 1000,
-                sd2=growth._sd_at(*lms, 2) * 1000,
+                sd2neg=growth.sd_at(*lms, -2) * 1000,
+                sd1neg=growth.sd_at(*lms, -1) * 1000,
+                median=growth.sd_at(*lms, 0) * 1000,
+                sd1=growth.sd_at(*lms, 1) * 1000,
+                sd2=growth.sd_at(*lms, 2) * 1000,
             )
         )
 
@@ -239,7 +244,7 @@ async def weight_png(
     session: AsyncSession, child: Child, now: datetime
 ) -> bytes | None:
     """Готовый PNG или `None`, если рисовать нечего."""
-    points, bands, evaluated = await collect_weight(session, child, now)
+    points, bands, evaluated = await collect_weight(session, child)
     if not points:
         return None
     return await asyncio.to_thread(draw_weight, child.name, points, bands, evaluated)

@@ -22,7 +22,6 @@
 from __future__ import annotations
 
 import argparse
-import socket
 import sys
 import urllib.error
 import urllib.request
@@ -50,12 +49,18 @@ BASE = (
 # двух. Это не опечатка ВОЗ в одном месте, а два разных написания на сайте;
 # первая попытка загрузки по единому шаблону дала 404 ровно на этих двух файлах
 SOURCES: list[tuple[str, str, str, str]] = [
-    (WEIGHT, "f", "wfa-girls", f"{BASE}/weight-for-age/expanded-tables/wfa-girls-zscore-expanded-tables.xlsx"),
-    (WEIGHT, "m", "wfa-boys", f"{BASE}/weight-for-age/expanded-tables/wfa-boys-zscore-expanded-tables.xlsx"),
-    (LENGTH, "f", "lhfa-girls", f"{BASE}/length-height-for-age/expandable-tables/lhfa-girls-zscore-expanded-tables.xlsx"),
-    (LENGTH, "m", "lhfa-boys", f"{BASE}/length-height-for-age/expandable-tables/lhfa-boys-zscore-expanded-tables.xlsx"),
-    (HEAD, "f", "hcfa-girls", f"{BASE}/head-circumference-for-age/expanded-tables/hcfa-girls-zscore-expanded-tables.xlsx"),
-    (HEAD, "m", "hcfa-boys", f"{BASE}/head-circumference-for-age/expanded-tables/hcfa-boys-zscore-expanded-tables.xlsx"),
+    (WEIGHT, "f", "wfa-girls",
+     f"{BASE}/weight-for-age/expanded-tables/wfa-girls-zscore-expanded-tables.xlsx"),
+    (WEIGHT, "m", "wfa-boys",
+     f"{BASE}/weight-for-age/expanded-tables/wfa-boys-zscore-expanded-tables.xlsx"),
+    (LENGTH, "f", "lhfa-girls",
+     f"{BASE}/length-height-for-age/expandable-tables/lhfa-girls-zscore-expanded-tables.xlsx"),
+    (LENGTH, "m", "lhfa-boys",
+     f"{BASE}/length-height-for-age/expandable-tables/lhfa-boys-zscore-expanded-tables.xlsx"),
+    (HEAD, "f", "hcfa-girls",
+     f"{BASE}/head-circumference-for-age/expanded-tables/hcfa-girls-zscore-expanded-tables.xlsx"),
+    (HEAD, "m", "hcfa-boys",
+     f"{BASE}/head-circumference-for-age/expanded-tables/hcfa-boys-zscore-expanded-tables.xlsx"),
 ]
 
 # Колонки, по которым сверяем формулу. Крайние (SD4) не берём: за ±3 у весовых
@@ -82,7 +87,7 @@ def fetch(name: str, url: str, *, offline: bool) -> Path:
     try:
         with urllib.request.urlopen(request, timeout=60) as response:
             payload = response.read()
-    except (urllib.error.URLError, socket.timeout) as exc:
+    except (urllib.error.URLError, TimeoutError) as exc:
         raise SystemExit(
             f"\nНе скачалось: {exc}\n"
             f"Скачайте вручную в {dest} и запустите снова."

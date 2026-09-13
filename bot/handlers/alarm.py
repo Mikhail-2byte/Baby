@@ -47,7 +47,13 @@ class HasRedFlag(BaseFilter):
             # содержит, но проверять каждую команду незачем
             return False
 
-        age = growth.age_days(child, tu.now_utc()) if child is not None else None
+        # Возраст СКОРРЕКТИРОВАННЫЙ — тот же, по которому считаются центили и
+        # вехи, и тот, что обещан в шапке `redflags.yaml`. Раньше здесь стоял
+        # хронологический, и у ребёнка, родившегося на 34-й неделе, окно
+        # «младше трёх месяцев» закрывалось на три недели раньше срока: порог
+        # 38.0 переставал работать тогда, когда он ещё нужен. Поправка идёт в
+        # сторону лишней тревоги, и это единственная допустимая здесь сторона
+        age = growth.corrected_age_days(child, tu.now_utc()) if child is not None else None
         hits = redflags.triage(text, age)
         if not hits:
             return False

@@ -1,12 +1,13 @@
-"""Отправка и удаление в чате семьи, плюс политика ошибок Telegram.
+"""Отправка в чат семьи и политика ошибок Telegram.
 
-Отдельный модуль, потому что политика нужна тикеру, дайджесту и панели
-(этап 2п). Держать её в `ticker.py` значило бы заставить `digest.py`
-импортировать тикер, который сам импортирует дайджест.
+Отдельный модуль, потому что политика нужна тикеру, дайджесту и панели.
+Держать её в `ticker.py` значило бы заставить `digest.py` импортировать тикер,
+который сам импортирует дайджест.
 
-С этапа 11 здесь же удаление: у утренней уборки политика ошибок своя, но живёт
-она по тому же правилу — «разбор ответов Telegram в одном месте». Новых
-статусов удаление не завело, обошлось существующими.
+Модуль скопирован из Family_planer (см. `CLAUDE.md`). Оттуда же приехали
+`delete_batch`/`delete_one` для утренней уборки чата — в этом проекте уборки
+нет и в плане её нет, вызывающих у них не было ни одного, поэтому они убраны.
+Понадобятся — переносятся обратно одним куском.
 """
 
 import logging
@@ -54,8 +55,8 @@ async def send(
 
     Отдаёт ещё и `message_id`: панели он нужен, чтобы потом её редактировать.
 
-    `reply_markup` появился ради разбора незакрытого (этап 5п): фоновые
-    сообщения кнопок раньше не знали вовсе — их принимал только `edit`.
+    `reply_markup` нужен фоновым сообщениям с кнопками: раньше клавиатуру
+    принимал только `edit`.
     """
     try:
         message = await bot.send_message(
@@ -133,78 +134,3 @@ async def edit(
     except Exception:
         log.exception("Не удалось отредактировать в чате %s", family.chat_id)
         return RETRY
-
-
-# --- Удаление (этап 11) -------------------------------------------------------
-
-# Признаки «прав не хватает» в тексте `TelegramBadRequest`. Telegram отвечает
-# по-разному в зависимости от того, что именно отобрали, а различать это важно:
-# без разделения бот без права `can_delete_messages` делал бы каждое утро одну
-# неудачную пачку плюс сотню неудачных одиночных удалений.
-#
-# **«message can't be deleted» сюда не входит, и это не описка.** Оно означает
-# «вот это конкретное сообщение неудаляемо» — служебное о создании супергруппы,
-# слишком старое, — а не «прав нет». Приняв его за отказ в правах, уборка
-# останавливалась бы на первой же пачке, в которую попало служебное сообщение,
-# то есть на первом боевом утре и потом каждое утро: знак не двигался бы
-# никогда, и вся затея молча не делала бы ничего
-_NO_RIGHTS = ("not enough rights", "chat_admin_required", "have no rights")
-
-
-def _delete_status(exc: TelegramBadRequest) -> str:
-    return FORBIDDEN if any(m in exc.message.lower() for m in _NO_RIGHTS) else BROKEN
-
-
-async def delete_batch(bot: Bot, family: Family, message_ids: list[int]) -> str:
-    """Удалить до ста сообщений разом. Исключений наружу не выпускает.
-
-    `NOT_FOUND` отсюда не приходит: несуществующие id Telegram пропускает молча,
-    и это как раз то, на чём держится уборка диапазоном — знать заранее, какие
-    из id живые, боту неоткуда.
-
-    А вот про существующие, но **неудаляемые** (служебное о создании
-    супергруппы, слишком старое) документация молчит вовсе. Проектируем от
-    худшего: считаем, что одно такое роняет всю пачку, — отсюда `BROKEN` и
-    поштучный откат у вызывающего.
-    """
-    try:
-        await bot.delete_messages(family.chat_id, message_ids)
-        return OK
-    except TelegramForbiddenError:
-        log.warning("Нет доступа в чат %s", family.chat_id)
-        return FORBIDDEN
-    except TelegramBadRequest as exc:
-        status = _delete_status(exc)
-        log.warning(
-            "Чат %s: пачка из %s не удалилась (%s): %s",
-            family.chat_id, len(message_ids), status, exc.message,
-        )
-        return status
-    except TelegramRetryAfter as exc:
-        log.warning("Флуд-контроль в чате %s, ждём %s с", family.chat_id, exc.retry_after)
-        return RETRY
-    except Exception:
-        log.exception("Не удалось удалить пачку в чате %s", family.chat_id)
-        return RETRY
-
-
-async def delete_one(bot: Bot, family: Family, message_id: int) -> str:
-    """Удалить одно сообщение — откат после упавшей пачки.
-
-    `BROKEN` здесь означает «именно это удалить нельзя» и ошибкой уборки не
-    считается: она идёт дальше по остальным id.
-    """
-    try:
-        await bot.delete_message(family.chat_id, message_id)
-        return OK
-    except TelegramForbiddenError:
-        return FORBIDDEN
-    except TelegramBadRequest as exc:
-        return _delete_status(exc)
-    except TelegramRetryAfter as exc:
-        log.warning("Флуд-контроль в чате %s, ждём %s с", family.chat_id, exc.retry_after)
-        return RETRY
-    except Exception:
-        log.exception("Не удалось удалить #%s в чате %s", message_id, family.chat_id)
-        return RETRY
-

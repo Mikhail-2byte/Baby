@@ -317,20 +317,27 @@ async def last_event(
     )
 
 
-async def count_events(
+async def count_events_since(
     session: AsyncSession,
     child_id: int,
-    start: datetime,
-    end: datetime,
+    since: datetime,
     kinds: frozenset[str] | set[str],
 ) -> int:
+    """Сколько событий начиналось после `since`. Верхней границы нет намеренно.
+
+    «За последние сутки» — окно без правого края: событий в будущем не бывает,
+    все записи создаются моментом `now`. Полуинтервал `[since, now)`, который
+    стоял здесь раньше, выбрасывал событие, отмеченное ровно в момент тика, —
+    в бою это микросекундное совпадение, а в тестах оно наступает всегда, и
+    отличить «окно посчиталось правильно» от «окно не посчиталось» становилось
+    нельзя.
+    """
     return (
         await session.scalar(
             select(func.count(Event.id)).where(
                 Event.child_id == child_id,
                 Event.kind.in_(kinds),
-                Event.started_at >= start,
-                Event.started_at < end,
+                Event.started_at >= since,
             )
         )
         or 0
