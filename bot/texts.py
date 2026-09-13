@@ -780,16 +780,35 @@ def _fragment(chunk: "Chunk") -> str:
 
 
 def qa_sources(chunks: "tuple[Chunk, ...]") -> str:
-    """Документы под ответом, без повторов, в порядке появления."""
+    """Документы под ответом, без повторов, отечественные первыми.
+
+    Порядок по тиру — это то, ради чего тир вообще заведён. Случай не
+    выдуманный: российский порог 37.5 °C уже расходился с международными 38.0,
+    и правильным ответом был российский, потому что семья пойдёт к российскому
+    педиатру. Когда в одном ответе сошлись документы разного веса, человек
+    должен видеть, какой из них чей.
+
+    Подпись тира появляется только при смешанной выдаче. Когда все источники
+    одного уровня — а так чаще всего и бывает, — она не несёт ничего, кроме
+    лишней строки над и без того длинным сообщением.
+    """
     seen: dict[str, Chunk] = {}
     for chunk in chunks:
         seen.setdefault(chunk.source_id, chunk)
-    lines = [
-        f'• <a href="{html_escape(chunk.url)}">{html_escape(chunk.title)}</a>'
-        f" — {html_escape(chunk.publisher)}"
-        for chunk in seen.values()
-    ]
-    return "<b>Источники</b>\n" + "\n".join(lines)
+    ordered = sorted(seen.values(), key=lambda chunk: chunk.tier)
+    mixed = len({chunk.tier for chunk in ordered}) > 1
+
+    lines = ["<b>Источники</b>"]
+    tier = ""
+    for chunk in ordered:
+        if mixed and chunk.tier != tier:
+            tier = chunk.tier
+            lines.append(f"<i>{html_escape(chunk.tier_name)}</i>")
+        lines.append(
+            f'• <a href="{html_escape(chunk.url)}">{html_escape(chunk.title)}</a>'
+            f" — {html_escape(chunk.publisher)}"
+        )
+    return "\n".join(lines)
 
 
 def qa_answer(answer: str, chunks: "tuple[Chunk, ...]") -> str:

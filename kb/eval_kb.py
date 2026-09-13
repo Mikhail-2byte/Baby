@@ -120,9 +120,20 @@ async def run() -> int:
     if misses:
         print(f"\nНе нашлось ({len(misses)}):")
         for question, found in misses:
-            got = f"{found[0].source_id}: {found[0].text[:70]}" if found else "пусто"
             print(f"  - {question.text}")
-            print(f"      ждали {question.source}, выдача: {got}")
+            if not found:
+                print(f"      ждали {question.source}, выдача пуста")
+                continue
+            top = found[0]
+            # Покрытие и счёт печатаются не для красоты: по ним видно, что
+            # именно случилось. Низкое покрытие у верного документа означает,
+            # что вопрос задан не теми словами; высокое у чужого — что нашлось
+            # похожее, но не то, и надо смотреть на ранжирование
+            print(
+                f"      ждали {question.source}, выдача: {top.source_id}"
+                f" (покрытие {top.coverage:.2f}, счёт {top.score:.4f})"
+            )
+            print(f"      {top.text[:80]}")
     if noisy:
         print(f"\nОтветил там, где ответа нет ({len(noisy)}):")
         for text, chunk in noisy:

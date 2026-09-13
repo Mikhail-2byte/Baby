@@ -204,7 +204,28 @@ _NAMED = re.compile(
     r"|оглавление|содержание|ключевые слова|критерии оценки)\b",
     re.IGNORECASE,
 )
-_LITERATURE = re.compile(r"^(список литературы|литература|references)\b", re.IGNORECASE)
+# Служебные разделы документа — не его содержание. Список литературы, состав
+# рабочей группы, методология разработки, благодарности: сотни фамилий и
+# канцелярита, которые не отвечают ни на один родительский вопрос, зато
+# находятся по любому. Проверено отложенным набором: на «сколько весит взрослый
+# слон» бот выдавал текст лицензии ВОЗ.
+#
+# Приложения А1 и А2 — именно про это (рабочая группа и методология), а вот
+# А3 «Справочные материалы» содержит дозировки, и его трогать нельзя
+_SERVICE = re.compile(
+    r"^(список литературы|литература|references"
+    r"|выражение признательности|благодарности"
+    r"|конфликт интересов|авторский коллектив"
+    r"|методология разработки"
+    r"|состав рабочей группы"
+    r"|приложение\s+а\s*[12][.\s)])",
+    re.IGNORECASE,
+)
+
+# Выходные данные издания. Заголовка у них обычно нет вовсе — они стоят на
+# обороте титула, — поэтому ловим по тексту, и только по тем меткам, которых в
+# клиническом тексте не бывает ни при каких обстоятельствах
+_IMPRINT = re.compile(r"(^|\s)(УДК|ББК|ISBN)\b|условиями лицензии|Все права защищены")
 
 # Строка оглавления: у неё точечное заполнение до номера страницы
 _TOC_LINE = re.compile(r"\.{4,}")
@@ -310,7 +331,7 @@ def _is_heading(line: _Line, body: float) -> bool:
     # «мл/кг») — сплошь и рядом, и он уезжает шапкой в каждый чанк раздела
     if sum(character.isalpha() for character in line.text) < 3:
         return False
-    if _NAMED.match(line.text) or _LITERATURE.match(line.text):
+    if _NAMED.match(line.text) or _SERVICE.match(line.text):
         return True
     if line.size >= body * 1.12:
         return True
@@ -342,10 +363,23 @@ def read_pdf(path: Path) -> list[Block]:
     finally:
         document.close()
 
-    body = _body_size(lines)
-    junk = _boilerplate(lines, pages)
-    contents = _toc_pages(lines)
+    return classify(
+        lines,
+        body=_body_size(lines),
+        junk=_boilerplate(lines, pages),
+        contents=_toc_pages(lines),
+    )
 
+
+def classify(
+    lines: list[_Line], *, body: float, junk: set[str], contents: set[int]
+) -> list[Block]:
+    """Строки PDF -> заголовки и абзацы, без мусора и служебных разделов.
+
+    Вынесено из `read_pdf` отдельной функцией, чтобы проверялось без PDF:
+    отсев служебных разделов — правило про содержание, и оно должно быть
+    проверяемо само по себе, а не вместе с разбором шрифтов.
+    """
     blocks: list[Block] = []
     skipping = False
     for line in lines:
@@ -355,7 +389,7 @@ def read_pdf(path: Path) -> list[Block]:
         if skipping and not heading:
             continue
         if heading:
-            skipping = bool(_LITERATURE.match(line.text))
+            skipping = bool(_SERVICE.match(line.text))
             if skipping:
                 continue
             if _NAMED.match(line.text) and not line.text.lower().startswith(
@@ -512,7 +546,11 @@ def chunk_blocks(source: Source, blocks: list[Block]) -> list[Chunk]:
             buffer.append(piece)
             length += len(piece) + 1
     flush()
-    return [chunk for chunk in chunks if len(chunk.text) >= MIN_CHUNK // 4]
+    return [
+        chunk
+        for chunk in chunks
+        if len(chunk.text) >= MIN_CHUNK // 4 and not _IMPRINT.search(chunk.text)
+    ]
 
 
 def indexed(source: Source, chunk: Chunk) -> str:

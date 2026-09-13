@@ -7,6 +7,7 @@
 """
 
 import socket
+from dataclasses import replace
 from datetime import datetime
 from typing import Any
 
@@ -274,6 +275,85 @@ def test_angle_brackets_from_the_document_are_escaped():
     assert "&lt;1&gt;" in text
     assert "<1>" not in text
 
+
+
+# --- Источники: показываем то, на что модель сослалась -----------------------
+
+
+def _two_chunks():
+    return (
+        _chunk("kr_newborn_2025", "Прикладывать к груди в первые 30 минут.", "Базовая помощь"),
+        _chunk("feeding_2019", "Прикорм вводят не ранее 4 месяцев.", "Прикорм"),
+    )
+
+
+def test_only_the_cited_fragment_is_shown():
+    """Под ответом по одному фрагменту нельзя перечислять все пять источников.
+
+    Список источников — главное, ради чего этот бот вообще отвечает. До аудита
+    поле `used` запрашивалось промптом и выбрасывалось, то есть список был
+    неправдой ровно там, где он важнее всего.
+    """
+    chunks = _two_chunks()
+    assert qa.cited(chunks, {"used": [2]}) == (chunks[1],)
+
+
+def test_garbage_in_used_shows_everything():
+    """Отбросить источник по кривому индексу хуже, чем показать лишний."""
+    chunks = _two_chunks()
+    for data in ({"used": "не список"}, {"used": []}, {"used": [0, 99, "ой"]}, {}, None):
+        assert qa.cited(chunks, data) == chunks
+
+
+def test_duplicate_indexes_do_not_duplicate_sources():
+    chunks = _two_chunks()
+    assert qa.cited(chunks, {"used": [1, 1, 1]}) == (chunks[0],)
+
+
+@pytest.mark.asyncio
+async def test_the_guard_still_sees_every_fragment(found, model):
+    """Сторож чисел сверяет со всеми найденными, а не только с процитированными.
+
+    Модель видела все пять фрагментов. Число, взятое из четвёртого, — взятое,
+    а не выдуманное, даже если в `used` его нет.
+    """
+    chunks = _two_chunks()
+    found(chunks)
+    model(llm.Answer(data={"answer": "Прикорм не ранее 4 месяцев.", "used": [1]}, calls=1))
+
+    result = await qa.answer("когда прикорм")
+    assert result.kind == qa.ANSWERED
+    assert [chunk.source_id for chunk in result.chunks] == ["kr_newborn_2025"]
+
+
+# --- Тир: чем он вообще занят ------------------------------------------------
+
+
+def test_russian_sources_are_listed_first():
+    """Порядок по тиру — то, ради чего тир заведён.
+
+    Случай не выдуманный: российский порог 37.5 °C уже расходился с
+    международными 38.0, и правильным был российский — семья пойдёт к
+    российскому педиатру.
+    """
+    foreign = replace(
+        _chunk("aap"), tier="T3", tier_name="Зарубежные общества", title="Safe Sleep"
+    )
+    russian = _chunk("kr_newborn_2025")
+    text = texts.qa_sources((foreign, russian))
+    assert text.index("Здоровый новорождённый") < text.index("Safe Sleep")
+
+
+def test_tier_is_named_only_when_sources_are_mixed():
+    """При одном уровне подпись не несёт ничего, кроме лишней строки."""
+    same = texts.qa_sources((_chunk(), _chunk("feeding_2019")))
+    assert "Клинические рекомендации Минздрава России" not in same
+
+    foreign = replace(
+        _chunk("aap"), tier="T3", tier_name="Зарубежные общества", title="Safe Sleep"
+    )
+    mixed = texts.qa_sources((_chunk(), foreign))
+    assert "Зарубежные общества" in mixed
 
 # --- Квота ------------------------------------------------------------------
 

@@ -116,6 +116,32 @@ def invented_numbers(answer: str, context: str) -> set[str]:
     return _numbers(answer) - _numbers(context)
 
 
+def cited(chunks: tuple[kb.Chunk, ...], data: dict | None) -> tuple[kb.Chunk, ...]:
+    """Фрагменты, на которые модель сослалась полем `used`.
+
+    Раньше это поле запрашивалось промптом и выбрасывалось. Просить у модели
+    то, что не читаешь, — полбеды; беда в том, что под ответом по одному
+    фрагменту перечислялись все пять источников, и список источников — главное,
+    ради чего этот бот вообще отвечает, — был неправдой.
+
+    Разбор нарочно терпимый: мусор, выход за границы и пустой список означают
+    «показываем всё». Отбросить источники по кривому индексу хуже, чем
+    показать лишний: в первом случае человек не увидит, откуда взят ответ.
+    """
+    raw = (data or {}).get("used")
+    if not isinstance(raw, list):
+        return chunks
+    picked: list[kb.Chunk] = []
+    for item in raw:
+        try:
+            index = int(item)
+        except (TypeError, ValueError):
+            continue
+        if 1 <= index <= len(chunks) and chunks[index - 1] not in picked:
+            picked.append(chunks[index - 1])
+    return tuple(picked) or chunks
+
+
 def build_user(question: str, chunks: tuple[kb.Chunk, ...]) -> str:
     """Сообщение модели: вопрос и пронумерованные фрагменты."""
     parts = [f"Вопрос: {question}", "", "Фрагменты:"]
@@ -175,6 +201,9 @@ async def _answer(question: str) -> Result:
         # найденное: пусть человек решит сам, есть там ответ или нет
         return _extract(question, chunks, "empty", logged=True)
 
+    # Сторож сверяет со ВСЕМИ найденными фрагментами, а не только с теми, на
+    # которые модель сослалась: она их все видела, и число из четвёртого —
+    # взятое, а не выдуманное, даже если в `used` его нет
     context = " ".join(chunk.text for chunk in chunks) + " " + question
     invented = invented_numbers(text, context)
     if invented:
@@ -182,7 +211,7 @@ async def _answer(question: str) -> Result:
         qa_log.write(event="qa_numbers", question=question, invented=sorted(invented), calls=0)
         return _extract(question, chunks, "invented_numbers", logged=True)
 
-    return Result(ANSWERED, text[:MAX_ANSWER], chunks)
+    return Result(ANSWERED, text[:MAX_ANSWER], cited(chunks, reply.data))
 
 
 def _extract(

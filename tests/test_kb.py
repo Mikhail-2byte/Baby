@@ -168,6 +168,86 @@ def test_indexed_text_carries_the_document_title():
     assert "Прикорм" in text
 
 
+
+# --- Служебные разделы документа -------------------------------------------
+
+
+def _line(text: str, *, big: bool = False, page: int = 1) -> build_kb._Line:
+    """Строка PDF: кегль 14 — заголовок, 10 — основной текст."""
+    return build_kb._Line(page, text, 14.0 if big else 10.0, big, 1)
+
+
+def _classified(lines):
+    return build_kb.classify(lines, body=10.0, junk=set(), contents=set())
+
+
+def test_the_list_of_references_is_dropped():
+    """Сотни фамилий, которые находятся по любому запросу и не отвечают ни на один."""
+    blocks = _classified([
+        _line("5. Профилактика", big=True),
+        _line("Профилактика желтухи у новорождённого начинается рано."),
+        _line("Список литературы", big=True),
+        _line("Иванов И.И., Петров П.П. Неонатология. Москва, 2019."),
+    ])
+    assert all("Иванов" not in block.text for block in blocks)
+    assert any("Профилактика желтухи" in block.text for block in blocks)
+
+
+def test_a_section_after_the_references_comes_back():
+    """Пропуск кончается на следующем заголовке, а не на конце документа.
+
+    В клинических рекомендациях за списком литературы идут приложения, и в
+    них — дозировки и шкалы. Выбросив всё до конца файла, мы потеряли бы их.
+    """
+    blocks = _classified([
+        _line("Список литературы", big=True),
+        _line("Иванов И.И. Неонатология. Москва, 2019."),
+        _line("Приложение А3. Справочные материалы", big=True),
+        _line("Дозировка рассчитывается на килограмм массы тела."),
+    ])
+    assert any("Дозировка" in block.text for block in blocks)
+
+
+def test_the_working_group_appendix_is_dropped_but_not_the_reference_one():
+    """А1 и А2 — рабочая группа и методология. А3 — дозировки, его трогать нельзя."""
+    assert build_kb._SERVICE.match("Приложение А1. Состав рабочей группы")
+    assert build_kb._SERVICE.match("Приложение А2. Методология разработки")
+    assert not build_kb._SERVICE.match("Приложение А3. Справочные материалы")
+    assert not build_kb._SERVICE.match("Приложение Б. Алгоритмы действий врача")
+
+
+def test_the_imprint_page_does_not_become_a_chunk():
+    """Выходные данные заголовка не имеют — ловятся по тексту.
+
+    До этого на «сколько весит взрослый слон» бот отвечал текстом лицензии ВОЗ:
+    в нём нет ни одного медицинского слова, зато есть много общих.
+    """
+    blocks = [
+        _heading("Выходные данные"),
+        _paragraph("УДК 613.953.1 ББК 51.289.1 ISBN 978-5-6042256-5-3. " * 12),
+        _heading("Глава 1"),
+        _paragraph("Грудное молоко — лучшее питание для младенца. " * 12),
+    ]
+    chunks = build_kb.chunk_blocks(_source(), blocks)
+    assert len(chunks) == 1
+    assert "молоко" in chunks[0].text
+
+
+def test_a_licence_notice_does_not_become_a_chunk():
+    blocks = [_paragraph("Урегулирование споров, связанных с условиями лицензии. " * 12)]
+    assert build_kb.chunk_blocks(_source(), blocks) == []
+
+
+def test_a_clinical_paragraph_mentioning_a_licence_survives():
+    """Отсев по метке, а не по слову: «лицензия» бывает и в клиническом тексте.
+
+    «Медицинские организации при наличии лицензии, предусматривающей
+    вакцинацию» — это порядок проведения прививок, а не выходные данные.
+    """
+    text = "Прививки проводятся в организациях при наличии лицензии на вакцинацию. " * 8
+    chunks = build_kb.chunk_blocks(_source(), [_paragraph(text)])
+    assert chunks and "лицензии" in chunks[0].text
+
 # --- Склейка переносов ------------------------------------------------------
 
 
