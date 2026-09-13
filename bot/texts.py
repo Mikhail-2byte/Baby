@@ -42,6 +42,7 @@ if TYPE_CHECKING:
     # Только для проверки типов: в рантайме импорта нет, потому что `stats`
     # сам обращается к `texts` — цикл разорван тем, что тот импорт локальный
     from bot.services.redflags import Watch
+    from bot.services.stage import Milestones, Period
     from bot.services.stats import Span
 
 NL = chr(10)
@@ -51,6 +52,7 @@ COMMANDS = [
     ("today", "сводка за сегодня"),
     ("week", "статистика за неделю"),
     ("chart", "графики: вес и ритм суток"),
+    ("stage", "что происходит на этой неделе"),
     ("weight", "записать вес"),
     ("baby", "данные о ребёнке"),
     ("remind", "напоминания"),
@@ -629,3 +631,78 @@ def redflags_list(flags: list) -> str:
         "<i>Источники: NICE NG143, WHO IMCI, КР МЗ РФ «Здоровый новорождённый» 2025.</i>",
     ]
     return "\n".join(lines)
+
+
+# --- Этап развития --------------------------------------------------------
+
+
+def stage_report(
+    child: Child,
+    now: datetime,
+    *,
+    period: "Period",
+    milestones: "Milestones | None",
+    windows: list,
+    caveat: str,
+    corrected: bool,
+) -> str:
+    """Что происходит на этой неделе. Собирается из `weeks.yaml`, не сочиняется."""
+    lines = [f"🌱 <b>{period.title}</b> · {child.name}, {age_phrase(child, now)}"]
+    if corrected:
+        # Молча подменять возраст нельзя: родители сверяют вехи с ровесниками,
+        # и разница в три недели без объяснения выглядит как ошибка бота
+        lines.append("<i>Считаю по скорректированному возрасту, с поправкой на срок.</i>")
+    lines += ["", period.happening]
+
+    if period.do:
+        lines += ["", "<b>Что делать на этой неделе</b>"]
+        lines += [f"• {item.text}" for item in period.do]
+
+    if period.talk:
+        lines += ["", "<b>О чём и как говорить</b>"]
+        lines += [f"• {item.text}" for item in period.talk]
+
+    if period.safety:
+        lines += ["", "<b>Безопасность</b>"]
+        lines += [f"• {item.text}" for item in period.safety]
+
+    if period.normal:
+        lines += ["", "<b>Это нормально</b>"]
+        lines += [f"• {item}" for item in period.normal]
+
+    if windows:
+        names = ", ".join(
+            f"{w.name.lower()} ({w.from_months:g}–{w.to_months:g} мес)" for w in windows
+        )
+        lines += [
+            "",
+            f"<b>Сейчас открыты окна ВОЗ:</b> {names}.",
+            "<i>Окно — это возраст, внутри которого веху осваивают 99% детей. "
+            "Обе границы — норма.</i>",
+        ]
+
+    if milestones is not None:
+        lines += ["", f"<b>Вехи CDC к {milestones.at_months} месяцам</b>", f"<i>{caveat}</i>"]
+        for title, items in (
+            ("Общение", milestones.social),
+            ("Речь", milestones.language),
+            ("Мышление", milestones.cognitive),
+            ("Движение", milestones.movement),
+        ):
+            if items:
+                lines.append(f"\n<u>{title}</u>")
+                lines += [f"• {item}" for item in items]
+
+    return "\n".join(lines)
+
+
+def stage_sources(period: "Period") -> str:
+    """Источники советов этого периода — отдельным сообщением, по запросу."""
+    seen = {item.source for item in (*period.do, *period.talk, *period.safety)}
+    return "Источники: " + "; ".join(sorted(seen)) + "."
+
+
+STAGE_OVER = (
+    "Содержание пока доходит до года с небольшим. Дальше бот продолжает "
+    "трекать и считать, но рассказывать про этап ему уже нечего."
+)

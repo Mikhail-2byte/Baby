@@ -229,8 +229,10 @@ async def test_digest_reports_an_empty_week(session, family, child, bot):
     moment = _monday_at(family, 12)
     await digest.send_pending(bot, session, moment)
 
-    assert len(bot.sent) == 1
     assert "записей не было" in bot.texts[0]
+    # Про этап рассказываем даже в пустую неделю: записей нет, а развитие идёт,
+    # и это ровно то, ради чего дайджест читают
+    assert "Что делать на этой неделе" in bot.texts[1]
 
 
 @pytest.mark.asyncio

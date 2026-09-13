@@ -1,4 +1,4 @@
-"""Сводки и графики: `/today`, `/week`, `/chart`, кнопки периодов."""
+"""Сводки, графики и этап развития: `/today`, `/week`, `/chart`, `/stage`."""
 
 import logging
 from datetime import timedelta
@@ -12,7 +12,7 @@ from bot import keyboards, texts
 from bot.db.models import Child, Family
 from bot.filters import IN_GROUP, IN_GROUP_CB
 from bot.keyboards import StatsCB
-from bot.services import charts, stats
+from bot.services import charts, stage, stats
 from bot.services import timeutil as tu
 
 log = logging.getLogger(__name__)
@@ -149,3 +149,17 @@ async def switch_period(
         # «message is not modified» при повторном тапе по тому же периоду —
         # самый частый случай, и он не стоит ни строчки в логе выше DEBUG
         log.debug("Сводку не перерисовали", exc_info=True)
+
+
+@router.message(IN_GROUP, Command("stage"))
+async def stage_now(message: Message, child: Child | None) -> None:
+    """Что происходит на этой неделе: развитие, занятия, вехи.
+
+    Отдельной командой, а не внутри `/week`: там статистика за прошедшее, а
+    здесь — про то, что сейчас и дальше. Смешивать их значит, что читать не
+    станут ни то, ни другое.
+    """
+    if child is None:
+        await message.answer(texts.NO_CHILD)
+        return
+    await message.answer(stage.report(child, tu.now_utc()) or texts.STAGE_OVER)

@@ -25,7 +25,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from bot import texts
 from bot.db import repo
 from bot.db.models import Child, Family
-from bot.services import charts, sending, stats
+from bot.services import charts, sending, stage, stats
 from bot.services import timeutil as tu
 
 log = logging.getLogger(__name__)
@@ -100,10 +100,29 @@ async def send_for(
         return
 
     if status == sending.OK:
+        await _send_stage(bot, family, child, now)
         await _send_charts(bot, family, session, child, now)
 
     await _mark(session, family, target)
     log.info("Дайджест семьи #%s отправлен (%s)", family.id, status)
+
+
+async def _send_stage(
+    bot: Bot, family: Family, child: Child, now: datetime
+) -> None:
+    """Что происходит на этой неделе — отдельным сообщением после итогов.
+
+    Отдельным, а не приклеенным к сводке: одно про прошедшее, другое про
+    предстоящее, и склеенные они читаются хуже обоих. Сбой здесь дайджест не
+    отменяет — итоги недели уже ушли.
+    """
+    try:
+        text = stage.report(child, now)
+    except Exception:
+        log.exception("Этап развития для семьи #%s не собрался", family.id)
+        return
+    if text is not None:
+        await sending.deliver(bot, family, text)
 
 
 async def _send_charts(

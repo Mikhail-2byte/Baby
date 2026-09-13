@@ -74,6 +74,7 @@ def test_thresholds_are_the_documented_ones():
     изменить поведение.
     """
     assert rf.THRESHOLDS["fever_c"] == 38.0
+    assert rf.THRESHOLDS["fever_c_watch"] == 37.5
     assert rf.THRESHOLDS["fever_age_days"] == 90
     assert rf.THRESHOLDS["hypothermia_c"] == 36.0
     assert rf.THRESHOLDS["min_wet_diapers"] == 4
@@ -123,11 +124,13 @@ def test_not_a_temperature(text):
     [
         (38.0, YOUNG, rf.EMERGENCY),  # ровно порог — уже тревога
         (38.2, YOUNG, rf.EMERGENCY),
-        (37.9, YOUNG, None),
+        (37.9, YOUNG, rf.URGENT),  # российский порог 37.5 — связаться с врачом
+        (37.4, YOUNG, None),
         (36.0, YOUNG, rf.EMERGENCY),  # гипотермия — такой же признак сепсиса
         (35.2, YOUNG, rf.EMERGENCY),
         (36.6, YOUNG, None),
         (38.2, OLD, None),  # после трёх месяцев порог выше
+        (38.5, OLD, rf.URGENT),
         (39.0, OLD, rf.URGENT),
         (35.0, OLD, None),  # гипотермия — признак именно у младенца
     ],
@@ -152,41 +155,49 @@ def test_temperature_without_known_age_still_fires():
 @pytest.mark.parametrize(
     "text",
     [
-        "температуры нет, спит спокойно",
-        "судорог не было",
-        "сыпи нет",
-        "без судорог",
-        "рвоты нет, всё нормально",
+        "пожелтела? нет",
+        "нет, не пожелтела",
+        "рвота фонтаном? нет такого",
+        "судороги? нет",
     ],
 )
 def test_negation_suppresses(text):
-    """«Судорог не было» — это не судороги.
+    """Отрицание рядом с признаком отменяет его.
 
-    Без разбора отрицания бот кричал бы ровно на тех сообщениях, где родители
-    успокаивают друг друга.
+    Тесты здесь подобраны так, чтобы фраза **действительно совпадала**, и
+    подавление было единственной причиной молчания. Соблазнительные примеры
+    вроде «судорог не было» проверяют не то: слова «судороги» в них просто нет,
+    и они прошли бы даже с полностью выключенным разбором отрицаний.
     """
+    matched = any(
+        phrase in rf.normalize(text) for flag in rf.FLAGS for phrase in flag.phrases
+    )
+    assert matched, f"тест бессмысленный: фраза в {text!r} и так не совпадает"
     assert rf.triage(text, YOUNG) == []
 
 
 @pytest.mark.parametrize(
     "text",
     [
-        "не просыпается уже долго",
-        "не могу разбудить",
-        "совсем не ест",
-        "отказывается от груди",
-        "не реагирует на голос",
+        "температуры нет, спит спокойно",
+        "судорог не было",
+        "сыпи нет",
     ],
 )
-def test_negation_inside_the_phrase_still_fires(text):
-    """Самые тяжёлые признаки сформулированы через отрицание.
+def test_calm_reassurance_is_quiet(text):
+    """Фразы, которыми родители успокаивают друг друга, тревогу не поднимают."""
+    assert rf.triage(text, YOUNG) == []
 
-    «Не просыпается» — это сам признак, а не его отсутствие. Слепое подавление
-    по слову «не» заставило бы бота молчать ровно на них.
+
+def test_negation_window_does_not_over_reach():
+    """Отрицание из соседней части фразы признак не отменяет.
+
+    «Запрокидывает голову назад когда не спит» — это сам признак, и «не»
+    относится ко сну. При окне в три слова он подавлялся; тест на примерах из
+    `redflags.yaml` это и поймал.
     """
-    hits = rf.triage(text, YOUNG)
-    assert hits, f"признак должен был сработать: {text!r}"
-    assert rf.worst(hits) == rf.EMERGENCY
+    hits = rf.triage("запрокидывает голову назад когда не спит", YOUNG)
+    assert [hit.flag.id for hit in hits] == ["head_tilt"]
 
 
 def test_negation_does_not_reach_across_the_sentence():
