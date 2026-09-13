@@ -429,3 +429,63 @@ async def test_search_runs_off_the_event_loop(tmp_path, monkeypatch):
     monkeypatch.setattr(search.asyncio, "to_thread", counted)
     await search.search("сон младенца", 2)
     assert calls == [search._search]
+
+
+# --- Файл базы: кто его держит ----------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_an_open_base_cannot_be_replaced(tmp_path, monkeypatch):
+    """Обещание README проверяется фактом, а не рассуждением.
+
+    «Пересобирать при остановленном боте» — это не совет, а свойство Windows:
+    открытый чужим процессом файл не подменить. Если однажды окажется, что
+    подмена проходит, документацию надо будет править, а не гадать.
+    """
+    _tiny_kb(tmp_path, monkeypatch, [_heading("Сон"), _paragraph("Сон младенца ночью. " * 15)])
+    assert await search.search("сон младенца", 1), "соединение должно открыться"
+
+    path = tmp_path / "kb.db"
+    fresh = tmp_path / "fresh.db"
+    fresh.write_bytes(path.read_bytes())
+    with pytest.raises(PermissionError):
+        path.unlink()
+        fresh.replace(path)
+
+
+@pytest.mark.asyncio
+async def test_close_releases_the_file(tmp_path, monkeypatch):
+    """`close()` не украшение: соединение живёт весь процесс.
+
+    До аудита эту функцию не звал никто — ровно тот случай, из-за которого
+    когда-то год не работали PRAGMA. Теперь её зовёт порядок остановки бота,
+    а проверяем мы то, ради чего она есть.
+    """
+    _tiny_kb(tmp_path, monkeypatch, [_heading("Сон"), _paragraph("Сон младенца ночью. " * 15)])
+    await search.search("сон младенца", 1)
+
+    search.close()
+
+    path = tmp_path / "kb.db"
+    fresh = tmp_path / "fresh.db"
+    fresh.write_bytes(path.read_bytes())
+    path.unlink()
+    fresh.replace(path)  # не должно поднять PermissionError
+
+
+def test_build_says_what_to_do_when_the_file_is_busy(tmp_path, monkeypatch):
+    """Сборка при работающем боте обязана объяснить, а не сыпать трассировкой.
+
+    Человек в этот момент не отлаживает скрипт, он пересобирает базу.
+    """
+    source = _source()
+    chunks = build_kb.chunk_blocks(source, [_heading("А"), _paragraph("Текст про сон. " * 20)])
+    path = tmp_path / "kb.db"
+    build_kb.write_db(path, [(source, chunks)])
+
+    holder = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    try:
+        with pytest.raises(SystemExit, match="Остановите бота"):
+            build_kb.write_db(path, [(source, chunks)])
+    finally:
+        holder.close()

@@ -16,8 +16,7 @@ from aiogram.client.session.base import BaseSession
 from aiogram.methods import TelegramMethod
 from aiogram.types import CallbackQuery, Chat, Message, Update, User
 
-from bot import keyboards, texts
-from bot.handlers import alarm, measure
+from bot import handlers, keyboards, texts
 from bot.handlers import qa as qa_handler
 from bot.services import kb, llm, pending, qa, qa_log
 
@@ -314,6 +313,19 @@ def test_a_broken_log_does_not_break_the_answer(monkeypatch):
 # --- Главное: до модели доходит не всё --------------------------------------
 
 
+def test_the_order_of_routers_is_the_one_everything_rests_on():
+    """Три инварианта этапа заданы не кодом, а этим списком.
+
+    `alarm` выше `qa` — иначе вопрос про судороги уйдёт в модель.
+    `qa` выше `measure` — иначе апдейт до него не дойдёт вовсе.
+    `common` первым — отказ для лички раньше всего остального.
+    """
+    order = [router.name for router in handlers.routers]
+    assert order[0] == "common"
+    assert order.index("alarm") < order.index("qa") < order.index("measure")
+    assert order[-1] == "measure"
+
+
 class RecordingSession(BaseSession):
     """Сеть не трогаем: складываем отправленное в список."""
 
@@ -353,7 +365,12 @@ def wired(session, family, child, mother, monkeypatch):
         return await handler(event, data)
 
     dp.update.outer_middleware(inject)
-    order = (alarm.router, qa_handler.router, measure.router)
+    # Боевой список целиком, а не свой порядок из трёх роутеров. Это и есть
+    # предмет проверки: своя тройка доказывала бы, что механизм работает при
+    # правильном порядке, но ничего не говорила бы о том, каков он на самом
+    # деле. Проверено переставлением `qa` и `measure` местами в
+    # `handlers/__init__.py` — с хардкодом здесь тест оставался зелёным
+    order = tuple(handlers.routers)
     for router in order:
         dp.include_router(router)
 
@@ -378,6 +395,24 @@ async def _feed(dp, bot, text, message_id=1):
         message_id=message_id, date=NOW, chat=CHAT, from_user=AUTHOR, text=text
     )
     await dp.feed_update(bot, Update(update_id=message_id, message=message))
+
+
+@pytest.mark.asyncio
+async def test_a_red_flag_drops_the_waiting_question(wired):
+    """Ответил триаж — ждать вопроса больше незачем.
+
+    Без этого ожидание висит ещё десять минут, и следующая реплика человека —
+    «звоню 103», «одеваемся, едем» — уедет в поиск по базе знаний ровно в ту
+    минуту, когда бот обязан молчать.
+    """
+    dp, bot, session_bot, asked = wired
+    pending.remember(CHAT.id, AUTHOR.id, pending.QUESTION)
+
+    await _feed(dp, bot, "у неё судороги, что делать", 1)
+    assert pending.peek(CHAT.id, AUTHOR.id) is None
+
+    await _feed(dp, bot, "одеваемся, едем", 2)
+    assert asked == []
 
 
 @pytest.mark.asyncio
@@ -450,6 +485,27 @@ async def test_the_button_starts_waiting(wired):
     ask = pending.peek(CHAT.id, AUTHOR.id)
     assert ask is not None and ask.what == pending.QUESTION
     assert texts.ASK_QUESTION in session_bot.sent
+
+
+@pytest.mark.asyncio
+async def test_a_broken_base_does_not_reach_the_handler(monkeypatch):
+    """Контракт «исключений наружу не выпускает» держится здесь, а не надеждой.
+
+    `kb.search` ходит в файл, который мог оказаться подменённым или битым, а
+    упавший хендлер — это потерянный навсегда апдейт. Битая база — это «базы
+    нет», так и отвечаем.
+    """
+    import sqlite3
+
+    async def broken(*args, **kwargs):
+        raise sqlite3.DatabaseError("файл базы знаний повреждён")
+
+    monkeypatch.setattr(qa.kb, "available", lambda: True)
+    monkeypatch.setattr(qa.kb, "search", broken)
+
+    result = await qa.answer("когда вводить прикорм")
+    assert result.kind == qa.NO_KB
+    assert result.reason == "broken"
 
 
 @pytest.mark.asyncio

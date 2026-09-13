@@ -785,7 +785,8 @@ def qa_sources(chunks: "tuple[Chunk, ...]") -> str:
     for chunk in chunks:
         seen.setdefault(chunk.source_id, chunk)
     lines = [
-        f'• <a href="{chunk.url}">{html_escape(chunk.title)}</a> — {html_escape(chunk.publisher)}'
+        f'• <a href="{html_escape(chunk.url)}">{html_escape(chunk.title)}</a>'
+        f" — {html_escape(chunk.publisher)}"
         for chunk in seen.values()
     ]
     return "<b>Источники</b>\n" + "\n".join(lines)

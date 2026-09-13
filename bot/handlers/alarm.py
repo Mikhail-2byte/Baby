@@ -9,9 +9,10 @@
 существенная: фильтр, не нашедший признаков, пропускает сообщение дальше
 нетронутым, и обычная переписка семьи этот роутер вообще не замечает.
 
-**Ни одного обращения к модели на этом пути.** Когда появится Q&A (этап 6), он
-встанет ПОСЛЕ этого роутера, и экстренный ответ так и останется фиксированным
-текстом — именно потому, что порядок роутеров задан здесь.
+**Ни одного обращения к модели на этом пути.** Q&A (этап 6) стоит ПОСЛЕ этого
+роутера, и экстренный ответ остаётся фиксированным текстом именно потому, что
+порядок роутеров задан так. Проверки красных флагов внутри Q&A нет и не должно
+быть: вторая копия границы безопасности разойдётся с первой молча.
 """
 
 import logging
@@ -21,9 +22,9 @@ from aiogram.filters import BaseFilter, Command
 from aiogram.types import Message
 
 from bot import texts
-from bot.db.models import Child
+from bot.db.models import Child, Family
 from bot.filters import IN_GROUP
-from bot.services import growth, redflags
+from bot.services import growth, pending, redflags
 from bot.services import timeutil as tu
 
 log = logging.getLogger(__name__)
@@ -61,13 +62,20 @@ class HasRedFlag(BaseFilter):
 
 
 @router.message(IN_GROUP, F.text | F.caption, HasRedFlag())
-async def alarm(message: Message, hits: list, level: str) -> None:
+async def alarm(message: Message, hits: list, level: str, family: Family) -> None:
     """Фиксированный ответ. Ни генерации, ни разбора — только текст из файла."""
     log.warning(
         "Триаж сработал (%s): %s",
         level,
         ", ".join(hit.flag.id for hit in hits),
     )
+    # Если человек нажал «❓ Вопрос» и написал про судороги, ответили на это мы,
+    # и ждать вопроса больше незачем. Иначе ожидание висит ещё десять минут, и
+    # следующая его реплика — «звоню 103», «одеваемся, едем» — уедет в поиск по
+    # базе знаний ровно в ту минуту, когда бот обязан молчать
+    if message.from_user is not None:
+        pending.forget(family.chat_id, message.from_user.id)
+
     # Отвечаем реплаем на исходное сообщение: в семейном чате в этот момент
     # может идти другая переписка, и ответ обязан быть привязан к тому, что его
     # вызвало

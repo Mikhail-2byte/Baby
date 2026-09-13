@@ -14,7 +14,7 @@ from bot.config import settings
 from bot.db.session import engine
 from bot.handlers import routers
 from bot.middlewares import FamilyMiddleware, drop_wizard_state
-from bot.services import lock, panel, ticker
+from bot.services import kb, lock, panel, ticker
 
 # Файл пишем сами, а не редиректом shell, и это не удобство. При `>> bot.log`
 # кодировку выбирает Python по локали Windows, а не по кодовой странице консоли:
@@ -157,6 +157,12 @@ async def main() -> None:
                 await step
             except Exception:
                 log.exception("Ошибка при остановке")
+        # Отдельной строкой, потому что не корутина: соединение с базой знаний
+        # открывается лениво и держится весь процесс
+        try:
+            kb.close()
+        except Exception:
+            log.exception("Ошибка при остановке")
         # Последним, когда всё уже закрыто: пока замок наш, второй экземпляр не
         # начнёт поднимать то, что мы ещё не отпустили
         guard.release()

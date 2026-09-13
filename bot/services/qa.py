@@ -126,7 +126,22 @@ def build_user(question: str, chunks: tuple[kb.Chunk, ...]) -> str:
 
 
 async def answer(question: str) -> Result:
-    """Ответ на вопрос. Исключений наружу не выпускает."""
+    """Ответ на вопрос. Исключений наружу не выпускает.
+
+    Обещание держится здесь, а не надеждой на вызываемых. `llm.ask` свой
+    контракт соблюдает, а вот `kb.search` ходит в файл, который между делом
+    мог оказаться подменённым или битым: `sqlite3.DatabaseError` оттуда прошёл
+    бы насквозь до хендлера, а упавший хендлер — это потерянный навсегда
+    апдейт. Битая база — это «базы нет», так и отвечаем.
+    """
+    try:
+        return await _answer(question)
+    except Exception:
+        log.exception("Не удалось ответить на вопрос")
+        return Result(NO_KB, "", (), "broken")
+
+
+async def _answer(question: str) -> Result:
     if not kb.available():
         return Result(NO_KB, "", ())
 

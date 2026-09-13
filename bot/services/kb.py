@@ -123,6 +123,10 @@ def _open() -> sqlite3.Connection | None:
         log.warning("Не удалось открыть базу знаний %s", path, exc_info=True)
         _broken = True
         return None
+    # Один раз, на открытии: соединение живёт весь процесс, а `_search`
+    # выполняется из пула потоков — менять на нём что-либо на каждый запрос
+    # значит делать это из разных потоков без нужды
+    connection.row_factory = sqlite3.Row
     _connection = connection
     return _connection
 
@@ -228,7 +232,6 @@ def _search(query: str, k: int) -> list[Chunk]:
     connection = _open()
     if connection is None:
         return []
-    connection.row_factory = sqlite3.Row
 
     significant, anchors = _significant(connection, morph.stems(query))
     if not anchors:
