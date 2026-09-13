@@ -17,6 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from bot.config import settings
 from bot.db.models import (
     TIMED_KINDS,
+    Alert,
     Child,
     Event,
     Family,
@@ -510,4 +511,28 @@ async def reschedule_reminder(
 ) -> None:
     reminder.fire_at = following
     reminder.sent_at = None
+    await session.commit()
+
+
+# --- Тревоги по данным ----------------------------------------------------
+
+
+async def alert_raised(
+    session: AsyncSession, child_id: int, flag_id: str, day: date
+) -> bool:
+    """Говорили ли уже про этот признак сегодня."""
+    found = await session.scalar(
+        select(Alert.id).where(
+            Alert.child_id == child_id,
+            Alert.flag_id == flag_id,
+            Alert.raised_on == day,
+        )
+    )
+    return found is not None
+
+
+async def raise_alert(
+    session: AsyncSession, child_id: int, flag_id: str, day: date
+) -> None:
+    session.add(Alert(child_id=child_id, flag_id=flag_id, raised_on=day))
     await session.commit()

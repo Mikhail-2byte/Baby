@@ -23,12 +23,24 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from bot import texts
 from bot.config import settings
 from bot.db import repo
-from bot.db.models import Child, Family, Reminder
+from bot.db.models import (
+    DIAPER_MIXED,
+    DIAPER_WET,
+    FEED_KINDS,
+    WEIGHT,
+    Child,
+    Family,
+    Reminder,
+)
 from bot.db.session import Session
-from bot.services import backup, digest, panel, sending
+from bot.services import backup, digest, growth, panel, redflags, sending
 from bot.services import timeutil as tu
 
 log = logging.getLogger(__name__)
+
+# Мокрым считается и смешанный подгузник: счётчик мокрых — тот, по которому
+# проверяется достаточность питья, и занижать его нельзя
+WET_KINDS = frozenset({DIAPER_WET, DIAPER_MIXED})
 
 # Признак живого цикла для внешнего сторожа. Отдельный файл, а не `bot.log`:
 # в спокойный тик бот не пишет в лог ни строки, и свежесть лога о жизни цикла
@@ -139,12 +151,14 @@ async def tick_once(
     """Одна итерация. Порядок шагов не случаен.
 
     Забытые таймеры закрываем первыми: пока они висят, любая сводка и любая
-    панель показывают неправду — а следом идут и сводка, и панель. Бэкап
-    последним: сорвавшийся снимок не должен задержать напоминание.
+    панель показывают неправду — а следом идут и наблюдение за данными, и
+    сводка, и панель. Бэкап последним: сорвавшийся снимок не должен задержать
+    ни напоминание, ни тревогу.
     """
     moment = now or tu.now_utc()
     await close_stale_timers(bot, session, moment)
     await send_due_reminders(bot, session, moment)
+    await watch_tracker(bot, session, moment)
     await digest.send_pending(bot, session, moment)
     await panel.refresh_stale(bot, session, moment)
     await backup.run_daily(moment)
@@ -285,3 +299,88 @@ async def _settle(
         await repo.deactivate_reminder(session, reminder)
         return
     await repo.reschedule_reminder(session, reminder, following)
+
+
+async def watch_tracker(
+    bot: Bot, session: AsyncSession, now: datetime | None = None
+) -> None:
+    """Проверить данные трекера по тем же порогам, что и текст.
+
+    Второй путь срабатывания триажа: человек ни о чём не спрашивал, но цифры
+    сами показывают то, о чём стоит знать. Мало мокрых подгузников, потеря
+    больше десяти процентов от веса при рождении, слишком долгий перерыв между
+    кормлениями у новорождённого.
+
+    Здесь особенно важно не поднимать тревогу на пустом месте: сообщение
+    приходит без спроса, и ложная тревога в три часа ночи стоит дороже, чем в
+    ответ на вопрос. Отсюда три ограничителя: условия проверяются только при
+    наличии данных (`redflags.check_*` сами отказываются судить по пустоте),
+    каждая тревога поднимается не чаще раза в сутки, и отметка об этом лежит в
+    БД — иначе перезапуск ПК сбрасывал бы её несколько раз за день.
+    """
+    moment = now or tu.now_utc()
+
+    for family in await repo.all_families(session):
+        child = await repo.active_child(session, family.id)
+        if child is None:
+            continue
+        try:
+            await _watch_child(bot, session, family, child, moment)
+        except Exception:
+            # Сбой одной семьи не срывает обход остальных
+            log.exception("Наблюдение за данными семьи #%s сорвалось", family.id)
+
+
+async def _watch_child(
+    bot: Bot, session: AsyncSession, family: Family, child: Child, now: datetime
+) -> None:
+    today = tu.local_today(family.tz, now)
+    age = growth.age_days(child, now)
+
+    for watch in await _collect_watches(session, family, child, now, age):
+        if await repo.alert_raised(session, child.id, watch.id, today):
+            continue
+        status = await sending.deliver(bot, family, texts.watch_alert(watch))
+        if status == sending.RETRY:
+            # Сеть подвела — отметку не ставим, попробуем на следующем тике
+            continue
+        await repo.raise_alert(session, child.id, watch.id, today)
+        log.warning("Тревога по данным: %s, ребёнок #%s", watch.id, child.id)
+
+
+async def _collect_watches(
+    session: AsyncSession, family: Family, child: Child, now: datetime, age: int
+) -> list[redflags.Watch]:
+    """Что нашлось в данных. Порядок — по убыванию срочности.
+
+    Список собирается с дырами и отцеживается в конце: каждая проверка сама
+    решает, хватает ли данных, чтобы судить, и `None` от неё — нормальный
+    ответ, а не сбой.
+    """
+    start, end = tu.day_bounds(tu.local_today(family.tz, now), family.tz)
+    found: list[redflags.Watch | None] = []
+
+    # Потеря веса — по последнему взвешиванию, а не по среднему: важен факт
+    last_weight = await repo.last_measurement(session, child.id, WEIGHT)
+    if last_weight is not None:
+        found.append(growth_watch(child, last_weight.value))
+
+    # Подгузники считаем за прошедшую часть суток, но судим только если сутки
+    # уже прошли: в девять утра «мало подгузников» — это не тревога, а утро
+    if end <= now:
+        wet = await repo.count_events(session, child.id, start, end, WET_KINDS)
+        any_wet = await repo.last_event(session, child.id, WET_KINDS)
+        found.append(
+            redflags.check_wet_diapers(wet, age, has_records=any_wet is not None)
+        )
+
+    last_feed = await repo.last_event(session, child.id, FEED_KINDS)
+    if last_feed is not None:
+        gap = (now - (last_feed.ended_at or last_feed.started_at)).total_seconds() / 3600
+        found.append(redflags.check_feeding_gap(gap, age))
+
+    return [watch for watch in found if watch is not None]
+
+
+def growth_watch(child: Child, grams: float) -> redflags.Watch | None:
+    return redflags.check_weight_loss(growth.loss_from_birth(child, grams))

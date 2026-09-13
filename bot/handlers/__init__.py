@@ -6,14 +6,20 @@ aiogram отдаёт апдейт первому роутеру, чей филь
 
 `common` первым: в нём отказ для лички, и он обязан сработать раньше всего
 остального, что могло бы попытаться достать из апдейта несуществующую семью.
+
+`alarm` вторым, и это не вкусовщина. Если мама пишет про симптом, находясь
+посреди мастера `/baby`, ответить надо про симптом, а не записать его как имя
+ребёнка. Сюда же встанет граница для будущего Q&A: модель окажется ПОСЛЕ
+триажа, и экстренный ответ так и останется фиксированным текстом.
 """
 
 from aiogram import Router
 
-from bot.handlers import baby, common, export, measure, track, views
+from bot.handlers import alarm, baby, common, export, measure, track, views
 
 routers: list[Router] = [
     common.router,
+    alarm.router,
     views.router,
     export.router,
     track.router,

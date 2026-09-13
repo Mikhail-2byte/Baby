@@ -226,6 +226,31 @@ class Reminder(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
 
+class Alert(Base):
+    """Тревога, поднятая ботом по данным трекера, а не по вопросу человека.
+
+    Существует ради одного: не повторять одну и ту же тревогу. Наблюдение за
+    данными идёт каждую минуту, и без отметки «сегодня про это уже сказали»
+    семья получала бы «мало мокрых подгузников» 1440 раз в сутки — то есть
+    ровно один раз, потому что после третьего уведомления бота отключили бы.
+
+    Отметка в БД, а не в памяти: домашний ПК перезапускается чаще, чем
+    проходят сутки, и модульная переменная гарантированно потерялась бы.
+
+    Ключ — сутки, а не момент: если признак сохраняется назавтра, сказать о
+    нём стоит ещё раз.
+    """
+
+    __tablename__ = "alerts"
+    __table_args__ = (UniqueConstraint("child_id", "flag_id", "raised_on"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    child_id: Mapped[int] = mapped_column(ForeignKey("children.id"), index=True)
+    flag_id: Mapped[str] = mapped_column(String(32), index=True)
+    raised_on: Mapped[date] = mapped_column(Date)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+
 class WhoLms(Base):
     """Коэффициенты L, M, S таблиц роста ВОЗ — по одному дню возраста.
 
