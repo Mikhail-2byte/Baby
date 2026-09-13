@@ -1,18 +1,18 @@
-"""Сводки: `/today`, `/week` и кнопки периодов на панели."""
+"""Сводки и графики: `/today`, `/week`, `/chart`, кнопки периодов."""
 
 import logging
 from datetime import timedelta
 
 from aiogram import Router
 from aiogram.filters import Command
-from aiogram.types import CallbackQuery, Message
+from aiogram.types import BufferedInputFile, CallbackQuery, Message
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot import keyboards, texts
 from bot.db.models import Child, Family
 from bot.filters import IN_GROUP, IN_GROUP_CB
 from bot.keyboards import StatsCB
-from bot.services import stats
+from bot.services import charts, stats
 from bot.services import timeutil as tu
 
 log = logging.getLogger(__name__)
@@ -20,67 +20,30 @@ log = logging.getLogger(__name__)
 router = Router(name="views")
 
 
-def _render(child: Child, span: stats.Span, label: str) -> str:
-    return texts.day_summary(
-        child,
-        label,
-        feeds=span.feeds,
-        feed_minutes=span.feed_minutes,
-        bottle_ml=span.bottle_ml,
-        sleep_total=span.sleep_time,
-        sleep_count=span.sleep_count,
-        wet=span.wet,
-        dirty=span.dirty,
-        longest_sleep=span.longest_sleep,
-    )
-
-
 async def _today(session: AsyncSession, family: Family, child: Child) -> str:
-    now = tu.now_utc()
-    span = await stats.day(session, child, family.tz, now=now)
-    return _render(child, span, "сегодня")
+    span = await stats.day(session, child, family.tz, now=tu.now_utc())
+    return texts.day_summary_from_span(child, span, "сегодня")
 
 
 async def _week(session: AsyncSession, family: Family, child: Child) -> str:
-    """Неделя: итог плюс построчная разбивка по дням.
-
-    Построчно, а не графиком: графики — этап 3, а разбивка нужна уже сейчас,
-    чтобы видеть, что вчерашняя бессонная ночь была именно вчерашней.
-    """
     now = tu.now_utc()
     total, days = await stats.week(session, child, family.tz, now=now)
-    lines = [_render(child, total, "неделя"), "", "<b>По дням:</b>"]
-    for day, span in days:
-        sleep = texts.duration(span.sleep_time) if span.sleep_time else "—"
-        lines.append(
-            f"{tu.WEEKDAYS_SHORT[day.weekday()]} {tu.day_stamp(day)}: "
-            f"🍼 {span.feeds} · 😴 {sleep} · 💧 {span.wet}/{span.dirty}"
-        )
-    return "\n".join(lines)
+    return texts.week_summary(child, total, days)
 
 
 async def _month(session: AsyncSession, family: Family, child: Child) -> str:
-    """Последние 30 дней — среднее за сутки.
+    """Последние 30 дней. У ребёнка младше месяца — столько, сколько он прожил.
 
-    Именно среднее, а не сумма: «812 кормлений за месяц» не говорит ни о чём,
-    а «8 кормлений в сутки» сравнимо с нормой и с прошлым месяцем.
+    Иначе среднее делилось бы на 30 при неделе данных и занижалось вчетверо —
+    ровно то место, где родители решили бы, что кормят слишком редко.
     """
     now = tu.now_utc()
     today = tu.local_today(family.tz, now)
-    start, _ = tu.day_bounds(today - timedelta(days=29), family.tz)
+    days = min(30, max(1, (now - child.born_at).days + 1))
+    start, _ = tu.day_bounds(today - timedelta(days=days - 1), family.tz)
     _, end = tu.day_bounds(today, family.tz)
     span = await stats.collect(session, child, start, end, now)
-
-    days = max(1, (now - child.born_at).days + 1)
-    days = min(days, 30)
-    return (
-        f"📊 <b>{child.name}, последние {days} "
-        f"{texts.plural(days, 'день', 'дня', 'дней')}</b>\n\n"
-        f"🍼 Кормления: {span.feeds / days:.1f} в сутки\n"
-        f"😴 Сон: {texts.duration(span.sleep_time / days)} в сутки\n"
-        f"💧 Подгузники: {span.wet / days:.1f} мокрых, "
-        f"{span.dirty / days:.1f} со стулом в сутки"
-    )
+    return texts.average_summary(child, span, days)
 
 
 PERIODS = {"today": _today, "week": _week, "month": _month}
@@ -108,6 +71,50 @@ async def week(
     await message.answer(
         await _week(session, family, child), reply_markup=keyboards.stats()
     )
+
+
+@router.message(IN_GROUP, Command("chart"))
+async def chart(
+    message: Message, session: AsyncSession, family: Family, child: Child | None
+) -> None:
+    """Оба графика по требованию.
+
+    Отправляем по одному, а не альбомом: у альбома одна подпись на всю группу,
+    а подписать надо каждый — иначе непонятно, что на картинке.
+    """
+    if child is None:
+        await message.answer(texts.NO_CHILD)
+        return
+
+    sent = await send_charts(message, session, family, child)
+    if not sent:
+        await message.answer(texts.CHART_EMPTY)
+
+
+async def send_charts(
+    message: Message, session: AsyncSession, family: Family, child: Child
+) -> bool:
+    """Отправить графики, которые есть. `False` — не было ни одного."""
+    now = tu.now_utc()
+    sent = False
+
+    weight = await charts.weight_png(session, child, now)
+    if weight is not None:
+        await message.answer_photo(
+            BufferedInputFile(weight, "weight.png"),
+            caption=f"Вес · {child.name} · коридоры ВОЗ",
+        )
+        sent = True
+
+    rhythm = await charts.rhythm_png(session, child, family, now)
+    if rhythm is not None:
+        await message.answer_photo(
+            BufferedInputFile(rhythm, "rhythm.png"),
+            caption="Ритм суток за неделю",
+        )
+        sent = True
+
+    return sent
 
 
 @router.callback_query(IN_GROUP_CB, StatsCB.filter())

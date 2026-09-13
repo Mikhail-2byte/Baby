@@ -10,11 +10,12 @@ aiogram отдаёт апдейт первому роутеру, чей филь
 
 from aiogram import Router
 
-from bot.handlers import baby, common, measure, track, views
+from bot.handlers import baby, common, export, measure, track, views
 
 routers: list[Router] = [
     common.router,
     views.router,
+    export.router,
     track.router,
     baby.router,
     measure.router,

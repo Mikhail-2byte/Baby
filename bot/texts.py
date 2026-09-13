@@ -13,6 +13,7 @@
 """
 
 from datetime import datetime, timedelta
+from typing import TYPE_CHECKING
 
 from bot.db.models import (
     DIAPER_DIRTY,
@@ -37,10 +38,18 @@ from bot.db.models import (
 )
 from bot.services import timeutil as tu
 
+if TYPE_CHECKING:
+    # Только для проверки типов: в рантайме импорта нет, потому что `stats`
+    # сам обращается к `texts` — цикл разорван тем, что тот импорт локальный
+    from bot.services.stats import Span
+
+NL = chr(10)
+
 COMMANDS = [
     ("panel", "показать панель"),
     ("today", "сводка за сегодня"),
     ("week", "статистика за неделю"),
+    ("chart", "графики: вес и ритм суток"),
     ("weight", "записать вес"),
     ("baby", "данные о ребёнке"),
     ("remind", "напоминания"),
@@ -309,6 +318,81 @@ def day_summary(
 
     lines.append(f"💧 Подгузники: {wet} мокрых, {dirty} со стулом")
     return "\n".join(lines)
+
+
+def week_summary(
+    child: Child, total: "Span", days: list, *, plain: bool = False
+) -> str:
+    """Неделя: итог плюс построчная разбивка по дням.
+
+    Разбивка нужна не для красоты: без неё «спала 8 часов в среднем» скрывает
+    ровно то, что родители хотят увидеть, — была ли бессонная ночь вчера или
+    неделю назад.
+
+    `plain=True` — для PDF. В чате значки в построчной разбивке работают
+    подписями («🍼 5 · 😴 5 ч»), и это компактно. В PDF их нет в шрифте, а
+    вырезать их нельзя: останется «5 · 5 ч · 0/0» — строка без единого
+    указания, что это за числа. Поэтому там подписи словами, и решается это
+    здесь, а не заменой значков постфактум: такая замена дала бы
+    «кормления Кормления: 10 раз» везде, где слово уже есть.
+    """
+    marks = ("кормл.", "сон", "подгуз.") if plain else ("🍼", "😴", "💧")
+
+    lines = [day_summary_from_span(child, total, "за неделю"), "", "<b>По дням:</b>"]
+    for day, span in days:
+        sleep = duration(span.sleep_time) if span.sleep_time else "—"
+        lines.append(
+            f"{tu.WEEKDAYS_SHORT[day.weekday()]} {tu.day_stamp(day)}: "
+            f"{marks[0]} {span.feeds} · {marks[1]} {sleep} · "
+            f"{marks[2]} {span.wet}/{span.dirty}"
+        )
+    return NL.join(lines)
+
+
+def day_summary_from_span(child: Child, span: "Span", label: str) -> str:
+    """`stats.Span` → текст сводки. Обёртка, чтобы вызывающие не разбирали поля."""
+    return day_summary(
+        child,
+        label,
+        feeds=span.feeds,
+        feed_minutes=span.feed_minutes,
+        bottle_ml=span.bottle_ml,
+        sleep_total=span.sleep_time,
+        sleep_count=span.sleep_count,
+        wet=span.wet,
+        dirty=span.dirty,
+        longest_sleep=span.longest_sleep,
+    )
+
+
+def average_summary(child: Child, span: "Span", days: int) -> str:
+    """Средние за сутки. Именно средние, а не суммы.
+
+    «812 кормлений за месяц» не говорит ни о чём; «8 кормлений в сутки»
+    сравнимо и с нормой, и с прошлым месяцем.
+    """
+    return (
+        f"📊 <b>{child.name}, последние {days} "
+        f"{plural(days, 'день', 'дня', 'дней')}</b>\n\n"
+        f"🍼 Кормления: {span.feeds / days:.1f} в сутки\n"
+        f"😴 Сон: {duration(span.sleep_time / days)} в сутки\n"
+        f"💧 Подгузники: {span.wet / days:.1f} мокрых, "
+        f"{span.dirty / days:.1f} со стулом в сутки"
+    )
+
+
+DIGEST_HEAD = "📬 <b>Итоги недели</b>\n\n"
+
+DIGEST_NO_DATA = (
+    "📬 За неделю записей не было. Если бот молчал не по делу — проверьте /ping."
+)
+
+EXPORT_CAPTION = (
+    "Выгрузка для врача: {events} событий, {measures} измерений.\n"
+    "Длительности с пометкой «прибл.» посчитал я сам — таймер забыли закрыть."
+)
+EXPORT_EMPTY = "Пока нечего выгружать: ни одной записи."
+CHART_EMPTY = "Пока не из чего строить график."
 
 
 # --- Карточка ребёнка -----------------------------------------------------

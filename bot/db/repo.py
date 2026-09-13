@@ -283,10 +283,20 @@ async def events_between(
     Именно пересекающиеся, а не начавшиеся внутри: сон с 23:40 до 06:10
     принадлежит обеим суткам, и сутки, которые его не видят, показывают
     неправдоподобные «спала 4 часа».
+
+    Пустой `ended_at` означает идущий таймер **только** у событий из
+    `TIMED_KINDS`. У подгузника и бутылочки он пуст всегда: это моменты, а не
+    отрезки. Без этой оговорки условие «либо не закончилось» затягивало в
+    любую выборку все мгновенные события за всю историю — окно выгрузки
+    переставало что-либо ограничивать, а запрос за сутки тащил годовой архив.
     """
     overlaps = and_(
         Event.started_at < end,
-        or_(Event.ended_at.is_(None), Event.ended_at > start),
+        or_(
+            Event.started_at >= start,
+            Event.ended_at > start,
+            and_(Event.ended_at.is_(None), Event.kind.in_(TIMED_KINDS)),
+        ),
     )
     query = select(Event).where(Event.child_id == child_id, overlaps)
     if kinds:

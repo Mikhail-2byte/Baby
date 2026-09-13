@@ -191,3 +191,37 @@ async def test_panel_without_who_tables_shows_birth_delta(session, child, family
     text = await stats.panel_text(session, family, child, now)
     assert f"3{texts.THIN_SPACE}250 г" in text
     assert "от рождения" in text
+
+
+@pytest.mark.asyncio
+async def test_instant_events_do_not_leak_across_windows(
+    session, child, mother, family, now
+):
+    """Подгузник из прошлого года не должен попадать в сегодняшнюю выборку.
+
+    У мгновенных событий `ended_at` пуст всегда — это момент, а не отрезок.
+    Пока условие «либо не закончилось» применялось ко всем видам, такое
+    событие выглядело вечно идущим таймером и затягивалось в любую выборку:
+    окно выгрузки переставало ограничивать, а запрос за сутки тащил архив.
+    """
+    ancient = now - timedelta(days=300)
+    await repo.add_event(session, child.id, mother.id, DIAPER_WET, started_at=ancient)
+
+    start, end = tu.day_bounds(tu.local_today(family.tz, now), family.tz)
+    assert await repo.events_between(session, child.id, start, end) == []
+
+
+@pytest.mark.asyncio
+async def test_running_timer_still_leaks_in_on_purpose(
+    session, child, mother, family, now
+):
+    """А вот незакрытый сон из прошлых суток в выборку попасть обязан.
+
+    Это обратная сторона того же условия: таймер, идущий с вечера, и есть
+    событие, пересекающее границу суток.
+    """
+    await repo.start_event(
+        session, child.id, mother.id, SLEEP, started_at=now - timedelta(hours=10)
+    )
+    start, end = tu.day_bounds(tu.local_today(family.tz, now), family.tz)
+    assert len(await repo.events_between(session, child.id, start, end)) == 1

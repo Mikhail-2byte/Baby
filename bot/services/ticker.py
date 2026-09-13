@@ -25,7 +25,7 @@ from bot.config import settings
 from bot.db import repo
 from bot.db.models import Child, Family, Reminder
 from bot.db.session import Session
-from bot.services import backup, panel, sending
+from bot.services import backup, digest, panel, sending
 from bot.services import timeutil as tu
 
 log = logging.getLogger(__name__)
@@ -139,12 +139,13 @@ async def tick_once(
     """Одна итерация. Порядок шагов не случаен.
 
     Забытые таймеры закрываем первыми: пока они висят, любая сводка и любая
-    панель показывают неправду. Бэкап последним — сорвавшийся снимок не должен
-    задержать напоминание.
+    панель показывают неправду — а следом идут и сводка, и панель. Бэкап
+    последним: сорвавшийся снимок не должен задержать напоминание.
     """
     moment = now or tu.now_utc()
     await close_stale_timers(bot, session, moment)
     await send_due_reminders(bot, session, moment)
+    await digest.send_pending(bot, session, moment)
     await panel.refresh_stale(bot, session, moment)
     await backup.run_daily(moment)
 

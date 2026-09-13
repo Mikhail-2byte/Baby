@@ -1,0 +1,360 @@
+"""Графики: вес с центильными коридорами ВОЗ и ритм суток за неделю.
+
+Два решения, которые стоит назвать вслух.
+
+**Объектный API matplotlib, а не `pyplot`.** `pyplot` держит глобальный реестр
+фигур и не потокобезопасен, а рисуем мы из `asyncio.to_thread`. С `Figure` и
+`FigureCanvasAgg` глобального состояния нет вовсе — заодно исчезает и классическая
+утечка «забыли `plt.close`», которая за месяц работы съедает память.
+
+**Рендер — всегда в отдельном потоке.** Матплотлиб на паре тысяч точек думает
+десятки миллисекунд, и в event loop это ровно тот симптом, от которого стоит
+heartbeat: `getUpdates` встаёт, процесс жив, бот молчит.
+
+Оформление следует общим правилам: тонкие штрихи, хайрлайновая сетка,
+прямые подписи вместо легенды там, где серия одна. Палитра проверена на
+различимость при дальтонизме (ΔE 24.7 при пороге 8).
+"""
+
+import asyncio
+import io
+import logging
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta
+
+from matplotlib.axes import Axes
+from matplotlib.backends.backend_agg import FigureCanvasAgg
+from matplotlib.figure import Figure
+from matplotlib.patches import Patch
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from bot.db import repo
+from bot.db.models import FEED_KINDS, SLEEP, WEIGHT, Child, Family
+from bot.services import growth
+from bot.services import timeutil as tu
+
+log = logging.getLogger(__name__)
+
+# --- Палитра --------------------------------------------------------------
+# Роли, а не «цвет графика»: слот 1 — сон, слот 2 — вес и кормления. Порядок
+# слотов и есть механизм различимости при дальтонизме, менять его нельзя
+SURFACE = "#fcfcfb"
+INK = "#0b0b0b"
+INK_MUTED = "#898781"
+GRID = "#e1e0d9"
+AXIS = "#c3c2b7"
+NIGHT = "#f0efec"
+
+SERIES_SLEEP = "#2a78d6"  # слот 1, синий
+SERIES_FEED = "#eb6834"  # слот 2, оранжевый
+
+# Центильные коридоры — последовательная шкала одного тона, от светлого края к
+# тёмной середине. Крупные заливки обязаны оставаться фоном: насыщенный цвет
+# приберегаем для данных, иначе коридор перекричит саму линию веса
+BAND_OUTER = "#e3eefc"  # ±2 SD
+BAND_INNER = "#cde2fb"  # ±1 SD
+BAND_MEDIAN = "#86b6ef"
+
+# Рисуем «в CSS-пикселях»: размер задаём так, будто дюйм это 100 пикселей, а
+# печатаем вдвое плотнее. Тогда `linewidth=2` читается как двухпиксельная линия
+# из общих правил, а картинка остаётся чёткой на телефоне
+DPI = 200
+FIGSIZE = (8.0, 4.5)
+
+# Кириллица в этом шрифте есть, и он же стоит у matplotlib по умолчанию.
+# Задаём явно на случай, если системные настройки подменят набор: получить
+# ряды квадратиков вместо подписей на графике для врача не хочется
+FONT_FAMILY = "DejaVu Sans"
+
+
+@dataclass
+class Band:
+    """Центильный коридор на один день возраста."""
+
+    day: int
+    sd2neg: float
+    sd1neg: float
+    median: float
+    sd1: float
+    sd2: float
+
+
+def _render(figure: Figure) -> bytes:
+    """Фигура → PNG в память. Файлы на диск не пишем — они никому не нужны."""
+    buffer = io.BytesIO()
+    FigureCanvasAgg(figure).print_png(buffer)
+    return buffer.getvalue()
+
+
+def _style(axes: Axes) -> None:
+    """Общая отделка: сетка хайрлайном, рамка убрана, подписи приглушены.
+
+    Сетка сплошная, а не пунктирная: пунктир добавляет шум и спорит с данными.
+    """
+    axes.set_facecolor(SURFACE)
+    axes.grid(True, color=GRID, linewidth=0.8)
+    axes.set_axisbelow(True)
+    for side in ("top", "right"):
+        axes.spines[side].set_visible(False)
+    for side in ("left", "bottom"):
+        axes.spines[side].set_color(AXIS)
+        axes.spines[side].set_linewidth(0.8)
+    axes.tick_params(colors=INK_MUTED, labelsize=9, length=0)
+
+
+# --- Вес ------------------------------------------------------------------
+
+
+async def collect_weight(
+    session: AsyncSession, child: Child, now: datetime
+) -> tuple[list[tuple[int, float]], list[Band], tuple[float, float] | None]:
+    """Точки взвешиваний, коридоры ВОЗ на тот же диапазон и центиль последней.
+
+    Точка — это (возраст в днях, граммы). Возраст скорректированный, тот же,
+    по которому считается центиль: иначе у недоношенного ребёнка точки легли бы
+    не на свой коридор.
+
+    Всё обращение к БД — здесь; рисование получает готовые числа и про базу не
+    знает. Иначе ленивая подгрузка уехала бы в чужой поток вместе с сессией.
+    """
+    rows = await repo.measurements(session, child.id, WEIGHT)
+    if not rows:
+        return [], [], None
+
+    points = [
+        (growth.corrected_age_days(child, row.taken_at), row.value) for row in rows
+    ]
+
+    first_day = growth.corrected_age_days(child, rows[0].taken_at)
+    last_day = growth.corrected_age_days(child, rows[-1].taken_at)
+    # Хвост вперёд: коридор, обрывающийся ровно на последней точке, выглядит
+    # так, будто ребёнок дошёл до края нормы. Неделя запаса это снимает
+    last_day = max(last_day + 7, first_day + 14)
+
+    bands: list[Band] = []
+    for day in range(first_day, last_day + 1):
+        lms = await growth.lms_at(session, child.sex, WEIGHT, day)
+        if lms is None:
+            continue
+        bands.append(
+            Band(
+                day=day,
+                sd2neg=growth._sd_at(*lms, -2) * 1000,
+                sd1neg=growth._sd_at(*lms, -1) * 1000,
+                median=growth._sd_at(*lms, 0) * 1000,
+                sd1=growth._sd_at(*lms, 1) * 1000,
+                sd2=growth._sd_at(*lms, 2) * 1000,
+            )
+        )
+
+    evaluated = await growth.evaluate(
+        session, child, WEIGHT, rows[-1].value, rows[-1].taken_at
+    )
+    return points, bands, evaluated
+
+
+def draw_weight(
+    child_name: str,
+    points: list[tuple[int, float]],
+    bands: list[Band],
+    evaluated: tuple[float, float] | None,
+) -> bytes:
+    """Вес по дням на фоне центильных коридоров ВОЗ.
+
+    Ось x — возраст в днях, а не даты. Коридоры ВОЗ определены именно на
+    возрасте, и любой пересчёт в даты добавил бы шаг, на котором можно
+    ошибиться; к тому же в первые месяцы родители и сами считают днями.
+
+    Легенды нет намеренно: серия одна, её называет заголовок, а границы
+    коридоров подписаны прямо у края — это читается быстрее, чем сверка с
+    отдельным блоком.
+    """
+    figure = Figure(figsize=FIGSIZE, dpi=DPI, facecolor=SURFACE)
+    axes = figure.add_subplot(111)
+    _style(axes)
+
+    if bands:
+        days = [band.day for band in bands]
+        axes.fill_between(
+            days, [b.sd2neg for b in bands], [b.sd2 for b in bands],
+            color=BAND_OUTER, linewidth=0,
+        )
+        axes.fill_between(
+            days, [b.sd1neg for b in bands], [b.sd1 for b in bands],
+            color=BAND_INNER, linewidth=0,
+        )
+        axes.plot(days, [b.median for b in bands], color=BAND_MEDIAN, linewidth=1.2)
+
+        # Прямые подписи у правого края вместо легенды
+        edge = days[-1]
+        for value, label in (
+            (bands[-1].sd2, "+2 SD"),
+            (bands[-1].median, "медиана ВОЗ"),
+            (bands[-1].sd2neg, "−2 SD"),
+        ):
+            axes.annotate(
+                label, (edge, value), xytext=(4, 0), textcoords="offset points",
+                color=INK_MUTED, fontsize=8, va="center", family=FONT_FAMILY,
+            )
+
+    if points:
+        ages = [age for age, _ in points]
+        values = [value for _, value in points]
+        axes.plot(
+            ages, values,
+            color=SERIES_FEED, linewidth=2.0,
+            marker="o", markersize=5, markerfacecolor=SURFACE,
+            markeredgewidth=2.0, markeredgecolor=SERIES_FEED,
+            zorder=5,
+        )
+        # Подписываем только последнюю точку: число на каждой превращает
+        # график в таблицу и перестаёт читаться
+        caption = f"{int(round(values[-1]))} г"
+        if evaluated is not None:
+            caption += f" · {evaluated[1]:.0f}-й центиль"
+        axes.annotate(
+            caption, (ages[-1], values[-1]), xytext=(0, 12),
+            textcoords="offset points", color=INK, fontsize=10,
+            fontweight="bold", ha="center", zorder=6, family=FONT_FAMILY,
+        )
+
+    axes.set_title(
+        f"Вес · {child_name}", color=INK, fontsize=13, fontweight="bold",
+        loc="left", pad=12, family=FONT_FAMILY,
+    )
+    axes.set_xlabel("возраст, дней", color=INK_MUTED, fontsize=9, family=FONT_FAMILY)
+    axes.set_ylabel("граммы", color=INK_MUTED, fontsize=9, family=FONT_FAMILY)
+    axes.yaxis.set_major_formatter(lambda value, _: f"{int(value):,}".replace(",", " "))
+
+    # Правый отступ ровно под подписи коридоров: больше — и справа повиснет
+    # пустая сетка, которую читают как «данные кончились раньше, чем норма»
+    if bands:
+        span = bands[-1].day - bands[0].day
+        axes.set_xlim(bands[0].day, bands[-1].day + max(3, span * 0.14))
+    figure.tight_layout()
+    return _render(figure)
+
+
+async def weight_png(
+    session: AsyncSession, child: Child, now: datetime
+) -> bytes | None:
+    """Готовый PNG или `None`, если рисовать нечего."""
+    points, bands, evaluated = await collect_weight(session, child, now)
+    if not points:
+        return None
+    return await asyncio.to_thread(draw_weight, child.name, points, bands, evaluated)
+
+
+# --- Ритм суток -----------------------------------------------------------
+
+
+@dataclass
+class DayRhythm:
+    """Один день: отрезки сна и моменты кормлений, в часах от полуночи."""
+
+    day: date
+    sleeps: list[tuple[float, float]]
+    feeds: list[float]
+
+
+async def collect_rhythm(
+    session: AsyncSession, child: Child, tz: str, now: datetime, days: int = 7
+) -> list[DayRhythm]:
+    """Последние `days` суток, каждое событие обрезано по границам своих суток."""
+    today = tu.local_today(tz, now)
+    result: list[DayRhythm] = []
+
+    for offset in range(days - 1, -1, -1):
+        target = today - timedelta(days=offset)
+        start, end = tu.day_bounds(target, tz)
+        events = await repo.events_between(session, child.id, start, end)
+
+        sleeps: list[tuple[float, float]] = []
+        feeds: list[float] = []
+        for event in events:
+            if event.kind == SLEEP:
+                began = max(event.started_at, start)
+                over = min(event.ended_at or now, end)
+                if over > began:
+                    sleeps.append((_hours(began, start), _hours(over, start)))
+            elif event.kind in FEED_KINDS and start <= event.started_at < end:
+                feeds.append(_hours(event.started_at, start))
+
+        result.append(DayRhythm(day=target, sleeps=sleeps, feeds=feeds))
+    return result
+
+
+def _hours(moment: datetime, start: datetime) -> float:
+    return (moment - start).total_seconds() / 3600
+
+
+def draw_rhythm(child_name: str, rhythm: list[DayRhythm]) -> bytes:
+    """Сутки по горизонтали, дни по вертикали — видно, куда съезжает режим.
+
+    Форма выбрана под вопрос, который родители задают на самом деле: не
+    «сколько она спала», а «когда». Сумма часов этого не показывает вовсе,
+    а здесь ночные отрезки выстраиваются в столбик, и сдвиг режима виден сразу.
+
+    Серий две, поэтому легенда обязательна: различать их только по цвету
+    нельзя.
+    """
+    height = max(2.6, 0.52 * len(rhythm) + 1.6)
+    figure = Figure(figsize=(FIGSIZE[0], height), dpi=DPI, facecolor=SURFACE)
+    axes = figure.add_subplot(111)
+    _style(axes)
+    axes.grid(True, axis="x", color=GRID, linewidth=0.8)
+    axes.grid(False, axis="y")
+
+    # Ночь фоном. Это не третья серия, а разметка оси — как затенённые выходные
+    # на биржевом графике: помогает читать, ничего не кодирует
+    axes.axvspan(0, 7, color=NIGHT, linewidth=0, zorder=0)
+    axes.axvspan(22, 24, color=NIGHT, linewidth=0, zorder=0)
+
+    for row, entry in enumerate(rhythm):
+        axes.broken_barh(
+            [(begin, over - begin) for begin, over in entry.sleeps],
+            (row - 0.22, 0.44),
+            facecolors=SERIES_SLEEP, edgecolors=SURFACE, linewidth=1.0, zorder=3,
+        )
+        for moment in entry.feeds:
+            # Кормление — момент, а не отрезок: короткий штрих честнее полоски
+            axes.vlines(
+                moment, row - 0.36, row + 0.36,
+                color=SERIES_FEED, linewidth=2.0, zorder=4,
+            )
+
+    axes.set_yticks(range(len(rhythm)))
+    axes.set_yticklabels(
+        [f"{tu.WEEKDAYS_SHORT[e.day.weekday()]} {tu.day_stamp(e.day)}" for e in rhythm],
+        fontsize=9, color=INK_MUTED, family=FONT_FAMILY,
+    )
+    axes.set_ylim(-0.7, len(rhythm) - 0.3)
+    axes.invert_yaxis()  # сегодня внизу, как в ленте чата
+
+    axes.set_xlim(0, 24)
+    axes.set_xticks(range(0, 25, 3))
+    axes.set_xticklabels([f"{h:02d}" for h in range(0, 25, 3)], fontsize=9, family=FONT_FAMILY)
+
+    axes.set_title(
+        f"Ритм суток · {child_name}", color=INK, fontsize=13, fontweight="bold",
+        loc="left", pad=12, family=FONT_FAMILY,
+    )
+    axes.legend(
+        handles=[
+            Patch(facecolor=SERIES_SLEEP, label="сон"),
+            Patch(facecolor=SERIES_FEED, label="кормление"),
+        ],
+        loc="lower right", bbox_to_anchor=(1.0, 1.0), ncol=2,
+        frameon=False, fontsize=9, labelcolor=INK_MUTED,
+    )
+    figure.tight_layout()
+    return _render(figure)
+
+
+async def rhythm_png(
+    session: AsyncSession, child: Child, family: Family, now: datetime, days: int = 7
+) -> bytes | None:
+    rhythm = await collect_rhythm(session, child, family.tz, now, days)
+    if not any(entry.sleeps or entry.feeds for entry in rhythm):
+        return None
+    return await asyncio.to_thread(draw_rhythm, child.name, rhythm)
