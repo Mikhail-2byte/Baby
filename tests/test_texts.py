@@ -109,6 +109,44 @@ def test_missed_summary_truncates_long_lists(family):
     assert len(text) < 4096
 
 
+def test_angle_brackets_in_a_reminder_do_not_eat_the_message(family):
+    """В нормативных актах сноски пишут как «<1>», и это незакрытый тег.
+
+    Telegram на сломанной разметке не ругается внятно — он просто отказывается
+    отправить сообщение, то есть напоминание исчезает, а в логе остаётся
+    `BadRequest`. Тот же класс поломки уже стоил одного ответа Q&A.
+    """
+    from bot.db.models import Reminder
+
+    now = datetime(2026, 9, 7, 12, 0)
+    reminder = Reminder(text="Осмотр <1> и анализы", fire_at=now)
+
+    one = texts.reminder_message(reminder, family.tz, now, late=False)
+    many = texts.missed_summary([reminder], family.tz, now)
+
+    assert "<1>" not in one and "&lt;1&gt;" in one
+    assert "<1>" not in many and "&lt;1&gt;" in many
+    # Своя разметка при этом на месте: экранируется только чужой текст
+    assert "<i>" in texts.reminder_message(reminder, family.tz, now, late=True)
+
+
+def test_no_medical_numbers_live_in_python():
+    """Правило «числа не через LLM» имеет вторую половину: и не в коде.
+
+    Доза витамина D, сроки прививок и возрасты осмотров лежат в
+    `schedule_ru.yaml` — там, где их может прочитать и поправить врач. Проверка
+    механическая, потому что на честное слово такие вещи и уезжают в Python.
+    """
+    from pathlib import Path
+
+    root = Path(texts.__file__).resolve().parent
+    marks = ("МЕ/сут", "1000 МЕ", " МЕ ", "мкг")
+    for path in root.rglob("*.py"):
+        body = path.read_text(encoding="utf-8")
+        for mark in marks:
+            assert mark not in body, f"{path.name}: {mark}"
+
+
 # --- Меню команд ----------------------------------------------------------
 
 

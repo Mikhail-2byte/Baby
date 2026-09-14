@@ -151,6 +151,68 @@ async def create_child(
     return child
 
 
+async def update_child(
+    session: AsyncSession,
+    child: Child,
+    *,
+    name: str | None = None,
+    sex: str | None = None,
+    born_at: datetime | None = None,
+    birth_weight_g: int | None = None,
+) -> Child:
+    """Поправить поля карточки. `None` означает «не трогать», а не «стереть».
+
+    Стирания здесь нет намеренно: ни один путь в интерфейсе не просит убрать
+    уже введённый вес или дату, а различать «не передали» и «передали пусто»
+    пришлось бы отдельным дозорным значением ради случая, которого нет.
+    """
+    if name is not None:
+        child.name = name
+    if sex is not None:
+        child.sex = sex
+    if born_at is not None:
+        child.born_at = born_at
+    if birth_weight_g is not None:
+        child.birth_weight_g = birth_weight_g
+    await session.commit()
+    return child
+
+
+async def measurement_at(
+    session: AsyncSession, child_id: int, kind: str, moment: datetime
+) -> Measurement | None:
+    """Измерение данного вида, снятое ровно в этот момент.
+
+    Нужно ровно для одного: вес при рождении живёт в двух местах — полем
+    `children.birth_weight_g` и точкой на графике с `taken_at = born_at`.
+    Поправив одно и забыв другое, мы получили бы карточку и график, которые
+    расходятся между собой, причём заметить это можно было бы только глазами.
+    """
+    return await session.scalar(
+        select(Measurement).where(
+            Measurement.child_id == child_id,
+            Measurement.kind == kind,
+            Measurement.taken_at == moment,
+        )
+    )
+
+
+async def update_measurement(
+    session: AsyncSession,
+    measurement: Measurement,
+    *,
+    taken_at: datetime | None = None,
+    value: float | None = None,
+) -> Measurement:
+    """Поправить измерение. `None`, как и у `update_child`, — «не трогать»."""
+    if taken_at is not None:
+        measurement.taken_at = taken_at
+    if value is not None:
+        measurement.value = value
+    await session.commit()
+    return measurement
+
+
 # --- События --------------------------------------------------------------
 
 
@@ -511,6 +573,28 @@ async def mark_reminder_sent(
 async def deactivate_reminder(session: AsyncSession, reminder: Reminder) -> None:
     reminder.active = False
     await session.commit()
+
+
+async def deactivate_preset(session: AsyncSession, family_id: int, preset: str) -> int:
+    """Погасить весь пресет и сказать, сколько напоминаний сняли.
+
+    `reminder_by_preset` возвращает одно, и для «витамина D» этого хватает.
+    Но подписка на прививки — это полтора десятка разовых строк, по одной на
+    возраст; выключить первую значит оставить четырнадцать работать.
+    """
+    reminders = await session.scalars(
+        select(Reminder).where(
+            Reminder.family_id == family_id,
+            Reminder.preset == preset,
+            Reminder.active.is_(True),
+        )
+    )
+    count = 0
+    for reminder in reminders:
+        reminder.active = False
+        count += 1
+    await session.commit()
+    return count
 
 
 async def reschedule_reminder(

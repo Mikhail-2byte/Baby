@@ -11,7 +11,7 @@ import pytest
 
 from bot.db import repo
 from bot.db.models import FEED_BREAST, SLEEP
-from bot.services import ticker
+from bot.services import schedule, ticker
 from bot.services import timeutil as tu
 
 TZ = "Europe/Moscow"
@@ -231,3 +231,65 @@ async def test_tick_survives_a_broken_family(session, family, mother, bot, monke
 
     monkeypatch.setattr(ticker.sending, "deliver", boom)
     await ticker.send_due_reminders(bot, session, now)  # не должно упасть
+
+
+# --- Стык с пресетами этапа 2 ---------------------------------------------
+#
+# Два теста ниже — единственная проверка того, что ради `/remind` тикер
+# править не пришлось. Он и до этого этапа умел ровно два случая, разовое и
+# `rrule`, и подписка на календарь легла на первый из них как есть.
+
+
+@pytest.mark.asyncio
+async def test_a_preset_reminder_makes_a_full_round_trip(session, family, mother, bot):
+    """Пресет «кормление» проходит полный круг и остаётся жить.
+
+    Текст приходит из `schedule_ru.yaml`, правило — из `schedule.rrule_of`,
+    а сдвиг считает тикер. Ни одна из трёх сторон о двух других не знает.
+    """
+    feed = schedule.BY_ID["feed"]
+    # Без микросекунд: правило считает `rrulestr`, а он работает с точностью до
+    # секунды и молча их срезает. Для напоминаний это безразлично, для
+    # сравнения «ровно три часа» — нет
+    now = tu.now_utc().replace(microsecond=0)
+    reminder = await repo.create_reminder(
+        session, family.id, mother.id,
+        text=feed.text, fire_at=now,
+        rrule=schedule.rrule_of(feed), preset=feed.id,
+    )
+
+    await ticker.send_due_reminders(bot, session, now)
+    await session.refresh(reminder)
+
+    assert len(bot.texts) == 1
+    assert "Пора кормить" in bot.texts[0]
+    assert reminder.active is True
+    assert reminder.fire_at == now + timedelta(hours=feed.default_hours)
+
+
+@pytest.mark.asyncio
+async def test_a_fired_calendar_reminder_dies_and_the_rest_live(
+    session, family, mother, bot
+):
+    """Сработавшая строка подписки гаснет сама, остальные не трогаются.
+
+    Именно поэтому подписка сделана пачкой разовых, а не одним напоминанием,
+    которое кто-то перезаряжал бы: перезаряжать календарь тикер не умеет и
+    уметь не должен.
+    """
+    now = tu.now_utc()
+    due = await repo.create_reminder(
+        session, family.id, mother.id,
+        text="Прививки: 3 месяца", fire_at=now, preset="vaccine",
+    )
+    later = await repo.create_reminder(
+        session, family.id, mother.id,
+        text="Прививки: 6 месяцев", fire_at=now + timedelta(days=90), preset="vaccine",
+    )
+
+    await ticker.send_due_reminders(bot, session, now)
+    await session.refresh(due)
+    await session.refresh(later)
+
+    assert due.active is False and due.sent_at is not None
+    assert later.active is True and later.sent_at is None

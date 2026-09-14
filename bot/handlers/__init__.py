@@ -17,17 +17,24 @@ aiogram отдаёт апдейт первому роутеру, чей филь
 выше `measure` — потому что иначе апдейт до него не дойдёт: там голый `F.text`.
 Своё голое число `qa` при этом не съедает: его обработчик висит на фильтре
 «ждём вопрос», и не совпав, пропускает апдейт дальше нетронутым.
+
+`remind` встал между `export` и `track` — то есть ниже `alarm` и выше
+`measure`. Обе границы он не двигает и двигать не может: в нём нет ни одного
+текстового обработчика, только команда и кнопки. Ниже `alarm` он стоит не по
+необходимости, а по правилу: граница безопасности не двигается ни для кого,
+включая безобидный экран настроек.
 """
 
 from aiogram import Router
 
-from bot.handlers import alarm, baby, common, export, measure, qa, track, views
+from bot.handlers import alarm, baby, common, export, measure, qa, remind, track, views
 
 routers: list[Router] = [
     common.router,
     alarm.router,
     views.router,
     export.router,
+    remind.router,
     track.router,
     baby.router,
     qa.router,

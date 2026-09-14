@@ -1,7 +1,7 @@
-﻿<?xml version="1.0" encoding="UTF-16"?>
+﻿<?xml version="1.0" encoding="utf-8"?>
 <Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <RegistrationInfo>
-    <Description>Family planer: Telegram-bot semejnogo planirovshchika. Zapusk cherez run-baby-hidden.vbs (bez okna konsoli) -&gt; run.cmd (migracii + long polling), log v data\bot.log. Vtoroj trigger kazhdye 5 minut - storozh: esli process umer, on podnimetsya sam; poka rabotaet, IgnoreNew ne daet zapustit vtoroj ekzemplyar.</Description>
+    <Description>Baby Bot: Telegram-bot pro pervyj god zhizni rebenka (treker kormlenij, sna, podguznikov i vesa). Zapusk cherez run-baby-hidden.vbs (bez okna konsoli) -&gt; run.cmd (migracii + long polling), log v data\bot.log. Vtoroj trigger kazhdye 5 minut - storozh: esli process umer, on podnimetsya sam; poka rabotaet, IgnoreNew ne daet zapustit vtoroj ekzemplyar. Token otdelnyj ot FamilyPlanerBot.</Description>
     <URI>\BabyBot</URI>
   </RegistrationInfo>
   <Principals>

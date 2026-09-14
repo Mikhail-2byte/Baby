@@ -12,7 +12,7 @@
 * ни одного слова, которое можно прочитать как оценку родителей.
 """
 
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from typing import TYPE_CHECKING
 
 from bot.db.models import (
@@ -43,6 +43,7 @@ if TYPE_CHECKING:
     # сам обращается к `texts` — цикл разорван тем, что тот импорт локальный
     from bot.services.kb import Chunk
     from bot.services.redflags import Watch
+    from bot.services.schedule import Entry, Preset, Section, Source
     from bot.services.stage import Milestones, Period
     from bot.services.stats import Span
 
@@ -56,9 +57,7 @@ COMMANDS = [
     ("stage", "что происходит на этой неделе"),
     ("weight", "записать вес"),
     ("baby", "данные о ребёнке"),
-    # /remind сюда вернётся вместе с обработчиком (этап 2, пункт открыт).
-    # Объявлять команду раньше нельзя: Telegram покажет её в меню группы,
-    # а тап по ней провалится мимо всех роутеров и не ответит ничего
+    ("remind", "напоминания и календарь"),
     ("export", "выгрузка для врача"),
     ("redflags", "когда звонить 103"),
     ("backup", "снять копию базы"),
@@ -190,7 +189,7 @@ def percentile_str(z: float, pct: float) -> str:
 NO_CHILD = (
     "Здесь пока нет ребёнка.\n\n"
     "Заведите карточку командой /baby — понадобятся имя, пол и дата рождения. "
-    "Вес и рост при рождении можно добавить позже."
+    "Вес при рождении можно пропустить и добавить позже."
 )
 
 PANEL_HINT = "Нажмите кнопку, чтобы записать. Панель обновляется сама."
@@ -438,6 +437,51 @@ def baby_card(child: Child, now: datetime, tz: str) -> str:
 BABY_SAVED = "Готово. Панель ниже — ей и пользуйтесь."
 
 
+# --- Правка карточки ------------------------------------------------------
+#
+# Карточку заполняют один раз, в первые часы после родов и не выспавшись.
+# Опечатка в моменте рождения тянет за собой все центили и порог «младше трёх
+# месяцев» в триаже, поэтому правка обязана быть в чате, а не в SQL.
+
+BABY_EDIT_HINT = "Что поправить?"
+
+BABY_EDIT_ASK_NAME = "Как зовут на самом деле?"
+BABY_EDIT_ASK_SEX = "Девочка или мальчик?"
+BABY_EDIT_ASK_BORN = (
+    "Когда родилась? Напишите дату и время: <code>13.09.2026 04:20</code>\n"
+    "Если время не помните, хватит и даты."
+)
+BABY_EDIT_ASK_WEIGHT = (
+    "Вес при рождении в граммах — например <code>3420</code>.\n"
+    "Это тот вес, что записан в выписке из роддома, а не сегодняшний: "
+    "от него считается потеря массы первых дней."
+)
+
+
+def baby_edited(field: str, value: str) -> str:
+    """Что именно изменилось — словами, а не «сохранено».
+
+    Человек правит карточку потому, что раньше ошибся; показать новое значение
+    вслух дешевле, чем заставлять его открывать карточку и сверять.
+    """
+    return f"Поправил. {field}: <b>{value}</b>"
+
+
+def presets_dropped(count: int) -> str:
+    """Сказать, что подписки на календарь погасли вместе с датой рождения.
+
+    Молчать здесь нельзя. Даты прививок и осмотров замораживаются в момент
+    включения подписки, и после правки даты рождения они считаются от старой.
+    Разъехавшийся календарь прививок не виден ничем до самой поликлиники.
+    """
+    word = plural(count, "напоминание", "напоминания", "напоминаний")
+    return (
+        f"\n\n⚠️ Дата рождения изменилась, поэтому я выключил подписки на "
+        f"прививки и осмотры: {count} {word} были посчитаны от старой даты.\n"
+        f"Включите их заново в /remind — пересчитаю от новой."
+    )
+
+
 # --- Измерения ------------------------------------------------------------
 
 ASK_WEIGHT = (
@@ -478,7 +522,14 @@ def weight_delta(grams: float, days: float) -> str:
 
 
 def reminder_message(reminder: Reminder, tz: str, now: datetime, *, late: bool) -> str:
-    text = f"⏰ {reminder.text}"
+    """Одно напоминание.
+
+    Текст экранируется, хотя приходит из своего же `schedule_ru.yaml`: в дозе
+    или в примечании легко появится «<» или «&», а Telegram на сломанной
+    разметке не ругается — он просто не отправляет сообщение. Курсив про время
+    добавляется снаружи экранированной части и продолжает работать.
+    """
+    text = f"⏰ {html_escape(reminder.text)}"
     if late:
         local = tu.to_local(reminder.fire_at, tz)
         text += f"\n<i>Было запланировано на {local:%H:%M}</i>"
@@ -498,10 +549,138 @@ def missed_summary(reminders: list[Reminder], tz: str, now: datetime) -> str:
     ]
     for reminder in reminders[:10]:
         local = tu.to_local(reminder.fire_at, tz)
-        lines.append(f"• {reminder.text} — {local:%d.%m %H:%M}")
+        lines.append(f"• {html_escape(reminder.text)} — {local:%d.%m %H:%M}")
     if count > 10:
         lines.append(f"…и ещё {count - 10}")
     return "\n".join(lines)
+
+
+# Ниже — экран `/remind`. Ни одной фразы про медицину и ни одного числа с
+# медицинским смыслом здесь нет: всё это приходит из `schedule_ru.yaml`, а
+# тексты только склеивают иконку, название, дату и список.
+
+REMIND_HINT = (
+    "<i>Тап по строке включает или выключает. Даты календаря считаю от дня "
+    "рождения — это ориентир, точную назначает поликлиника.</i>"
+)
+REMIND_PICK = "Как часто напоминать?"
+REMIND_NEEDS_CHILD = "Сначала заведите карточку ребёнка — /baby. Без даты рождения календаря нет."
+REMIND_ALL_PAST = "Всё, что есть в календаре, уже позади. Напоминать не о чем."
+CALENDAR_HOSPITAL = "🏥 — делают в роддоме, напоминать не о чем."
+
+
+def _interval_hours(rrule: str | None) -> int | None:
+    """Интервал почасового правила, чтобы показать его на экране словами."""
+    if not rrule or "HOURLY" not in rrule:
+        return None
+    for part in rrule.split(";"):
+        if part.startswith("INTERVAL="):
+            return int(part.removeprefix("INTERVAL="))
+    return None
+
+
+def _preset_line(
+    preset: "Preset", reminder: Reminder | None, count: int, tz: str, now: datetime
+) -> str:
+    label = f"{preset.icon} {preset.title}"
+    if reminder is None:
+        return f"⬜ {label}"
+
+    when = tu.fmt_due(reminder.fire_at, tz, now=now)
+    hours = _interval_hours(reminder.rrule)
+    if hours:
+        return f"✅ {label} — каждые {hours} ч, ближайшее {when}"
+    if count > 1:
+        return f"✅ {label} — {count} впереди, ближайшее {when}"
+    return f"✅ {label} — ближайшее {when}"
+
+
+def remind_screen(
+    rows: list[tuple["Preset", Reminder | None, int]], tz: str, now: datetime
+) -> str:
+    lines = ["⏰ <b>Напоминания</b>", ""]
+    lines += [_preset_line(*row, tz, now) for row in rows]
+    lines += ["", REMIND_HINT]
+    return "\n".join(lines)
+
+
+def schedule_reminder(preset: "Preset", entry: "Entry", day: date) -> str:
+    """Текст, который уедет в `reminders.text` и придёт семье в свой день.
+
+    Собирается один раз при включении подписки и хранится строкой: колонка
+    `Reminder.text` — 500 знаков, и `tests/test_texts.py` следит, чтобы самая
+    длинная запись календаря в неё влезала. Исследования сюда намеренно не
+    идут — они длинные и лежат на экране календаря.
+    """
+    what = "; ".join(entry.items or entry.doctors)
+    return (
+        f"{preset.icon} {preset.title}: {entry.age_label}, {tu.day_stamp(day)}. "
+        f"{what}."
+    )
+
+
+def calendar_screen(
+    child: Child,
+    section: "Section",
+    source: "Source",
+    rows: list[tuple["Entry", date, bool]],
+) -> str:
+    """Календарь целиком, с датами этого ребёнка.
+
+    Пройденное помечается, ближайшее выделяется — ровно затем, чтобы человек,
+    включающий подписку за день до прививки, всё равно увидел её дату. Само
+    напоминание в этом случае не заведётся: его момент уже в прошлом.
+    """
+    title = "Прививки" if section.id == "vaccines" else "Осмотры"
+    lines = [f"<b>{title}</b> · {child.name}", ""]
+
+    next_shown = False
+    for entry, day, past in rows:
+        mark = "✓" if past else " "
+        if not past and not next_shown and not entry.in_hospital:
+            mark, next_shown = "➡️", True
+        hospital = " 🏥" if entry.in_hospital else ""
+        lines.append(f"{mark} <b>{tu.day_stamp(day)}</b> · {entry.age_label}{hospital}")
+        body = "; ".join(entry.items or entry.doctors)
+        if body:
+            lines.append(f"    {html_escape(body)}")
+        if entry.tests:
+            lines.append(f"    <i>{html_escape('; '.join(entry.tests))}</i>")
+        if entry.note:
+            lines.append(f"    <i>{html_escape(entry.note)}</i>")
+
+    lines += ["", CALENDAR_HOSPITAL]
+    lines.append(
+        f'<i>Источник: <a href="{html_escape(source.url)}">'
+        f"{html_escape(source.publisher)}</a></i>"
+    )
+    return "\n".join(lines)
+
+
+def preset_turned_on(
+    preset: "Preset", count: int, fire_at: datetime, tz: str, now: datetime
+) -> str:
+    when = tu.fmt_due(fire_at, tz, now=now)
+    head = f"✅ {preset.icon} {preset.title}"
+    if count > 1:
+        word = plural(count, "напоминание", "напоминания", "напоминаний")
+        return (
+            f"{head} — завёл {count} {word} по календарю, ближайшее {when}.\n"
+            "<i>Даты посчитаны от дня рождения. Если поправите её в /baby — "
+            "выключите и включите снова.</i>"
+        )
+    body = f"{head} — напомню {when}."
+    if preset.text:
+        body += f"\n<i>{html_escape(preset.text)}</i>"
+    return body
+
+
+def preset_turned_off(preset: "Preset", count: int) -> str:
+    head = f"⬜ {preset.icon} {preset.title} — выключил"
+    if count > 1:
+        word = plural(count, "напоминание", "напоминания", "напоминаний")
+        return f"{head}, снял {count} {word}."
+    return f"{head}."
 
 
 # --- Прочее ---------------------------------------------------------------
@@ -521,7 +700,11 @@ HELP = """👶 <b>Что я умею</b>
 Вес — с центилями ВОЗ. /export — выгрузка для педиатра.
 /stage — что происходит на этой неделе.
 
-<b>Команды:</b> /panel /today /week /weight /baby /stage /export
+<b>Напоминать</b> — /remind. Кормление по интервалу, витамин D,
+взвешивание; прививки и осмотры — по национальному календарю,
+с датами от дня рождения. Всё выключено, пока не включите.
+
+<b>Команды:</b> /panel /today /week /weight /baby /stage /remind /export
 
 <b>Отвечать</b> — кнопка «❓ Вопрос» на панели. Ищу в клинических
 рекомендациях Минздрава, приказах и руководствах ВОЗ и показываю,
