@@ -136,7 +136,7 @@ def panel(*, running_kind: str | None) -> InlineKeyboardMarkup:
         )
         builder.row(
             InlineKeyboardButton(
-                text="😴 Уснула",
+                text="😴 Сон",
                 callback_data=TrackCB(action="start", kind=SLEEP).pack(),
             ),
             InlineKeyboardButton(

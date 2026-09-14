@@ -155,13 +155,31 @@ async def test_empty_day_is_all_zeros(session, child, family, now):
 
 
 @pytest.mark.asyncio
-async def test_week_covers_monday_to_today(session, child, family, now):
-    """Неделя считается от понедельника и кончается сегодня, а не воскресеньем."""
+async def test_week_is_always_seven_days(session, child, family, now):
+    """Неделя скользящая: семь суток, кончая сегодняшними.
+
+    Была календарной, и в понедельник состояла из одного дня — а «Месяц»
+    рядом всегда означал последние 30 дней. Сильнее всего это било по
+    дайджесту, который уходит утром понедельника.
+    """
     total, days = await stats.week(session, child, family.tz, now=now)
     local_today = tu.local_today(family.tz, now)
-    assert days[0][0].weekday() == 0
+    assert len(days) == 7
     assert days[-1][0] == local_today
-    assert len(days) == local_today.weekday() + 1
+    assert days[0][0] == local_today - timedelta(days=6)
+    assert total.feeds == sum(span.feeds for _, span in days)
+
+
+@pytest.mark.asyncio
+async def test_week_can_end_yesterday_for_the_digest(session, child, family, now):
+    """Дайджест подводит итог неделе, которая закончилась."""
+    total, days = await stats.week(
+        session, child, family.tz, now=now, ending_yesterday=True
+    )
+    local_today = tu.local_today(family.tz, now)
+    assert len(days) == 7
+    assert days[-1][0] == local_today - timedelta(days=1)
+    assert local_today not in [day for day, _ in days]
     assert total.feeds == sum(span.feeds for _, span in days)
 
 

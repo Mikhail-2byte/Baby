@@ -169,6 +169,13 @@ def weight_str(grams: float) -> str:
     return f"{int(round(grams)):,}".replace(",", THIN_SPACE) + " г"
 
 
+WEIGHT_IMPLAUSIBLE = (
+    "Проверьте число: для этого возраста такой вес невозможен. "
+    "Запись я оставил: если число верное, ничего делать не нужно."
+)
+WEIGHT_IMPLAUSIBLE_SHORT = "проверьте число"
+
+
 def percentile_str(z: float, pct: float) -> str:
     """'52-й центиль' плюс пометка, если значение вне обычного коридора.
 
@@ -406,7 +413,8 @@ CHART_EMPTY = "Пока не из чего строить график."
 BABY_ASK_NAME = "Как зовут малышку или малыша?"
 BABY_ASK_SEX = "Девочка или мальчик? Это нужно для таблиц роста ВОЗ — они разные."
 BABY_ASK_BORN = (
-    "Когда родилась? Напишите дату и время: <code>13.09.2026 04:20</code>\n"
+    "Когда родился ребёнок? Напишите дату и время: "
+    "<code>13.09.2026 04:20</code>\n"
     "Если время не помните, хватит и даты."
 )
 BABY_ASK_WEIGHT = (
@@ -425,7 +433,7 @@ def baby_card(child: Child, now: datetime, tz: str) -> str:
     local = tu.to_local(child.born_at, tz)
     lines = [
         f"👶 <b>{child.name}</b>",
-        f"Родилась {local:%d.%m.%Y в %H:%M} · {age_phrase(child, now)}",
+        f"Дата рождения: {local:%d.%m.%Y в %H:%M} · {age_phrase(child, now)}",
     ]
     if child.birth_weight_g:
         lines.append(f"При рождении: {weight_str(child.birth_weight_g)}")
@@ -448,7 +456,8 @@ BABY_EDIT_HINT = "Что поправить?"
 BABY_EDIT_ASK_NAME = "Как зовут на самом деле?"
 BABY_EDIT_ASK_SEX = "Девочка или мальчик?"
 BABY_EDIT_ASK_BORN = (
-    "Когда родилась? Напишите дату и время: <code>13.09.2026 04:20</code>\n"
+    "Когда родился ребёнок? Напишите дату и время: "
+    "<code>13.09.2026 04:20</code>\n"
     "Если время не помните, хватит и даты."
 )
 BABY_EDIT_ASK_WEIGHT = (

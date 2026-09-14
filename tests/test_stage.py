@@ -175,8 +175,8 @@ def test_motor_windows_match_who_table():
     assert windows["Стоит с поддержкой"] == (4.8, 11.4)
     assert windows["Ползает на четвереньках"] == (5.2, 13.5)
     assert windows["Ходит с поддержкой"] == (6.0, 13.7)
-    assert windows["Стоит сама"] == (6.9, 16.9)
-    assert windows["Ходит сама"] == (8.2, 17.6)
+    assert windows["Стоит самостоятельно"] == (6.9, 16.9)
+    assert windows["Ходит самостоятельно"] == (8.2, 17.6)
 
 
 def test_motor_windows_are_ordered():
@@ -191,7 +191,7 @@ def test_no_windows_open_for_a_newborn():
 
 def test_walking_window_is_open_at_a_year():
     names = {w.name for w in stage.open_windows(365)}
-    assert "Ходит сама" in names
+    assert "Ходит самостоятельно" in names
 
 
 # --- Сборка сообщения -----------------------------------------------------

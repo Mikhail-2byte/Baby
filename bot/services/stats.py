@@ -130,17 +130,40 @@ async def day(
 
 
 async def week(
-    session: AsyncSession, child: Child, tz: str, now: datetime | None = None
+    session: AsyncSession,
+    child: Child,
+    tz: str,
+    now: datetime | None = None,
+    *,
+    ending_yesterday: bool = False,
 ) -> tuple[Span, list[tuple[date, Span]]]:
-    """Итог за текущую неделю и разбивка по дням — для графика."""
+    """Итог за семь суток и разбивка по дням — для графика.
+
+    Окно скользящее, а не календарное, и это правка живой проверки. Раньше
+    бралась текущая календарная неделя, а недельный дайджест уходит в
+    понедельник в 10:00 — то есть «Итоги недели» подводили итог десяти часам.
+    Заметить это было почти невозможно: текст говорил «за неделю», а числа
+    выглядели правдоподобно, просто как маленький день.
+
+    Заодно исчезла разноголосица с соседней кнопкой: «Месяц» всегда означал
+    последние 30 дней, а «Неделя» — календарную, и в понедельник показывала
+    один день.
+
+    `ending_yesterday` нужен дайджесту: он подводит итог НЕДЕЛИ, которая
+    закончилась, и неполные сегодняшние сутки в него попадать не должны.
+    """
     moment = now or tu.now_utc()
     today = tu.local_today(tz, moment)
-    start, end = tu.week_bounds(today, tz)
+    last = today - timedelta(days=1) if ending_yesterday else today
+    first = last - timedelta(days=6)
+
+    start, _ = tu.day_bounds(first, tz)
+    _, end = tu.day_bounds(last, tz)
     total = await collect(session, child, start, end, moment)
 
     days: list[tuple[date, Span]] = []
-    cursor = today - timedelta(days=today.weekday())
-    while cursor <= today:
+    cursor = first
+    while cursor <= last:
         days.append((cursor, await day(session, child, tz, cursor, moment)))
         cursor += timedelta(days=1)
     return total, days
@@ -171,7 +194,11 @@ async def panel_text(
             session, child, WEIGHT, weight.value, weight.taken_at
         )
         if evaluated is not None:
-            note = texts.percentile_str(*evaluated)
+            note = (
+                texts.WEIGHT_IMPLAUSIBLE_SHORT
+                if growth.implausible(evaluated[0], WEIGHT)
+                else texts.percentile_str(*evaluated)
+            )
         else:
             # Таблицы ВОЗ ещё не залиты — покажем хотя бы динамику от рождения
             loss = growth.loss_from_birth(child, weight.value)

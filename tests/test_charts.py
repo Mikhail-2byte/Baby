@@ -240,6 +240,34 @@ async def test_digest_sends_the_week(session, family, child, mother, bot):
     family.digest_dow = 0
     family.digest_time = "10:00"
     moment = _monday_at(family, 12)
+    # Кормление в неделе, которая закончилась, — именно его дайджест и считает
+    await repo.add_event(
+        session, child.id, mother.id, FEED_BREAST,
+        started_at=moment - timedelta(days=2),
+        ended_at=moment - timedelta(days=2) + timedelta(minutes=20),
+    )
+
+    await digest.send_pending(bot, session, moment)
+    assert "Итоги недели" in bot.texts[0]
+    assert family.last_digest_on == tu.local_today(family.tz, moment)
+
+
+@pytest.mark.asyncio
+async def test_digest_counts_the_week_that_ended_not_today(
+    session, family, child, mother, bot
+):
+    """Дайджест уходит в понедельник в 10:00 — и раньше считал эти десять часов.
+
+    Неделя бралась календарная, то есть начиналась в тот же понедельник.
+    «Итоги недели» подводили итог утру, текст при этом говорил «за неделю», а
+    числа выглядели правдоподобно — просто как маленький день. Нашла живая
+    проверка: в дайджесте стояло «По дням: пн 14 сен», одна строка.
+    """
+    family.digest_dow = 0
+    family.digest_time = "10:00"
+    moment = _monday_at(family, 12)
+
+    # Единственная запись — сегодняшняя, за два часа до отправки
     await repo.add_event(
         session, child.id, mother.id, FEED_BREAST,
         started_at=moment - timedelta(hours=2),
@@ -247,5 +275,7 @@ async def test_digest_sends_the_week(session, family, child, mother, bot):
     )
 
     await digest.send_pending(bot, session, moment)
-    assert "Итоги недели" in bot.texts[0]
-    assert family.last_digest_on == tu.local_today(family.tz, moment)
+    body = bot.texts[0]
+    assert "записей не было" in body, (
+        "сегодняшнее кормление попало в итоги недели, которая закончилась вчера"
+    )

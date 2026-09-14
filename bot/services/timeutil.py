@@ -60,14 +60,6 @@ def at_local_time(day: date, moment: time, tz_name: str) -> datetime:
     return to_utc(datetime.combine(day, moment), tz_name)
 
 
-def week_bounds(day: date, tz_name: str) -> tuple[datetime, datetime]:
-    """Границы недели (с понедельника), в которую попадает `day`."""
-    monday = day - timedelta(days=day.weekday())
-    start, _ = day_bounds(monday, tz_name)
-    _, end = day_bounds(monday + timedelta(days=6), tz_name)
-    return start, end
-
-
 def day_stamp(day: date) -> str:
     """'27 авг' — короткая дата без года и без слов «завтра»/«вчера»."""
     return f"{day.day} {MONTHS_SHORT[day.month - 1]}"

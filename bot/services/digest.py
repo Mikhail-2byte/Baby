@@ -87,7 +87,11 @@ async def send_for(
         await _mark(session, family, target)
         return
 
-    total, days = await stats.week(session, child, family.tz, now=now)
+    # Неделя, которая закончилась: дайджест уходит утром, и неполные
+    # сегодняшние сутки в итоге недели не значат ничего
+    total, days = await stats.week(
+        session, child, family.tz, now=now, ending_yesterday=True
+    )
     if total.feeds == 0 and not total.sleep_time:
         status = await sending.deliver(bot, family, texts.DIGEST_NO_DATA)
     else:

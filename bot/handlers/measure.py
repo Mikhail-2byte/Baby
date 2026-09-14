@@ -174,6 +174,9 @@ async def _zscore_text(
     """
     evaluated = await growth.evaluate(session, child, WEIGHT, grams, now)
     if evaluated is not None:
+        z, _ = evaluated
+        if growth.implausible(z, WEIGHT):
+            return texts.WEIGHT_IMPLAUSIBLE
         return texts.percentile_str(*evaluated)
 
     loss = growth.loss_from_birth(child, grams)
