@@ -18,7 +18,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.types import Chat, Message, TelegramObject, Update, User
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from bot import texts
+from bot import keyboards, texts
 from bot.db import repo
 from bot.db.session import Session
 
@@ -36,16 +36,24 @@ GROUP_CHATS = {"group", "supergroup"}
 WIZARD_SAFE = frozenset({"skip", "cancel"})
 
 
-def _interrupting_command(event: TelegramObject) -> bool:
-    """Это команда, которая должна прервать мастер?
+def _interrupts_the_wizard(event: TelegramObject) -> bool:
+    """Это реплика, которая должна прервать мастер?
 
     Смотрим на текст, а не на фильтры: outer-middleware работает до них, и в
     этом весь смысл — решение обязано быть одинаковым для всех роутеров, а не
     зависеть от того, чей фильтр сойдётся первым.
+
+    Кроме команд сюда входят метки постоянной клавиатуры: Telegram присылает
+    нажатие обычным сообщением, и для мастера оно неотличимо от ответа на
+    «Как зовут?». Роутер `home` стоит выше `baby` и апдейт заберёт себе, но
+    состояние FSM без этой строки осталось бы висеть — и следующая фраза
+    человека, хоть через три дня, молча стала бы именем ребёнка.
     """
     if not isinstance(event, Message):
         return False
     text = (event.text or "").strip()
+    if text in keyboards.HOME_LABELS:
+        return True
     if not text.startswith("/"):
         return False
     # «/today@BabyBot arg» → «today»
@@ -74,7 +82,7 @@ async def drop_wizard_state(
     становилась именем ребёнка.
     """
     state: FSMContext | None = data.get("state")
-    if state is None or not _interrupting_command(event):
+    if state is None or not _interrupts_the_wizard(event):
         return await handler(event, data)
 
     dropped = await state.get_state() is not None

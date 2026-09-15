@@ -200,7 +200,10 @@ async def _finish(
         )
 
     log.info("Заведён ребёнок #%s в семье #%s", child.id, family.id)
-    await message.answer(texts.BABY_SAVED)
+    # Клавиатура едет вместе с «Готово»: мастер проходят обязательно — панель
+    # без карточки сама зовёт в `/baby`, — значит это надёжнейший первый
+    # контакт новой семьи с кнопками под полем ввода
+    await message.answer(texts.BABY_SAVED, reply_markup=keyboards.home())
     await panel.refresh(bot, family.id, force_new=True)
 
 

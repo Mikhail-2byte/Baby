@@ -359,6 +359,7 @@ class StepReport:
             "alert": "    (~) всплывашка",
             "file": "    (f) файл",
             "edit": "    (e) правка",
+            "delete": "    (x) убрал",
             "message": "    ->  в чат",
         }.get(record.kind, f"    ... {record.method}")
         tail = f" #{record.message_id}" if record.message_id else ""

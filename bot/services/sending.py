@@ -6,8 +6,9 @@
 
 Модуль скопирован из Family_planer (см. `CLAUDE.md`). Оттуда же приехали
 `delete_batch`/`delete_one` для утренней уборки чата — в этом проекте уборки
-нет и в плане её нет, вызывающих у них не было ни одного, поэтому они убраны.
-Понадобятся — переносятся обратно одним куском.
+нет и в плане её нет, поэтому `delete_batch` убран. `delete_one` вернулся:
+нажатие кнопки постоянной клавиатуры Telegram кладёт в чат обычным сообщением
+от человека, и его надо убрать сразу.
 """
 
 import logging
@@ -89,6 +90,28 @@ async def deliver(
     """То же, что `send`, но без `message_id` — тикеру и дайджесту он не нужен."""
     status, _ = await send(bot, family, text, reply_markup=reply_markup)
     return status
+
+
+async def delete_one(bot: Bot, family: Family, message_id: int) -> bool:
+    """Убрать одно сообщение из чата семьи. Исключений наружу не выпускает.
+
+    Ловим всё подряд намеренно, той же доктриной, что `panel._pin`: удаление —
+    украшение. Без права `can_delete_messages` нажатие просто останется в
+    ленте, и это не повод не делать то, ради чего его нажали. «message can't be
+    deleted», «not enough rights», сетевой сбой — различать их здесь незачем.
+
+    `message_id` только по ключу: позиционно он уйдёт в
+    `business_connection_id` — та же ловушка сигнатуры aiogram 3.31, на которой
+    уже попадался `unpin_chat_message` в `panel._pin`.
+    """
+    try:
+        await bot.delete_message(family.chat_id, message_id=message_id)
+        return True
+    except Exception:
+        log.info(
+            "Сообщение %s в чате %s осталось", message_id, family.chat_id, exc_info=True
+        )
+        return False
 
 
 async def edit(

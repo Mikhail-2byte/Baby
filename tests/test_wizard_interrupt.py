@@ -27,7 +27,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.methods import TelegramMethod
 from aiogram.types import Chat, Message, Update, User
 
-from bot import texts
+from bot import keyboards, texts
 from bot.middlewares import drop_wizard_state
 
 CHAT = Chat(id=-1001, type="supergroup", title="Малышка")
@@ -94,6 +94,13 @@ def wired():
     @router.message(Wizard.name, Command("skip"))
     async def skip(message: Message) -> None:
         await message.answer("пропустил")
+
+    # Порядок как в бою: роутер `home` стоит выше `baby`, поэтому метка кнопки
+    # до шага мастера не доходит. Но состояние он не снимает — это работа
+    # middleware, и она здесь и проверяется
+    @router.message(F.text.in_(keyboards.HOME_LABELS))
+    async def home_tap(message: Message) -> None:
+        await message.answer("панель")
 
     @router.message(Wizard.name, F.text)
     async def got_name(message: Message, state: FSMContext) -> None:
@@ -167,3 +174,27 @@ async def test_command_without_a_wizard_is_untouched(wired):
     await _feed(dp, bot, "/today", 1)
 
     assert session.sent == ["сводка"]
+
+
+@pytest.mark.asyncio
+async def test_a_keyboard_label_breaks_the_wizard_too(wired):
+    """Метка постоянной клавиатуры прерывает мастер наравне с командой.
+
+    Для Telegram нажатие reply-кнопки — обычное сообщение, и проверка, глядящая
+    только на ведущий «/», оставила бы мастер висеть. Роутер `home` стоит выше
+    `baby` и апдейт заберёт себе, но состояние без этой ветки осталось бы
+    ждать имя — и следующая фраза человека, хоть через три дня, молча стала бы
+    именем ребёнка. Та же поломка, что у команды, только вход в неё в один тап.
+    """
+    dp, bot, session, seen = wired
+    context = dp.fsm.resolve_context(bot=bot, chat_id=CHAT.id, user_id=AUTHOR.id)
+    await context.set_state(Wizard.name)
+
+    await _feed(dp, bot, keyboards.HOME_PANEL, 1)
+
+    assert await _state_of(dp, bot) is None
+    assert "панель" in session.sent
+    assert texts.WIZARD_DROPPED in session.sent
+
+    await _feed(dp, bot, "купи молока", 2)
+    assert seen["names"] == []

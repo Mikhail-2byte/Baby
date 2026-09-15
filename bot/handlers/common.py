@@ -7,7 +7,7 @@ from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.types import FSInputFile, Message
 
-from bot import texts
+from bot import keyboards, texts
 from bot.db.models import Family
 from bot.filters import IN_GROUP, IN_PRIVATE
 from bot.services import backup, panel
@@ -30,7 +30,17 @@ async def private_stub(message: Message) -> None:
 
 @router.message(IN_GROUP, Command("help", "start"))
 async def help_command(message: Message) -> None:
-    await message.answer(texts.HELP)
+    """Помощь — и она же носитель постоянной клавиатуры.
+
+    Отдельного сообщения «вот вам кнопки» нет намеренно: клавиатуру нельзя
+    приложить ни к правке панели (`edit_message_text` её не принимает), ни к
+    самой панели (в одном сообщении с inline-кнопками она не уживается), а
+    заводить ради неё лишнюю реплику — плохой первый экран. Поэтому она едет с
+    ответами, которые бот и так шлёт: с этим и с концом мастера `/baby`.
+
+    Он же путь возврата: клавиатуру можно скрыть, и `/help` её вернёт.
+    """
+    await message.answer(texts.HELP, reply_markup=keyboards.home())
 
 
 @router.message(IN_GROUP, Command("panel"))

@@ -8,8 +8,8 @@ Telegram такой id отвергает, и это не мелочь: в `hand
 перерисовки панели не было бы вовсе. Протокол при этом выглядел бы зелёным.
 
 Поэтому `answerCallbackQuery` замкнут на себя, а всё остальное — sendMessage,
-sendPhoto, sendDocument, editMessageText, pinChatMessage — уходит в настоящий
-Telegram настоящей группе. Побочная выгода: тексты всплывашек («Пошло время»,
+sendPhoto, sendDocument, editMessageText, pinChatMessage, deleteMessage —
+уходит в настоящий Telegram настоящей группе. Побочная выгода: тексты всплывашек («Пошло время»,
 «Записал», «Таймер уже закрыт») попадают в протокол, тогда как в живом чате их
 не увидел бы никто.
 
@@ -53,7 +53,7 @@ class Outgoing:
     method: str
     text: str = ""
     message_id: int | None = None
-    kind: str = "message"  # message | alert | file | edit | service
+    kind: str = "message"  # message | alert | file | edit | delete | service
     extra: dict[str, Any] = field(default_factory=dict)
 
 
@@ -142,6 +142,11 @@ class StandSession(AiohttpSession):
             kind = "file"
         elif name.startswith("Edit"):
             kind = "edit"
+        elif name == "DeleteMessage":
+            # Свой вид, а не «service»: уборку нажатия постоянной клавиатуры
+            # надо видеть фактом. В «service» она падала бы без цели и без
+            # текста, то есть пустой строкой — зелёный протокол на молчании
+            kind = "delete"
         elif name == "SendMessage":
             kind = "message"
         else:
@@ -153,8 +158,13 @@ class StandSession(AiohttpSession):
             filename = getattr(value, "filename", None)
             if filename:
                 extra["file"] = filename
-        if name.startswith("Edit") and "message_id" in payload:
+        if (name.startswith("Edit") or name == "DeleteMessage") and "message_id" in payload:
             extra["target"] = payload["message_id"]
+        # Клавиатура под полем ввода едет обычным полем сообщения, и без этой
+        # строки её доставка ничем бы себя не выдала
+        markup = payload.get("reply_markup") or {}
+        if isinstance(markup, dict) and "keyboard" in markup:
+            extra["keyboard"] = sum(len(row) for row in markup["keyboard"])
 
         self.records.append(
             Outgoing(

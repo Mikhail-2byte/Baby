@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from datetime import timedelta
 
+from bot import keyboards
 from bot.db.models import (
     DIAPER_DIRTY,
     DIAPER_WET,
@@ -72,7 +73,9 @@ async def run(stand: Stand) -> None:
         await stand.say("/help")
         await stand.say("/panel")
         r.expect("/baby")
+        r.expect("Кнопки под полем ввода")
         r.show("панель", "SELECT panel_message_id, panel_day FROM families")
+        r.note("В extra у /help обязан быть keyboard: клавиатура доехала")
 
     async with stand.step("4", "тап по кнопке записи до карточки") as r:
         # Кнопок на панели сейчас нет вовсе, и это правильно. Нажатие
@@ -109,6 +112,7 @@ async def run(stand: Stand) -> None:
     async with stand.step("5е", "мастер /baby: вес 3420") as r:
         await stand.say(str(BIRTH_WEIGHT_G))
         r.expect("Панель ниже")
+        r.note("С «Готово» едет клавиатура — первый контакт новой семьи с ней")
         r.show(
             "children",
             "SELECT id, name, sex, born_at, birth_weight_g FROM children",
@@ -266,6 +270,35 @@ async def run(stand: Stand) -> None:
         await stand.say("4700")
         r.expect_silence()
         r.note("Бот не должен мешать переписке родителей")
+
+    # --- постоянная клавиатура под полем ввода ----------------------------
+    #
+    # Нажатие reply-кнопки и напечатанная та же строка — для бота один и тот же
+    # апдейт, поэтому `say` здесь не упрощение, а точная модель. Чего стенд
+    # проверить НЕ может: отрисовку самой клавиатуры на экране — он видит
+    # только `extra["keyboard"]` в шаге 3.
+
+    async with stand.step("20а", "кнопка «Панель»: панель заново и нажатие убрано") as r:
+        before = stand.panel_message_id()
+        await stand.say(keyboards.HOME_PANEL)
+        await stand.settle(1.0)
+        after = stand.panel_message_id()
+        r.expect_kind("delete")
+        r.note(f"панель {before} -> {after}")
+        if before == after:
+            stand.protocol.fail("шаг 20а", "панель не выпущена заново")
+        r.note("Шаг красный на «не было delete» — у бота нет права удалять")
+
+    async with stand.step("20б", "кнопка «Вопрос» ждёт вопрос следующей репликой") as r:
+        await stand.say(keyboards.HOME_ASK)
+        r.expect("Напишите вопрос")
+        r.expect_kind("delete")
+
+    async with stand.step("20в", "кнопка «Сутки» отвечает тем же, чем /today") as r:
+        await stand.say(keyboards.HOME_TODAY)
+        r.expect("сегодня")
+        r.expect_kind("delete")
+        r.note("Ожидание вопроса с шага 20б снято не будет — истечёт само")
 
     # --- сводки и графики -------------------------------------------------
 

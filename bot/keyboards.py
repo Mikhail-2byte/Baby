@@ -12,7 +12,12 @@
 from collections.abc import Sequence
 
 from aiogram.filters.callback_data import CallbackData
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.types import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    ReplyKeyboardMarkup,
+)
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from bot.db.models import (
@@ -101,6 +106,57 @@ class RemindCB(CallbackData, prefix="rmd"):
     action: str
     preset: str = ""
     hours: int = 0
+
+
+# Метки постоянной клавиатуры под полем ввода. Лежат здесь, а не в `texts`, по
+# тому же основанию, что и подписи кнопок панели: это часть клавиатуры. И это
+# единственный источник правды — `handlers/home.py` и `middlewares` берут их
+# отсюда же, а не повторяют строки у себя. Совпадение там точное: метка с
+# эмодзи руками не набирается, и семейная реплика со словом «панель» проходит
+# мимо.
+#
+# Разница с inline-кнопками принципиальная и объясняет всю осторожность ниже.
+# Inline-кнопка опознаётся по `callback_data`, её подпись — только для глаз.
+# Reply-кнопка опознаётся **по самой подписи**: она уходит на клиент и
+# возвращается оттуда обычным текстом. Отсюда два правила.
+#
+# Первое: эмодзи берутся без селектора вариаций U+FE0F. `⚖️` и подобные
+# возвращаются с клиента в другой нормализации и перестают равняться своей же
+# константе — кнопка есть, бот молчит, и видно это только глазами в чате.
+#
+# Второе: метка не должна содержать слов из `redflags.yaml`. Роутер `alarm`
+# стоит выше и такую метку заберёт себе — молча и навсегда.
+#
+# «❓ Вопрос» и «📊 Сутки» дословно повторяют подписи на панели намеренно: одно
+# действие — одно имя. Правя подпись там, надо править и здесь.
+HOME_PANEL = "📋 Панель"
+HOME_ASK = "❓ Вопрос"
+HOME_TODAY = "📊 Сутки"
+HOME_LABELS = frozenset({HOME_PANEL, HOME_ASK, HOME_TODAY})
+
+
+def home() -> ReplyKeyboardMarkup:
+    """Три кнопки под полем ввода — единственное, что видно всегда.
+
+    Панель уезжает вверх по истории от каждого подтверждения, и до неё нужно
+    было либо прокручивать чат, либо писать `/panel`. Ночью, одной рукой, не
+    глядя — это ровно то, ради отсутствия чего панель и заводилась.
+    Обычная клавиатура — единственный механизм Telegram, который держит кнопку
+    на экране постоянно.
+
+    `is_persistent` обязателен: без него клавиатура сворачивается в иконку, то
+    есть перестаёт быть одним тапом. `selective` не ставим намеренно — оба
+    родителя видят одно и то же, в этом весь смысл бота.
+    """
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text=HOME_PANEL), KeyboardButton(text=HOME_ASK)],
+            [KeyboardButton(text=HOME_TODAY)],
+        ],
+        resize_keyboard=True,
+        is_persistent=True,
+        input_field_placeholder="Скажите голосом или напишите",
+    )
 
 
 def panel(*, running_kind: str | None) -> InlineKeyboardMarkup:

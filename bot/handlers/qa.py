@@ -46,12 +46,24 @@ class AwaitsQuestion(BaseFilter):
         return ask is not None and ask.what == pending.QUESTION
 
 
+async def start_question(message: Message, family: Family, user_id: int) -> None:
+    """Начать ждать вопрос и сказать об этом. Ничего не ищет.
+
+    Вызывающих двое: кнопка «❓ Вопрос» на панели (колбэк ниже) и та же кнопка
+    на постоянной клавиатуре (`handlers/home.py`). Та же причина, по которой
+    разнят `alarm.assess`/`respond`: две копии «запомнить ожидание и позвать
+    человека» разошлись бы молча, а расхождение здесь означает ожидание,
+    которое поставили, но о котором не сказали.
+    """
+    pending.remember(family.chat_id, user_id, pending.QUESTION)
+    await message.answer(texts.ASK_QUESTION)
+
+
 @router.callback_query(IN_GROUP_CB, keyboards.AskCB.filter())
 async def ask(call: CallbackQuery, family: Family) -> None:
-    pending.remember(family.chat_id, call.from_user.id, pending.QUESTION)
     await call.answer()
     if isinstance(call.message, Message):
-        await call.message.answer(texts.ASK_QUESTION)
+        await start_question(call.message, family, call.from_user.id)
 
 
 @router.message(IN_GROUP, F.text, AwaitsQuestion())

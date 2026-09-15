@@ -49,16 +49,29 @@ async def _month(session: AsyncSession, family: Family, child: Child) -> str:
 PERIODS = {"today": _today, "week": _week, "month": _month}
 
 
-@router.message(IN_GROUP, Command("today"))
-async def today(
+async def send_today(
     message: Message, session: AsyncSession, family: Family, child: Child | None
 ) -> None:
+    """Сводка за сутки одним сообщением, с переключателем периода.
+
+    Вызывающих двое: команда `/today` и кнопка «📊 Сутки» на постоянной
+    клавиатуре (`handlers/home.py`). Вторая копия отличалась бы от первой
+    молча — например, потеряв `keyboards.stats()`, и «Неделя» с «Месяцем»
+    перестали бы существовать для того, кто пришёл кнопкой.
+    """
     if child is None:
         await message.answer(texts.NO_CHILD)
         return
     await message.answer(
         await _today(session, family, child), reply_markup=keyboards.stats()
     )
+
+
+@router.message(IN_GROUP, Command("today"))
+async def today(
+    message: Message, session: AsyncSession, family: Family, child: Child | None
+) -> None:
+    await send_today(message, session, family, child)
 
 
 @router.message(IN_GROUP, Command("week"))
