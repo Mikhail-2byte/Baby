@@ -38,7 +38,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from bot.config import settings
-from bot.services import morph
+from bot.services import morph, synonyms
 
 log = logging.getLogger(__name__)
 
@@ -171,36 +171,77 @@ def _frequency(connection: sqlite3.Connection, stem: str) -> int:
     return int(row[0] or 0)
 
 
-def _significant(connection: sqlite3.Connection, stems: list[str]) -> tuple[list[str], set[str]]:
-    """Основы вопроса, по которым судим о попадании, и опорные среди них.
+def _phrase_frequency(connection: sqlite3.Connection, phrase: synonyms.Phrase) -> int:
+    """Во скольких фрагментах может встретиться написание целиком.
 
-    Выбрасываем две категории. Слишком частые — служебные: «как», «ребёнок»,
-    «год» есть в трети фрагментов и не выделяют ничего. И те, которых в базе
-    нет вовсе: покрыть их нечем, а в знаменателе они бы опускали покрытие тем
-    ниже, чем больше человек написал незнакомых слов.
+    Оценка сверху — минимум по словам: фрагмент, где есть все слова фразы,
+    содержит и самое редкое из них. Точного счёта совместной встречаемости у
+    нас нет, и он тут не нужен: число работает как мера распространённости.
+    """
+    return min(_frequency(connection, word) for word in phrase)
 
-    Опорные — те, что вдобавок встречаются не реже `MIN_DF` раз. Хотя бы одна
-    опорная основа обязана найтись во фрагменте, иначе весь ответ держится на
-    осечке стеммера.
+
+def _covers(phrases: synonyms.Group, found: list[str]) -> bool:
+    """Назван ли термин во фрагменте хоть одним из своих написаний."""
+    return any(
+        all(any(word.startswith(part) for word in found) for part in phrase)
+        for phrase in phrases
+    )
+
+
+def _significant(
+    connection: sqlite3.Connection, stems: list[str]
+) -> tuple[list[synonyms.Group], list[synonyms.Group], set[synonyms.Group]]:
+    """Основы вопроса, по которым судим о попадании: знакомые, незнакомые, опорные.
+
+    Выбрасываем одну категорию — слишком частые: «как», «ребёнок», «год» есть
+    в трети фрагментов и не выделяют ничего.
+
+    Незнакомые базе основы (`docs == 0`) **не выбрасываются**. Раньше
+    выбрасывались, и это была поломка ровно того свойства, ради которого
+    считается покрытие: в знаменателе оставались только слова, которые база
+    знает, то есть слово, делающее вопрос чужим, не считалось вовсе. «Как
+    поменять масло в машине» давало знаменатель из одного «масла» и покрытие
+    1.0 — бот отвечал про растительное масло в салаты. Чем более чужим было
+    слово, тем меньше оно весило.
+
+    Опорные — знакомые, что вдобавок встречаются не реже `MIN_DF` раз. Хотя бы
+    одна опорная основа обязана найтись во фрагменте, иначе весь ответ держится
+    на осечке стеммера.
     """
     total = connection.execute("SELECT count(*) FROM chunks").fetchone()[0]
     if not total:
-        return [], set()
+        return [], [], set()
     big = total >= MIN_CORPUS
     limit = total * settings.kb_stopword_df if big else float("inf")
     floor = MIN_DF if big else 1
-    significant: list[str] = []
-    anchors: set[str] = set()
+    known: list[synonyms.Group] = []
+    unknown: list[synonyms.Group] = []
+    anchors: set[synonyms.Group] = set()
     for stem in dict.fromkeys(stems):
         if stem in morph.QUESTION_STEMS:
             continue
-        docs = _frequency(connection, stem)
-        if not 0 < docs <= limit:
+        # Термин — само слово плюс то, как его называет документ. Частота
+        # берётся по самому распространённому написанию: «БЦЖ» встречается
+        # однажды, «туберкулёз» — тринадцать раз, и незнакомой аббревиатуру
+        # считать нельзя, раз документ про неё говорит
+        phrases = synonyms.alternatives(stems, stem) or ((stem,),)
+        # Группа синонимов задевается каждым своим словом, и «хватает молока»
+        # пришло бы сюда дважды — по «хватает» и по «молока». В знаменателе
+        # покрытия термин обязан стоять один раз: попадание считается через
+        # множество, и дубль опускал бы покрытие вдвое на ровном месте
+        if phrases in known or phrases in unknown:
             continue
-        significant.append(stem)
+        docs = max(_phrase_frequency(connection, phrase) for phrase in phrases)
+        if docs == 0:
+            unknown.append(phrases)
+            continue
+        if docs > limit:
+            continue
+        known.append(phrases)
         if docs >= floor:
-            anchors.add(stem)
-    return significant, anchors
+            anchors.add(phrases)
+    return known, unknown, anchors
 
 
 def _rrf(rankings: list[list[int]]) -> dict[int, float]:
@@ -212,8 +253,8 @@ def _rrf(rankings: list[list[int]]) -> dict[int, float]:
     return scores
 
 
-def _lexical(connection: sqlite3.Connection, query: str) -> list[sqlite3.Row]:
-    expression = morph.match_query(query)
+def _lexical(connection: sqlite3.Connection, parts: list[str]) -> list[sqlite3.Row]:
+    expression = morph.expression(parts)
     if not expression:
         return []
     try:
@@ -238,11 +279,25 @@ def _search(query: str, k: int) -> list[Chunk]:
     if connection is None:
         return []
 
-    significant, anchors = _significant(connection, morph.stems(query))
+    known, unknown, anchors = _significant(connection, morph.stems(query))
     if not anchors:
         return []
+    # Вопрос, в котором незнакомых базе слов не меньше, чем знакомых, — вопрос
+    # не про эту базу. Отвечать на него по остатку значит отвечать про масло
+    # в салаты на вопрос про масло в машине. Счёт целыми, а не порогом с
+    # плавающей точкой: пятая настроечная ручка — приглашение подогнать её
+    # под оценочный набор, а это уже стоило проекту одиннадцати пунктов recall
+    if len(unknown) >= len(known):
+        return []
+    significant = known + unknown
 
-    rows = _lexical(connection, query)
+    # В запрос уходят и написания из словаря синонимов: без них фрагмент, где
+    # написано «вакцинация против туберкулёза», по вопросу про БЦЖ не найдётся
+    # вовсе, и проверять его покрытие будет нечего
+    parts = morph.stems(query) + [
+        word for term in significant for phrase in term for word in phrase
+    ]
+    rows = _lexical(connection, parts)
     if not rows:
         return []
 
@@ -251,7 +306,7 @@ def _search(query: str, k: int) -> list[Chunk]:
     anchored: dict[int, bool] = {}
     for row in rows:
         found = row["stems"].split()
-        hit = {stem for stem in significant if any(word.startswith(stem) for word in found)}
+        hit = {term for term in significant if _covers(term, found)}
         coverage[row["id"]] = len(hit) / len(significant)
         anchored[row["id"]] = bool(hit & anchors)
 

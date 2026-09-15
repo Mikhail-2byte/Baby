@@ -43,6 +43,34 @@ EVAL = ROOT / "kb" / "eval.yaml"
 DEPTH = 5
 
 
+def _report_missing_sources() -> None:
+    """Сказать вслух, каких объявленных источников в базе нет.
+
+    `build_kb` такой список печатает, но сборка бывает раз в полгода, а замер —
+    каждый раз, когда трогают поиск. Источник `aap_safe_sleep_2022` объявлен в
+    манифесте с самого начала и не положен ни разу: тема безопасного сна в базе
+    отсутствует целиком, а выглядит это как покрытая. Шаг, который должен
+    выполнить человек, — это не шаг, а дыра, и дыру надо показывать.
+    """
+    import sqlite3
+
+    from bot.config import settings
+    from kb.build_kb import SOURCES  # локально: боту этот модуль не нужен
+
+    connection = sqlite3.connect(f"file:{settings.kb_path}?mode=ro", uri=True)
+    try:
+        built = {row[0] for row in connection.execute("SELECT id FROM sources")}
+    finally:
+        connection.close()
+    missing = [source.id for source in SOURCES if source.id not in built]
+    if missing:
+        print(
+            f"Объявлено источников {len(SOURCES)}, в базе {len(built)}"
+            f" — нет: {', '.join(missing)}"
+        )
+        print()
+
+
 @dataclass(frozen=True)
 class Question:
     text: str
@@ -50,8 +78,8 @@ class Question:
     contains: tuple[re.Pattern[str], ...]
 
 
-def load() -> tuple[tuple[Question, ...], tuple[str, ...]]:
-    raw: Any = yaml.safe_load(EVAL.read_text(encoding="utf-8"))
+def load(path: Path = EVAL) -> tuple[tuple[Question, ...], tuple[str, ...]]:
+    raw: Any = yaml.safe_load(path.read_text(encoding="utf-8"))
     questions = tuple(
         Question(
             text=item["q"],
@@ -83,7 +111,14 @@ async def run() -> int:
         print("Базы знаний нет. Соберите её: python kb/build_kb.py")
         return 1
 
-    questions, silence = load()
+    # Набор задаётся аргументом: отложенный набор меряется тем же кодом, что
+    # основной, иначе числа «до/после» сравнивать не с чем
+    chosen = Path(sys.argv[1]) if len(sys.argv) > 1 else EVAL
+    if not chosen.exists():
+        print(f"Набора нет: {chosen}")
+        return 1
+    questions, silence = load(chosen)
+    _report_missing_sources()
     at = {1: 0, 3: 0, 5: 0}
     reciprocal = 0.0
     misses: list[tuple[Question, list[kb.Chunk]]] = []

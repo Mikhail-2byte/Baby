@@ -93,7 +93,17 @@ def match_query(text: str) -> str:
     невролога не находится вовсе. Измерено оценочным набором: на точных
     основах recall@5 был 0.64.
     """
-    unique = list(dict.fromkeys(stems(text)))
+    return expression(stems(text))
+
+
+def expression(parts: list[str]) -> str:
+    """То же выражение, но по готовому списку основ.
+
+    Отдельной функцией, потому что поиск подмешивает в запрос написания из
+    словаря синонимов (`services/synonyms.py`), а импортировать его сюда
+    нельзя — он сам зовёт этот модуль.
+    """
+    unique = list(dict.fromkeys(parts))
     if not unique:
         return ""
     return " OR ".join(f'"{stem}" *' for stem in unique)

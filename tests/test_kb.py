@@ -569,3 +569,210 @@ def test_build_says_what_to_do_when_the_file_is_busy(tmp_path, monkeypatch):
             build_kb.write_db(path, [(source, chunks)])
     finally:
         holder.close()
+
+
+# --- Сторож молчания на базе боевого размера ---------------------------------
+#
+# Все проверки ниже идут через `_big_kb`, а не `_tiny_kb`, и это не вкусовщина.
+# При `total < kb.MIN_CORPUS` частотные пороги выключаются целиком
+# (`kb._significant`: `limit = inf`, `floor = 1`), то есть на базе из трёх
+# чанков отбор наполовину не работает. Тест сторожа, написанный на маленькой
+# базе, был бы зелёным при любом состоянии кода.
+
+
+def _filler(count: int) -> list[build_kb.Block]:
+    """Наполнитель на разные темы, чтобы чанков стало больше `MIN_CORPUS`."""
+    blocks: list[build_kb.Block] = []
+    for number in range(count):
+        blocks.append(_heading(f"Раздел {number}"))
+        blocks.append(_paragraph(f"Тема номер {number} про наблюдение ребенка. " * 20))
+    return blocks
+
+
+def _big_kb(tmp_path, monkeypatch, blocks) -> int:
+    """База крупнее `MIN_CORPUS`. Возвращает число фрагментов.
+
+    Размер проверяется здесь же: фикстура, тихо съехавшая в маленькую ветку,
+    сделала бы зелёными все тесты на ней, ничего при этом не проверяя.
+    """
+    _tiny_kb(tmp_path, monkeypatch, blocks + _filler(30))
+    connection = sqlite3.connect(f"file:{tmp_path / 'kb.db'}?mode=ro", uri=True)
+    total = connection.execute("SELECT count(*) FROM chunks").fetchone()[0]
+    connection.close()
+    assert total >= search.MIN_CORPUS, f"база из {total} чанков — пороги выключены"
+    return total
+
+
+def test_the_big_fixture_really_turns_the_thresholds_on(tmp_path, monkeypatch):
+    """Вторая половина фикстуры: пороги обязаны быть включены.
+
+    Без этой проверки `_big_kb` однажды уменьшится, и сторожи молчания станут
+    зелёными ни о чём — тот же класс, что тест WAL на базе в памяти.
+    """
+    _big_kb(tmp_path, monkeypatch, [_heading("Сон"), _paragraph("Сон младенца ночью. " * 15)])
+    connection = search._open()
+    assert connection is not None
+    total = connection.execute("SELECT count(*) FROM chunks").fetchone()[0]
+    assert total >= search.MIN_CORPUS
+
+
+def _about(word: str, also: str = "", times: int = 4) -> list[build_kb.Block]:
+    """Разделы про одно и то же слово, чтобы его `df` перевалил `MIN_DF`.
+
+    Меньше трёх разделов — и слово не станет опорным, а выдача опустеет по
+    требованию `anchors`. Тест сторожа молчания прошёл бы тогда по чужой
+    причине и остался бы зелёным, даже если сторож убрать совсем.
+    """
+    blocks: list[build_kb.Block] = []
+    for number in range(times):
+        blocks.append(_heading(f"{word.capitalize()} — часть {number}"))
+        blocks.append(_paragraph(f"Тут {word} {also} и его применение у ребенка. " * 12))
+    return blocks
+
+
+def _is_anchored(word: str) -> bool:
+    """Стала ли основа опорной: без этого сторож проверять нечего."""
+    connection = search._open()
+    assert connection is not None
+    _, _, anchors = search._significant(connection, morph.stems(word))
+    return bool(anchors)
+
+
+@pytest.mark.asyncio
+async def test_an_unknown_word_counts_against_the_coverage(tmp_path, monkeypatch):
+    """Незнакомое базе слово обязано попасть в знаменатель покрытия.
+
+    Раньше оно выбрасывалось, и знаменатель состоял только из слов, которые
+    база знает. «Как поменять масло в машине» давало покрытие 1.0 по одному
+    «маслу» — бот отвечал про растительное масло в салаты.
+    """
+    _big_kb(tmp_path, monkeypatch, _about("масло"))
+    # Само «масло» базе знакомо и опорно — значит выдача пуста из-за ворот,
+    # а не оттого, что искать было нечем
+    assert _is_anchored("масло")
+    assert await search.search("как поменять масло в машине") == []
+
+
+@pytest.mark.asyncio
+async def test_a_single_unknown_word_does_not_silence_a_good_question(tmp_path, monkeypatch):
+    """Вторая половина сторожа, и без неё он однажды затянется.
+
+    Ворота считают слова, а не запрещают незнакомые: в настоящем вопросе
+    опечатка или редкое слово встречаются постоянно, и молчание на них
+    выглядело бы как поломка бота.
+    """
+    # Оба знакомых слова обязаны лежать в одном фрагменте: покрытие считается
+    # по фрагменту, и разнесённые по разным разделам они дали бы 1/3
+    _big_kb(tmp_path, monkeypatch, _about("фототерапия", "желтухи"))
+    assert _is_anchored("фототерапия")
+    assert await search.search("фототерапия желтухи зимой")
+
+
+@pytest.mark.asyncio
+async def test_thresholds_are_off_on_a_tiny_base(tmp_path, monkeypatch):
+    """Правило `MIN_CORPUS` держалось комментарием и не проверялось ничем.
+
+    В базе из нескольких фрагментов каждое слово одновременно и «редчайшее»,
+    и «в шестой части документов»; включённые пороги заставили бы такую базу
+    молчать на всё подряд.
+    """
+    _tiny_kb(tmp_path, monkeypatch, [_heading("Сон"), _paragraph("Сон младенца ночью. " * 15)])
+    connection = search._open()
+    assert connection is not None
+    total = connection.execute("SELECT count(*) FROM chunks").fetchone()[0]
+    assert total < search.MIN_CORPUS
+    assert await search.search("сон младенца")
+
+
+# --- Чистка индекса ---------------------------------------------------------
+
+
+def _styled(text: str, size: float = 9.0, bold: bool = False, lines: int = 1) -> build_kb._Line:
+    """Строка с заданным кеглем: `_line` выше про другое и занят."""
+    return build_kb._Line(text=text, size=size, bold=bold, lines=lines, page=1)
+
+
+def test_a_bibliography_entry_is_not_a_heading():
+    """Запись списка литературы начинается с номера и заглавной буквы.
+
+    То есть проходит под `_NUMBERED` — и именно этим открывала библиографию
+    обратно: `classify` снимает пропуск служебного раздела на каждом заголовке.
+    """
+    entry = "2. Lunze K., Higgins-Steele A. // BMC Pregnancy Childbirth. 2015"
+    assert not build_kb._is_heading(_styled(entry), body=9.0)
+
+
+def test_the_reference_list_does_not_come_back_on_its_own_entries():
+    """Регрессия, стоившая базе сотен мусорных фрагментов.
+
+    Заголовок «Список литературы» пропуск включал, а первая же запись —
+    выключала, и весь остаток списка уезжал в индекс как содержание.
+    """
+    blocks = build_kb.classify(
+        [
+            _styled("Список литературы"),
+            _styled("1. Иванов И. И. Питание детей. М., 2016. 23 с."),
+            _styled("2. Lunze K., Higgins-Steele A. // BMC Pregnancy Childbirth. 2015"),
+        ],
+        body=9.0,
+        contents=set(),
+        junk=set(),
+    )
+    assert blocks == []
+
+
+def test_an_author_biography_is_not_a_heading():
+    """Каждый автор становился отдельным разделом, и его биография — шапкой.
+
+    Живая поломка: на вопрос «когда начинают резаться зубы» бот выдавал
+    «6. Зубков Виктор Васильевич — доктор медицинских наук».
+    """
+    person = "6. Зубков Виктор Васильевич - доктор медицинских наук, директор"
+    assert not build_kb._is_heading(_styled(person), body=9.0)
+
+
+def test_a_numbered_section_is_still_a_heading():
+    """Вторая половина: нумерованный заголовок обязан выжить.
+
+    Без неё сторож затянут, и вместе с библиографией уедет вся структура —
+    ровно та поломка, что уже случалась с «1. Краткая информация».
+    """
+    assert build_kb._is_heading(_styled("2. Ведение беременных с желтухой"), body=9.0)
+
+
+def test_a_table_caption_is_not_a_heading():
+    """Подпись к таблице бывает жирной, но всегда мельче основного текста.
+
+    Замерено: основной текст 9.0, «Возраст, мес» — жирные 7.5. Из-за них путь
+    заголовков рвался, и настоящие главы в шапку чанка не попадали.
+    """
+    assert not build_kb._is_heading(_styled("Возраст, мес", size=7.5, bold=True), body=9.0)
+
+
+def test_a_bold_heading_of_body_size_survives():
+    """Вторая половина проверки кегля: жирный заголовок в кегль текста бывает."""
+    assert build_kb._is_heading(_styled("Вскармливание недоношенных", bold=True), body=9.0)
+
+
+def test_a_toc_line_is_not_a_heading():
+    """Одиночная строка оглавления доживала до заголовка.
+
+    Целые страницы оглавления выбрасываются раньше, но строка, уехавшая на
+    соседнюю страницу, становилась разделом: «Глава 11. … . . . . . .».
+    """
+    assert not build_kb._is_heading(_styled("Глава 11. Лечебное питание . . . . . ."), body=9.0)
+
+
+def test_a_clinical_paragraph_naming_one_author_survives():
+    """Одна пара инициалов в тексте законна и выбрасываться не должна."""
+    text = "Оценка по шкале Апгар (Apgar V., 1953) проводится на первой минуте. " * 6
+    assert not build_kb._is_credits(text)
+
+
+def test_a_paragraph_of_solid_names_is_dropped():
+    """А несколько подряд бывают только в перечне людей."""
+    text = (
+        "Никитюк Д. Б., Батурин А. К., Конь И. Я. Организация наблюдения. "
+        "Тутельян В. А., Бушуева Т. В. Диетотерапия при патологии обмена."
+    )
+    assert build_kb._is_credits(text)
