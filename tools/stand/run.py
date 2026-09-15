@@ -189,7 +189,7 @@ def main() -> int:
         else None,
     )
     parser = argparse.ArgumentParser(prog="tools.stand.run")
-    parser.add_argument("command", choices=("prepare", "chat", "act1", "act2", "act3"))
+    parser.add_argument("command", choices=("prepare", "chat", "act1", "act2", "act3", "act4"))
     parser.add_argument("--chat", type=int, default=None)
     parser.add_argument("--user", type=int, default=None)
     parser.add_argument(

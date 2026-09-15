@@ -86,6 +86,15 @@ class Family(Base):
     digest_time: Mapped[str] = mapped_column(String(5), default="10:00")
     last_digest_on: Mapped[date | None] = mapped_column(Date)
 
+    # Периодический опрос «Что было с прошлого раза?»: интервал в часах и
+    # отметка о последнем заданном вопросе. `0` = выключено, и это значение по
+    # умолчанию — бот молчит, пока его не попросили. `server_default` здесь не
+    # украшение: без него миграция выпустит NOT NULL без умолчания в DDL, и
+    # боевая база с уже заведённой семьёй откажется принять колонку — при
+    # зелёных тестах, потому что они строят схему через `create_all`
+    checkin_hours: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    checkin_last_at: Mapped[datetime | None] = mapped_column(DateTime)
+
     # Живая панель: закреплённое сообщение, которое правится на каждый тап.
     # `panel_day` — локальный день, за который она выпущена. Именно день, а не
     # момент: сравнение идёт с `local_today`, как и у `last_digest_on`

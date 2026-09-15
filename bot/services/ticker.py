@@ -34,7 +34,7 @@ from bot.db.models import (
     Reminder,
 )
 from bot.db.session import Session
-from bot.services import backup, digest, growth, panel, redflags, sending
+from bot.services import backup, checkin, digest, growth, panel, redflags, sending
 from bot.services import timeutil as tu
 
 log = logging.getLogger(__name__)
@@ -155,12 +155,17 @@ async def tick_once(
     панель показывают неправду — а следом идут и наблюдение за данными, и
     сводка, и панель. Бэкап последним: сорвавшийся снимок не должен задержать
     ни напоминание, ни тревогу.
+
+    Опрос идёт после дайджеста: в понедельник утром они созревают в один тик,
+    и вопрос, заданный первым, тут же уехал бы вверх под итоги недели с двумя
+    графиками. Перед панелью — по общему правилу этого списка.
     """
     moment = now or tu.now_utc()
     await close_stale_timers(bot, session, moment)
     await send_due_reminders(bot, session, moment)
     await watch_tracker(bot, session, moment)
     await digest.send_pending(bot, session, moment)
+    await checkin.send_pending(bot, session, moment)
     await panel.refresh_stale(bot, session, moment)
     await backup.run_daily(moment)
 

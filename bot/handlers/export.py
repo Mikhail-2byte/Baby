@@ -28,7 +28,7 @@ from matplotlib.backends.backend_pdf import PdfPages
 from matplotlib.figure import Figure
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from bot import texts
+from bot import keyboards, texts
 from bot.db import repo
 from bot.db.models import MEASURE_KINDS, Child, Event, Family, Measurement
 from bot.filters import IN_GROUP
@@ -51,7 +51,7 @@ async def export(
     message: Message, session: AsyncSession, family: Family, child: Child | None
 ) -> None:
     if child is None:
-        await message.answer(texts.NO_CHILD)
+        await message.answer(texts.NO_CHILD, reply_markup=keyboards.home())
         return
 
     now = tu.now_utc()
@@ -68,7 +68,7 @@ async def export(
         )
 
     if not events and not measures:
-        await message.answer(texts.EXPORT_EMPTY)
+        await message.answer(texts.EXPORT_EMPTY, reply_markup=keyboards.home())
         return
 
     stamp = tu.to_local(now, family.tz).strftime("%Y-%m-%d")
@@ -110,9 +110,15 @@ def _csv(
     """Одна таблица на события и измерения: врачу нужна хронология, а не схема."""
     buffer = io.StringIO()
     writer = csv.writer(buffer, delimiter=";", lineterminator="\r\n")
+    # «Уточнение» — это `subtype`: название лекарства, вид прикорма. Колонка
+    # появилась вместе с голосовым вводом, и не для красоты: до неё `subtype`
+    # не читал ни один экран, то есть названное вслух «витамин D» ложилось в
+    # базу и исчезало навсегда. Колонка, которую пишет модель и не читает
+    # никто, хуже неиспользуемой
     writer.writerow(
-        ["дата", "время", "возраст, дней", "что", "длительность, мин",
-         "значение", "сторона", "кто записал", "примечание"]
+        ["дата", "время", "возраст, дней", "что", "уточнение",
+         "длительность, мин", "значение", "сторона", "кто записал",
+         "примечание"]
     )
 
     rows: list[tuple[datetime, list]] = []
@@ -133,6 +139,7 @@ def _csv(
                     f"{local:%d.%m.%Y}", f"{local:%H:%M}",
                     growth.age_days(child, event.started_at),
                     texts.KIND_NAMES.get(event.kind, event.kind),
+                    event.subtype or "",
                     minutes,
                     f"{event.value_num:g}" if event.value_num is not None else "",
                     texts.SIDE_NAMES.get(event.side or "", ""),
@@ -151,6 +158,7 @@ def _csv(
                     f"{local:%d.%m.%Y}", f"{local:%H:%M}",
                     growth.age_days(child, measure.taken_at),
                     texts.MEASURE_NAMES.get(measure.kind, measure.kind),
+                    "",
                     "",
                     f"{measure.value:g}",
                     "",

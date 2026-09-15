@@ -106,14 +106,14 @@ async def baby(
         )
         return
     await state.set_state(New.name)
-    await message.answer(texts.BABY_ASK_NAME)
+    await message.answer(texts.BABY_ASK_NAME, reply_markup=keyboards.home())
 
 
 @router.message(New.name, F.text)
 async def got_name(message: Message, state: FSMContext) -> None:
     name = " ".join((message.text or "").split())[:64]
     if not name:
-        await message.answer(texts.BABY_ASK_NAME)
+        await message.answer(texts.BABY_ASK_NAME, reply_markup=keyboards.home())
         return
     await state.update_data(name=name)
     await state.set_state(New.sex)
@@ -128,24 +128,24 @@ async def got_sex(
     await state.set_state(New.born)
     await call.answer()
     if isinstance(call.message, Message):
-        await call.message.answer(texts.BABY_ASK_BORN)
+        await call.message.answer(texts.BABY_ASK_BORN, reply_markup=keyboards.home())
 
 
 @router.message(New.born, F.text)
 async def got_born(message: Message, state: FSMContext, family: Family) -> None:
     moment = parse_moment(message.text or "", family.tz)
     if moment is None:
-        await message.answer(texts.BABY_BAD_DATE)
+        await message.answer(texts.BABY_BAD_DATE, reply_markup=keyboards.home())
         return
     if moment > tu.now_utc():
         # Отдельная проверка, а не общий «не понял»: перепутанный год — самая
         # частая опечатка, и сказать об этом прямо дешевле, чем заставлять
         # человека гадать, что не так с форматом
-        await message.answer(texts.BABY_FUTURE_DATE)
+        await message.answer(texts.BABY_FUTURE_DATE, reply_markup=keyboards.home())
         return
     await state.update_data(born=moment.isoformat())
     await state.set_state(New.weight)
-    await message.answer(texts.BABY_ASK_WEIGHT)
+    await message.answer(texts.BABY_ASK_WEIGHT, reply_markup=keyboards.home())
 
 
 @router.message(New.weight, Command("skip"))
@@ -163,7 +163,7 @@ async def got_weight(
 ) -> None:
     grams = parse_grams(message.text or "")
     if grams is None:
-        await message.answer(texts.BABY_BAD_WEIGHT)
+        await message.answer(texts.BABY_BAD_WEIGHT, reply_markup=keyboards.home())
         return
     await _finish(message, state, session, family, member, bot, grams=grams)
 
@@ -259,11 +259,11 @@ async def edit_name(
 ) -> None:
     name = " ".join((message.text or "").split())[:64]
     if not name:
-        await message.answer(texts.BABY_EDIT_ASK_NAME)
+        await message.answer(texts.BABY_EDIT_ASK_NAME, reply_markup=keyboards.home())
         return
     await state.clear()
     await repo.update_child(session, child, name=name)
-    await message.answer(texts.baby_edited("Имя", name))
+    await message.answer(texts.baby_edited("Имя", name), reply_markup=keyboards.home())
 
 
 @router.callback_query(IN_GROUP_CB, Edit.sex, SexCB.filter())
@@ -279,7 +279,7 @@ async def edit_sex(
     await call.answer()
     if isinstance(call.message, Message):
         spelled = "девочка" if callback_data.value == "f" else "мальчик"
-        await call.message.answer(texts.baby_edited("Пол", spelled))
+        await call.message.answer(texts.baby_edited("Пол", spelled), reply_markup=keyboards.home())
 
 
 @router.message(Edit.born, F.text)
@@ -293,10 +293,10 @@ async def edit_born(
     """Сменить момент рождения — и погасить то, что от него было посчитано."""
     moment = parse_moment(message.text or "", family.tz)
     if moment is None:
-        await message.answer(texts.BABY_BAD_DATE)
+        await message.answer(texts.BABY_BAD_DATE, reply_markup=keyboards.home())
         return
     if moment > tu.now_utc():
-        await message.answer(texts.BABY_FUTURE_DATE)
+        await message.answer(texts.BABY_FUTURE_DATE, reply_markup=keyboards.home())
         return
 
     await state.clear()
@@ -322,7 +322,7 @@ async def edit_born(
     answer = texts.baby_edited("Дата рождения", f"{local:%d.%m.%Y в %H:%M}")
     if dropped:
         answer += texts.presets_dropped(dropped)
-    await message.answer(answer)
+    await message.answer(answer, reply_markup=keyboards.home())
 
 
 @router.message(Edit.weight, F.text)
@@ -340,7 +340,7 @@ async def edit_weight(
     """
     grams = parse_grams(message.text or "")
     if grams is None:
-        await message.answer(texts.BABY_BAD_WEIGHT)
+        await message.answer(texts.BABY_BAD_WEIGHT, reply_markup=keyboards.home())
         return
 
     await state.clear()
@@ -357,4 +357,7 @@ async def edit_weight(
     else:
         await repo.update_measurement(session, birth_point, value=float(grams))
 
-    await message.answer(texts.baby_edited("Вес при рождении", texts.weight_str(grams)))
+    await message.answer(
+        texts.baby_edited("Вес при рождении", texts.weight_str(grams)),
+        reply_markup=keyboards.home(),
+    )

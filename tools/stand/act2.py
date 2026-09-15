@@ -14,6 +14,8 @@ from datetime import timedelta
 from pathlib import Path
 
 from bot.config import settings
+from bot.db.models import SLEEP
+from bot.keyboards import CheckinCB
 from bot.services import timeutil as tu
 from tools.stand import seed
 from tools.stand.harness import Stand
@@ -130,5 +132,72 @@ async def run(stand: Stand) -> None:
         r.note(f"heartbeat обновлён {age:.0f} с назад")
         if age < 0 or age > 30:
             stand.protocol.fail("шаг 51", f"heartbeat не живой: {age:.0f} с")
+
+    await stand.mark("Дальше периодический опрос")
+
+    async with stand.step("52", "опрос созрел и пришёл карточкой") as r:
+        seed.stage_checkin(db, family_id, 3, tu.now_utc())
+        r.note("опрос включён на 3 ч, отметка отодвинута на 3 ч 1 мин назад")
+        await stand.settle(TICK_WAIT)
+        r.expect("Что было с прошлого раза")
+        r.show(
+            "опрос",
+            "SELECT checkin_hours, checkin_last_at FROM families WHERE id = ?",
+            (family_id,),
+        )
+
+    # Карточку тапаем по её собственному номеру, а не по «последнему
+    # отправленному»: между шагами в чат уходят отбивки, и «последним» станет
+    # отбивка. Номер берётся сразу после шага, до первого `mark`
+    card_id = stand.session.last_message_id
+
+    async with stand.step("53", "опрос не повторяется на следующем тике") as r:
+        await stand.settle(TICK_WAIT)
+        r.expect_silence()
+
+    async with stand.step("54", "опрос молчит ночью") as r:
+        previous_tz = seed.stage_checkin_night(db, family_id, tu.now_utc())
+        try:
+            seed.stage_checkin(db, family_id, 3, tu.now_utc())
+            r.note(f"зона подменена на ту, где сейчас ночь; была {previous_tz}")
+            await stand.settle(TICK_WAIT)
+            r.expect_silence()
+        finally:
+            # Сначала гасим опрос, потом возвращаем зону: вернув зону при
+            # созревшем опросе, мы дали бы ему выстрелить в те три секунды,
+            # которые шаг досиживает перед вердиктом
+            seed.stage_checkin(db, family_id, 0, tu.now_utc())
+            seed.set_timezone(db, family_id, previous_tz)
+
+    async with stand.step("55", "опрос молчит, если записи есть") as r:
+        moment = tu.now_utc()
+        seed.stage_checkin_silent(db, child_id, member_id, moment)
+        seed.stage_checkin(db, family_id, 3, moment)
+        r.note("подгузник пять минут назад — окно в три часа не пустое")
+        await stand.settle(TICK_WAIT)
+        r.expect_silence()
+
+    async with stand.step("56", "три тапа по карточке пишут сон задним числом") as r:
+        if card_id is None:
+            raise RuntimeError("Карточка опроса не дошла — нечего нажимать")
+        await stand.tap(CheckinCB(action="kind", kind=SLEEP).pack(), on=card_id)
+        await stand.tap(CheckinCB(action="when", kind=SLEEP, back=60).pack(), on=card_id)
+        await stand.tap(
+            CheckinCB(action="dur", kind=SLEEP, back=60, mins=30).pack(), on=card_id
+        )
+        r.expect("Сон")
+        r.show(
+            "последний сон",
+            "SELECT started_at, ended_at, estimated FROM events "
+            "WHERE kind = ? ORDER BY id DESC LIMIT 1",
+            (SLEEP,),
+        )
+        r.note("ждём estimated = 0: длительность назвал человек, а не тикер")
+        r.note("ждём начало час назад и конец через полчаса после начала")
+
+    async with stand.step("57", "«Не спрашивать» выключает опрос и говорит вслух") as r:
+        await stand.tap(CheckinCB(action="mute").pack(), on=card_id)
+        r.expect("спрашивать не буду")
+        r.show("опрос", "SELECT checkin_hours FROM families WHERE id = ?", (family_id,))
 
     await stand.mark("Акт 2 закончен")

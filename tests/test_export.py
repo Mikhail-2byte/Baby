@@ -34,8 +34,12 @@ async def test_csv_is_semicolon_separated(session, child, mother, family, now):
 
     text = _decode(export._csv(child, family.tz, events, []))
     rows = list(csv.reader(text.splitlines(), delimiter=";"))
-    assert len(rows[0]) == 9, "шапка обязана разобраться в девять колонок"
-    assert len(rows[1]) == 9
+    # Сторожим совпадение шапки со строками, а не количество колонок числом:
+    # число менялось (голосовой ввод добавил «уточнение»), и тест краснел на
+    # верной правке, ничего не говоря о настоящем инварианте — врач читает
+    # таблицу, в которой подписи и данные обязаны стоять друг под другом
+    assert len(rows[0]) > 1, "шапка обязана разобраться по точке с запятой"
+    assert all(len(row) == len(rows[0]) for row in rows[1:])
 
 
 @pytest.mark.asyncio

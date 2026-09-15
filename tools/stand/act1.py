@@ -62,6 +62,14 @@ async def run(stand: Stand) -> None:
 
     # --- знакомство ---------------------------------------------------
 
+    async with stand.step("0", "бота добавили в группу: приветствие и клавиатура") as r:
+        await stand.join()
+        r.expect("/baby")
+        r.expect_keyboard()
+        r.note("Клавиатура обязана доехать до первой команды, а не после неё")
+        r.note("Что шаг НЕ проверяет: что Telegram присылает my_chat_member —")
+        r.note("это про allowed_updates, и закрыто юнит-сторожем")
+
     async with stand.step("1", "первый апдейт из группы: семья заводится сама") as r:
         await stand.say("/ping")
         r.expect("Живой")
@@ -75,7 +83,7 @@ async def run(stand: Stand) -> None:
         r.expect("/baby")
         r.expect("Кнопки под полем ввода")
         r.show("панель", "SELECT panel_message_id, panel_day FROM families")
-        r.note("В extra у /help обязан быть keyboard: клавиатура доехала")
+        r.expect_keyboard()
 
     async with stand.step("4", "тап по кнопке записи до карточки") as r:
         # Кнопок на панели сейчас нет вовсе, и это правильно. Нажатие
@@ -112,7 +120,8 @@ async def run(stand: Stand) -> None:
     async with stand.step("5е", "мастер /baby: вес 3420") as r:
         await stand.say(str(BIRTH_WEIGHT_G))
         r.expect("Панель ниже")
-        r.note("С «Готово» едет клавиатура — первый контакт новой семьи с ней")
+        r.expect_keyboard()
+        r.note("С «Готово» едет клавиатура — она же ехала с приветствием")
         r.show(
             "children",
             "SELECT id, name, sex, born_at, birth_weight_g FROM children",
@@ -288,6 +297,22 @@ async def run(stand: Stand) -> None:
         if before == after:
             stand.protocol.fail("шаг 20а", "панель не выпущена заново")
         r.note("Шаг красный на «не было delete» — у бота нет права удалять")
+
+    async with stand.step("20а2", "обычный ответ несёт клавиатуру") as r:
+        # Шаг, которого не хватило 15.09. Не /help, не мастер — рядовой ответ
+        # бота, каких у семьи десятки в день. Ровно на них клавиатура и не
+        # ехала, а протокол был зелёным
+        await stand.say("/ping")
+        r.expect("Живой")
+        r.expect_keyboard()
+
+    async with stand.step("20а3", "вопрос после тапа несёт, подтверждение — нет") as r:
+        # Два сообщения из одного `track._say`, разведённые `markup or home()`:
+        # у подтверждения своя кнопка отмены, у вопроса — клавиатура
+        await stand.tap(TrackCB(action="add", kind=FEED_BOTTLE).pack())
+        r.expect("Сколько мл")
+        r.expect_keyboard()
+        r.note("Какое из двух сообщений какую разметку несёт — видно построчно")
 
     async with stand.step("20б", "кнопка «Вопрос» ждёт вопрос следующей репликой") as r:
         await stand.say(keyboards.HOME_ASK)

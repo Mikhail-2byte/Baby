@@ -52,7 +52,7 @@ async def ask_weight(
     pending.remember(family.chat_id, call.from_user.id, pending.WEIGHT_G)
     await call.answer()
     if isinstance(call.message, Message):
-        await call.message.answer(texts.ASK_WEIGHT)
+        await call.message.answer(texts.ASK_WEIGHT, reply_markup=keyboards.home())
 
 
 @router.message(IN_GROUP, Command("weight"))
@@ -71,17 +71,17 @@ async def weight_command(
     цифра в голове, панель где-то выше по чату. Одна команда — и готово.
     """
     if child is None:
-        await message.answer(texts.NO_CHILD)
+        await message.answer(texts.NO_CHILD, reply_markup=keyboards.home())
         return
 
     if not command.args:
         pending.remember(family.chat_id, message.from_user.id, pending.WEIGHT_G)
-        await message.answer(texts.ASK_WEIGHT)
+        await message.answer(texts.ASK_WEIGHT, reply_markup=keyboards.home())
         return
 
     value = pending.parse_number(command.args)
     if value is None:
-        await message.answer(texts.BAD_WEIGHT)
+        await message.answer(texts.BAD_WEIGHT, reply_markup=keyboards.home())
         return
     await _save_weight(message, session, bot, family, member, child, value)
 
@@ -127,8 +127,44 @@ async def number_reply(
         return
     event.value_num = value
     await session.commit()
-    await message.answer(f"Записал: {value:g} мл")
+    await message.answer(f"Записал: {value:g} мл", reply_markup=keyboards.home())
     panel.schedule(bot, family.id, message.message_id)
+
+
+async def record_weight(
+    session: AsyncSession,
+    family: Family,
+    member: Member,
+    child: Child,
+    grams: float,
+    taken_at: datetime,
+) -> tuple[Measurement, str]:
+    """Записать взвешивание и собрать текст о нём. Ничего не отправляет.
+
+    Вызывающих двое: ответ числом (`_save_weight` ниже) и диктовка «вес три
+    двести» (`handlers/voice`). Возвращает текст, а не отправляет его, ровно
+    поэтому: голосовой путь кладёт его в свою карточку, а не во второе
+    сообщение.
+
+    Собирать этот текст у голоса заново нельзя: центиль и прибавка с прошлого
+    взвешивания — то, ради чего вес вообще записывают, и вторая, более бедная
+    версия того же объявления разошлась бы с первой молча.
+
+    `taken_at` параметром: сказанное вслух взвешивание могло быть утром, а не
+    «сейчас». Проверку правдоподобия делает `to_grams`, и делает её один — это
+    единственный вход веса в базу.
+    """
+    previous = await repo.last_measurement(session, child.id, WEIGHT)
+    measurement = await repo.add_measurement(
+        session, child.id, member.id, WEIGHT, taken_at=taken_at, value=grams
+    )
+    text = texts.weight_saved(
+        measurement,
+        family.tz,
+        zscore_text=await _zscore_text(session, child, grams, taken_at),
+        delta_text=_delta_text(previous, grams, taken_at),
+    )
+    return measurement, text
 
 
 async def _save_weight(
@@ -142,23 +178,14 @@ async def _save_weight(
 ) -> None:
     grams = to_grams(raw)
     if grams is None:
-        await message.answer(texts.WEIGHT_OUT_OF_RANGE)
+        await message.answer(texts.WEIGHT_OUT_OF_RANGE, reply_markup=keyboards.home())
         return
 
-    now = tu.now_utc()
-    previous = await repo.last_measurement(session, child.id, WEIGHT)
-    measurement = await repo.add_measurement(
-        session, child.id, member.id, WEIGHT, taken_at=now, value=grams
+    measurement, text = await record_weight(
+        session, family, member, child, grams, tu.now_utc()
     )
-
     await message.answer(
-        texts.weight_saved(
-            measurement,
-            family.tz,
-            zscore_text=await _zscore_text(session, child, grams, now),
-            delta_text=_delta_text(previous, grams, now),
-        ),
-        reply_markup=keyboards.undo("measure", measurement.id),
+        text, reply_markup=keyboards.undo("measure", measurement.id)
     )
     panel.schedule(bot, family.id, message.message_id)
 

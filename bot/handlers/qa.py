@@ -56,7 +56,7 @@ async def start_question(message: Message, family: Family, user_id: int) -> None
     которое поставили, но о котором не сказали.
     """
     pending.remember(family.chat_id, user_id, pending.QUESTION)
-    await message.answer(texts.ASK_QUESTION)
+    await message.answer(texts.ASK_QUESTION, reply_markup=keyboards.home())
 
 
 @router.callback_query(IN_GROUP_CB, keyboards.AskCB.filter())
@@ -66,24 +66,37 @@ async def ask(call: CallbackQuery, family: Family) -> None:
         await start_question(call.message, family, call.from_user.id)
 
 
-@router.message(IN_GROUP, F.text, AwaitsQuestion())
-async def reply(message: Message, family: Family) -> None:
-    """Вопрос пришёл. Ответ уходит одним сообщением, каким бы он ни был."""
-    pending.take(family.chat_id, message.from_user.id)
-    question = (message.text or "").strip()
+async def answer_and_reply(message: Message, question: str) -> None:
+    """Задать вопрос базе знаний и ответить одним сообщением.
 
+    Вызывающих двое: этот роутер (вопрос текстом после кнопки «❓ Вопрос») и
+    голосовой хендлер (вопрос, сказанный вслух). Четыре ветки по `result.kind`
+    в двух копиях однажды разойдутся, и разойдутся молча — отличить «не нашёл»
+    от «базы нет» по виду сообщения человек не сможет.
+
+    Ответ уходит одним сообщением, каким бы он ни был, — и отправка тоже одна.
+    Четыре ветки собирают текст, но не шлют его: с четырьмя отправками забыть
+    разметку в одной из них ничего не стоило бы, а видно это было бы только у
+    того, кто получил именно эту ветку.
+    """
     # Печатает бот заметно дольше, чем отвечает на тап: цепочка моделей ждёт до
     # полутора минут. Без «печатает…» человек решит, что тап не сработал
     await message.bot.send_chat_action(message.chat.id, "typing")
     result = await qa.answer(question)
 
     if result.kind == qa.NO_KB:
-        await message.reply(texts.QA_NO_KB)
-        return
-    if result.kind == qa.NOT_FOUND:
-        await message.reply(texts.QA_NOT_FOUND)
-        return
-    if result.kind == qa.ANSWERED:
-        await message.reply(texts.qa_answer(result.answer, result.chunks))
-        return
-    await message.reply(texts.qa_extract(result.chunks))
+        text = texts.QA_NO_KB
+    elif result.kind == qa.NOT_FOUND:
+        text = texts.QA_NOT_FOUND
+    elif result.kind == qa.ANSWERED:
+        text = texts.qa_answer(result.answer, result.chunks)
+    else:
+        text = texts.qa_extract(result.chunks)
+    await message.reply(text, reply_markup=keyboards.home())
+
+
+@router.message(IN_GROUP, F.text, AwaitsQuestion())
+async def reply(message: Message, family: Family) -> None:
+    """Вопрос пришёл."""
+    pending.take(family.chat_id, message.from_user.id)
+    await answer_and_reply(message, (message.text or "").strip())

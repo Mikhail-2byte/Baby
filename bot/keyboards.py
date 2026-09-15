@@ -75,6 +75,18 @@ class AskCB(CallbackData, prefix="ask"):
     """
 
 
+class VoiceCB(CallbackData, prefix="vc"):
+    """Карточка разбора голосового: записать или отвергнуть.
+
+    Ровно одно поле, и запасных «на потом» здесь нет намеренно — см. докстроку
+    модуля про то, как стареют кнопки в истории чата. Правки полей у карточки
+    тоже нет: ночью переговорить фразу заново дешевле, чем читать карточку
+    глазами и править её по полю.
+    """
+
+    action: str
+
+
 class SexCB(CallbackData, prefix="sex"):
     value: str
 
@@ -105,6 +117,38 @@ class RemindCB(CallbackData, prefix="rmd"):
 
     action: str
     preset: str = ""
+    hours: int = 0
+
+
+class CheckinCB(CallbackData, prefix="ci"):
+    """Периодический опрос: карточка в чате и ряд настройки на экране `/remind`.
+
+    `action`: `kind` — вид выбран, спросить «когда»; `when` — сдвиг выбран;
+    `dur` — длительность выбрана, записать отрезок; `run` — «ещё идёт», открыть
+    таймер задним числом; `none` — ничего не было; `back` — вернуться к видам;
+    `mute` — «не спрашивать» с самой карточки; `off` — выключить с экрана
+    `/remind`; `pick` — спросить интервал; `on` — включить.
+
+    `mute` и `off` делают с настройкой одно и то же и всё-таки разные: после
+    `off` надо перерисовать экран настроек, а после `mute` — погасить карточку,
+    на которой нажали. Одно действие на оба случая означало бы, что хендлер
+    угадывает, откуда пришёл тап, по содержимому сообщения.
+
+    `back` — минут назад от МОМЕНТА НАЖАТИЯ, `mins` — сколько длилось,
+    `hours` — интервал опроса.
+
+    Вид едет полной константой из `models`, а не номером строки в файле
+    содержания: номер сдвинется от перестановки строк, и вчерашняя кнопка
+    «мокрый» запишет сегодня «стул» — молча и без единого следа в логе.
+
+    Один класс на оба экрана, а не два: сценарий один, и делить его значило бы
+    завести две вещи, которые обязаны стареть вместе.
+    """
+
+    action: str
+    kind: str = ""
+    back: int = 0
+    mins: int = 0
     hours: int = 0
 
 
@@ -165,6 +209,30 @@ def panel(*, running_kind: str | None) -> InlineKeyboardMarkup:
     Когда таймер идёт, его кнопки уступают место одной большой «Закончить».
     Это не украшение: перепутать «начали» и «закончили» в полусне легко, а
     лишний старт поверх идущего таймера портит статистику суток.
+
+    **По две кнопки в ряду, и это замер, а не вкус.** В нижнем ряду стояло
+    четыре, и на телефоне Telegram резал подписи до «Су…» и «во.» — то есть
+    кнопка переставала называть себя ровно там, где на неё жмут не глядя. Три в
+    ряду тоже мало: «🍼 Бутылочка» не помещалась. Две — единственная ширина, при
+    которой не обрезается ни одна подпись, и заодно вдвое более крупная цель
+    для пальца ночью.
+
+    **Трёх кнопок здесь больше нет, и все три ушли не в никуда.** «📊 Сутки» и
+    «❓ Вопрос» переехали на постоянную клавиатуру под полем ввода
+    (`home()`) — там они доступны в один тап всегда, а не только когда панель
+    на экране. «🔄» перерисовывала панель **на месте**, то есть была нужна
+    ровно тогда, когда панель уже видно; её работу забрала кнопка «📋 Панель»,
+    которая приводит панель вниз чата.
+
+    Обработчики `StatsCB`, `AskCB` и `PanelCB` при этом остаются: кнопки живут
+    в истории чата неограниченно долго, и тап по вчерашней панели обязан
+    работать — см. докстроку модуля.
+
+    **«🍼 Бутылочка» переехала в нижний ряд и стала доступна всегда.** Это не
+    побочный эффект раскладки, а исправление: бутылочка — мгновенное событие,
+    как подгузник, и с идущим таймером не конфликтует (`_add` его не трогает
+    вовсе). Пока она стояла в ряду кормлений, её прятало любое включённое
+    сцеживание.
     """
     builder = InlineKeyboardBuilder()
 
@@ -185,10 +253,6 @@ def panel(*, running_kind: str | None) -> InlineKeyboardMarkup:
                 text="🤱 Правая",
                 callback_data=TrackCB(action="start", kind=FEED_BREAST, side=RIGHT).pack(),
             ),
-            InlineKeyboardButton(
-                text="🍼 Бутылочка",
-                callback_data=TrackCB(action="add", kind=FEED_BOTTLE).pack(),
-            ),
         )
         builder.row(
             InlineKeyboardButton(
@@ -201,7 +265,7 @@ def panel(*, running_kind: str | None) -> InlineKeyboardMarkup:
             ),
         )
 
-    # Подгузники доступны всегда: они мгновенные и с таймером не конфликтуют
+    # Мгновенные события: с таймером не конфликтуют, поэтому доступны всегда
     builder.row(
         InlineKeyboardButton(
             text="💧 Мокрый",
@@ -214,16 +278,11 @@ def panel(*, running_kind: str | None) -> InlineKeyboardMarkup:
     )
     builder.row(
         InlineKeyboardButton(
+            text="🍼 Бутылочка",
+            callback_data=TrackCB(action="add", kind=FEED_BOTTLE).pack(),
+        ),
+        InlineKeyboardButton(
             text="⚖️ Вес", callback_data=MeasureCB(kind="weight").pack()
-        ),
-        InlineKeyboardButton(
-            text="📊 Сутки", callback_data=StatsCB(period="today").pack()
-        ),
-        InlineKeyboardButton(
-            text="❓ Вопрос", callback_data=AskCB().pack()
-        ),
-        InlineKeyboardButton(
-            text="🔄", callback_data=PanelCB(action="refresh").pack()
         ),
     )
     return builder.as_markup()
@@ -242,6 +301,30 @@ def undo(what: str, row_id: int) -> InlineKeyboardMarkup:
                     text="↩️ Отменить",
                     callback_data=UndoCB(what=what, row_id=row_id).pack(),
                 )
+            ]
+        ]
+    )
+
+
+def voice_card() -> InlineKeyboardMarkup:
+    """Две кнопки под разбором голосового.
+
+    Первая карточка в проекте, у которой их две: до сих пор подтверждение было
+    одной кнопкой «↩️ Отменить» под уже сделанной записью. Здесь наоборот —
+    записи ещё нет, и «ничего не сохраняется молча» означает, что между
+    разбором и базой стоит человек с кнопкой.
+    """
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="✅ Записать",
+                    callback_data=VoiceCB(action="save").pack(),
+                ),
+                InlineKeyboardButton(
+                    text="✖️ Не то",
+                    callback_data=VoiceCB(action="drop").pack(),
+                ),
             ]
         ]
     )
@@ -296,13 +379,22 @@ def edit_child() -> InlineKeyboardMarkup:
 
 
 def remind(
-    presets: Sequence[tuple[str, str, bool]], *, pickable: frozenset[str] = frozenset()
+    presets: Sequence[tuple[str, str, bool]],
+    *,
+    pickable: frozenset[str] = frozenset(),
+    checkin: tuple[str, bool] | None = None,
 ) -> InlineKeyboardMarkup:
     """Список пресетов: по кнопке на строку плюс календарь снизу.
 
     `presets` — тройки «id, подпись, включён ли». Клавиатура ничего не знает
     про содержание: что за пресеты и как они называются, решает `schedule`, а
     здесь только раскладка.
+
+    `checkin` — пара «подпись, включён ли» для периодического опроса. Он
+    отдельным аргументом, а не шестым элементом `presets`, потому что это не
+    пресет: строки в `reminders` у него нет, и кнопка у него своя, с другим
+    `callback_data`. Слить их в один список значило бы соврать читателю о том,
+    чем опрос является.
 
     Выключение — то же нажатие, что и включение. Отдельной кнопки «выключить»
     нет: строк стало бы вдвое больше, а промахнуться в темноте по соседней
@@ -316,6 +408,14 @@ def remind(
             InlineKeyboardButton(
                 text=f"{mark} {label}",
                 callback_data=RemindCB(action=action, preset=preset_id).pack(),
+            )
+        )
+    if checkin is not None:
+        label, is_on = checkin
+        builder.row(
+            InlineKeyboardButton(
+                text=f"{'✅' if is_on else '⬜'} {label}",
+                callback_data=CheckinCB(action="off" if is_on else "pick").pack(),
             )
         )
     builder.row(
@@ -370,6 +470,95 @@ def remind_calendar(shown: str) -> InlineKeyboardMarkup:
             ],
         ]
     )
+
+
+def checkin_card(
+    kinds: Sequence[tuple[str, str]], *, nothing: str, mute: str
+) -> InlineKeyboardMarkup:
+    """Первый экран опроса: виды по двое в ряд, снизу отказ и отключение.
+
+    По двое, а не по одному: видов пять, и пять строк подряд под вопросом
+    читаются как список дел. По трое подписи с иконкой уже режутся.
+
+    «Не спрашивать» стоит на самой карточке, а не только в `/remind`, потому
+    что отказаться от навязанного должно быть не труднее, чем включить нужное,
+    — а карточка приходит сама.
+    """
+    builder = InlineKeyboardBuilder()
+    for kind, label in kinds:
+        builder.button(text=label, callback_data=CheckinCB(action="kind", kind=kind))
+    builder.adjust(2)
+    builder.row(
+        InlineKeyboardButton(text=nothing, callback_data=CheckinCB(action="none").pack())
+    )
+    builder.row(
+        InlineKeyboardButton(text=mute, callback_data=CheckinCB(action="mute").pack())
+    )
+    return builder.as_markup()
+
+
+def checkin_when(kind: str, shifts: Sequence[tuple[int, str]]) -> InlineKeyboardMarkup:
+    """Второй экран: как давно это было.
+
+    По двое в ряд: подписи здесь длиннее, чем «2 ч» у интервала напоминаний, и
+    пятью в строку Telegram обрежет их до неузнаваемости.
+    """
+    builder = InlineKeyboardBuilder()
+    for minutes, label in shifts:
+        builder.button(
+            text=label, callback_data=CheckinCB(action="when", kind=kind, back=minutes)
+        )
+    builder.adjust(2)
+    builder.row(
+        InlineKeyboardButton(text="⬅️ Назад", callback_data=CheckinCB(action="back").pack())
+    )
+    return builder.as_markup()
+
+
+def checkin_how_long(
+    kind: str, back: int, durations: Sequence[tuple[int, str]], *, still: str
+) -> InlineKeyboardMarkup:
+    """Третий экран, только у длящихся видов: сколько это длилось.
+
+    Третий тап — цена того, что ни одно число в дневнике не придумано ботом.
+    Подставить длительность из файла было бы на тап дешевле и означало бы
+    запись, которую никто не называл, — а в сводке она сложилась бы с
+    измеренными и стала бы от них неотличима.
+
+    `still` — «ещё идёт», и он последний намеренно: это единственный ответ, у
+    которого конца нет вовсе, и таких ночей меньше, чем закончившихся.
+    """
+    builder = InlineKeyboardBuilder()
+    for minutes, label in durations:
+        builder.button(
+            text=label,
+            callback_data=CheckinCB(action="dur", kind=kind, back=back, mins=minutes),
+        )
+    builder.adjust(4)
+    builder.row(
+        InlineKeyboardButton(
+            text=still, callback_data=CheckinCB(action="run", kind=kind, back=back).pack()
+        )
+    )
+    builder.row(
+        InlineKeyboardButton(text="⬅️ Назад", callback_data=CheckinCB(action="back").pack())
+    )
+    return builder.as_markup()
+
+
+def checkin_hours(choices: Sequence[int]) -> InlineKeyboardMarkup:
+    """Выбор интервала опроса. Близнец `remind_hours`, но со своим CB."""
+    builder = InlineKeyboardBuilder()
+    builder.row(
+        *(
+            InlineKeyboardButton(
+                text=f"{hours} ч",
+                callback_data=CheckinCB(action="on", hours=hours).pack(),
+            )
+            for hours in choices
+        )
+    )
+    return builder.as_markup()
 
 
 def stats() -> InlineKeyboardMarkup:

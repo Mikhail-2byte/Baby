@@ -59,9 +59,13 @@ async def _say(
 
     Именно отдельным, а не всплывашкой: подтверждение должно остаться в ленте,
     чтобы второй родитель видел, что происходило ночью, не открывая статистику.
+
+    `markup or keyboards.home()`: подтверждение записи несёт свою кнопку отмены,
+    а вопрос «Сколько мл?» — ничего, и именно он становится носителем
+    клавиатуры. Одно сообщение обе разметки не носит, поэтому выбор, а не сумма.
     """
     if isinstance(call.message, Message):
-        await call.message.answer(text, reply_markup=markup)
+        await call.message.answer(text, reply_markup=markup or keyboards.home())
 
 
 @router.callback_query(IN_GROUP_CB, TrackCB.filter())
@@ -106,10 +110,12 @@ async def _start(
 
     # Идущий таймер закрываем, а не отказываем. Отказ («сначала закончите
     # предыдущее») в три часа ночи означает, что человек нажмёт ещё раз,
-    # не поймёт, почему ничего не происходит, и бросит запись вовсе
-    running = await repo.any_open_event(session, child.id)
-    if running is not None:
-        await repo.close_event(session, running, now)
+    # не поймёт, почему ничего не происходит, и бросит запись вовсе.
+    #
+    # Молча — потому что панель меняется под пальцем и закрытие видно сразу.
+    # На голосовом пути это не так (перерисовка отложена дебаунсом), и там о
+    # закрытии говорится вслух
+    await repo.close_running(session, child.id, now)
 
     event = await repo.start_event(
         session,

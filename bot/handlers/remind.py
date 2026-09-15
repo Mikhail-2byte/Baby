@@ -28,7 +28,7 @@ from bot.db import repo
 from bot.db.models import Child, Family, Member, Reminder
 from bot.filters import IN_GROUP, IN_GROUP_CB
 from bot.keyboards import RemindCB
-from bot.services import schedule
+from bot.services import checkin, schedule
 from bot.services import timeutil as tu
 
 log = logging.getLogger(__name__)
@@ -65,14 +65,24 @@ async def _state(
 async def _screen(
     session: AsyncSession, family: Family, now: datetime
 ) -> tuple[str, InlineKeyboardMarkup]:
+    """Экран целиком: пять пресетов из файла плюс ряд опроса.
+
+    Опроса нет в `_state` и быть не может: тот собирает строки из `reminders`, а
+    у опроса строки там нет — он не догоняется, и место ему в своём шаге тика, а
+    не в таблице напоминаний (см. докстроку `services/checkin.py`). Отсюда
+    отдельная ветка здесь: состояние опроса лежит в колонке семьи, а тап по
+    его ряду забирает `handlers/checkin.py` по своему `callback_data`.
+    """
     rows = await _state(session, family)
     buttons = [
         (preset.id, f"{preset.icon} {preset.title}", reminder is not None)
         for preset, reminder, _ in rows
     ]
-    return texts.remind_screen(rows, family.tz, now), keyboards.remind(
-        buttons, pickable=PICKABLE
-    )
+    hours = family.checkin_hours
+    label = f"{checkin.CARD.icon} {checkin.CARD.short}"
+    return texts.remind_screen(
+        rows, family.tz, now, checkin=texts.checkin_row(checkin.CARD, hours)
+    ), keyboards.remind(buttons, pickable=PICKABLE, checkin=(label, hours > 0))
 
 
 @router.message(IN_GROUP, Command("remind"))
@@ -129,8 +139,14 @@ async def _turn_on(
     return len(ahead), ahead[0][1] if ahead else None
 
 
-async def _redraw(call: CallbackQuery, session: AsyncSession, family: Family,
-                  now: datetime) -> None:
+async def redraw(call: CallbackQuery, session: AsyncSession, family: Family,
+                 now: datetime) -> None:
+    """Перерисовать экран на месте.
+
+    Публичная, потому что вызывающих двое: этот модуль и `handlers/checkin.py`
+    — настройка опроса живёт там, а экран, на котором её включают, здесь.
+    Вторая копия сборки экрана разошлась бы с первой молча.
+    """
     text, markup = await _screen(session, family, now)
     try:
         await call.message.edit_text(text, reply_markup=markup)
@@ -155,7 +171,7 @@ async def tap(
 
     if action == "back":
         await call.answer()
-        await _redraw(call, session, family, now)
+        await redraw(call, session, family, now)
         return
 
     if action == "cal":
@@ -180,8 +196,10 @@ async def tap(
     if action == "off":
         count = await repo.deactivate_preset(session, family.id, preset.id)
         await call.answer()
-        await call.message.answer(texts.preset_turned_off(preset, count))
-        await _redraw(call, session, family, now)
+        await call.message.answer(
+            texts.preset_turned_off(preset, count), reply_markup=keyboards.home()
+        )
+        await redraw(call, session, family, now)
         return
 
     if await repo.reminder_by_preset(session, family.id, preset.id):
@@ -197,10 +215,13 @@ async def tap(
     )
     await call.answer()
     if count == 0 or moment is None:
-        await call.message.answer(texts.REMIND_ALL_PAST)
+        await call.message.answer(texts.REMIND_ALL_PAST, reply_markup=keyboards.home())
         return
-    await call.message.answer(texts.preset_turned_on(preset, count, moment, family.tz, now))
-    await _redraw(call, session, family, now)
+    await call.message.answer(
+        texts.preset_turned_on(preset, count, moment, family.tz, now),
+        reply_markup=keyboards.home(),
+    )
+    await redraw(call, session, family, now)
 
 
 async def _calendar(

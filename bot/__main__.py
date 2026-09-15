@@ -83,17 +83,39 @@ def make_bot() -> Bot:
     )
 
 
-async def _publish_commands(bot: Bot) -> None:
-    """Меню команд для групп — в личке бот всё равно отвечает отказом.
+async def _publish_profile(bot: Bot) -> None:
+    """Меню команд и описание бота — то, что бот рассказывает о себе сам.
 
-    Сбой здесь не должен ронять старт: без меню бот работает, просто команды
-    приходится помнить наизусть.
+    Описание публикуется отсюда, а не выставляется руками у BotFather, по той же
+    причине, по которой здесь публикуется меню: то, что бот обещает про себя, —
+    это текст, и он обязан лежать в проекте. Выставленный руками, он расходится
+    с тем, что бот умеет, и заметить это можно только открыв BotFather. До
+    этапа 7 оба описания были пусты, и человек, которому бота переслали, не
+    узнавал о нём ничего.
+
+    Меню — в скоуп групп: в личке бот всё равно отвечает отказом. Описание
+    наоборот видно только в личке (в пустом чате и в профиле), и поэтому оно
+    прямо говорит, что работать надо в группе.
+
+    Каждый вызов в своём `try`, и сбой ни одного не роняет старт: без меню и
+    описания бот работает целиком, просто команды приходится помнить наизусть.
+    Раньше три вызова в одном `try` означали бы, что упавший первый отменяет
+    остальные.
     """
     commands = [BotCommand(command=c, description=d) for c, d in texts.COMMANDS]
-    try:
-        await bot.set_my_commands(commands, scope=BotCommandScopeAllGroupChats())
-    except Exception:
-        log.warning("Не удалось обновить меню команд", exc_info=True)
+    published = (
+        ("меню команд", bot.set_my_commands(commands, scope=BotCommandScopeAllGroupChats())),
+        ("описание", bot.set_my_description(description=texts.DESCRIPTION)),
+        (
+            "короткое описание",
+            bot.set_my_short_description(short_description=texts.SHORT_DESCRIPTION),
+        ),
+    )
+    for what, call in published:
+        try:
+            await call
+        except Exception:
+            log.warning("Не удалось обновить %s", what, exc_info=True)
 
 
 async def _stop_ticker(task: asyncio.Task | None) -> None:
@@ -139,7 +161,7 @@ async def main() -> None:
         me = await bot.get_me()
         log.info("Запуск @%s", me.username)
         await bot.delete_webhook(drop_pending_updates=True)
-        await _publish_commands(bot)
+        await _publish_profile(bot)
 
         task = asyncio.create_task(ticker.run(bot), name="ticker")
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())

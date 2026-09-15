@@ -20,10 +20,21 @@ from aiogram import Bot, Dispatcher
 from aiogram.client.session.base import BaseSession
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.methods import DeleteMessage, TelegramMethod
-from aiogram.types import Chat, Message, Update, User
+from aiogram.types import (
+    CallbackQuery,
+    Chat,
+    ChatMemberAdministrator,
+    ChatMemberLeft,
+    ChatMemberMember,
+    ChatMemberUpdated,
+    Message,
+    ReplyKeyboardMarkup,
+    Update,
+    User,
+)
 
 from bot import handlers, keyboards, texts
-from bot.handlers import baby, home
+from bot.handlers import baby, common, home
 from bot.middlewares import drop_wizard_state
 from bot.services import pending
 
@@ -138,7 +149,9 @@ class RecordingSession(BaseSession):
         payload = method.model_dump(exclude_none=True)
         if "text" in payload:
             self.sent.append(payload["text"])
-            self.markups.append(payload.get("reply_markup"))
+            # Объектом, а не выгрузкой в dict: pydantic сравнивает модели по
+            # значению, и `== keyboards.home()` читается без переводчика
+            self.markups.append(getattr(method, "reply_markup", None))
         return Message(message_id=999, date=NOW, chat=CHAT, from_user=AUTHOR, text="")
 
     async def stream_content(self, *args: Any, **kwargs: Any) -> Any:  # pragma: no cover
@@ -184,6 +197,17 @@ def wired(session, family, child, mother, monkeypatch):
     # «Router is already attached»
     for router in order:
         router._parent_router = None
+
+
+async def _tap(dp, bot, data, message_id=1):
+    """Тап по inline-кнопке под сообщением бота."""
+    message = Message(
+        message_id=message_id, date=NOW, chat=CHAT, from_user=AUTHOR, text="панель"
+    )
+    call = CallbackQuery(
+        id="1", from_user=AUTHOR, chat_instance="1", message=message, data=data
+    )
+    await dp.feed_update(bot, Update(update_id=message_id, callback_query=call))
 
 
 async def _feed(dp, bot, text, message_id=1):
@@ -339,3 +363,198 @@ async def test_a_bare_number_still_reaches_measure(wired):
 
     assert pending.peek(CHAT.id, AUTHOR.id) is None, "число обязано дойти до measure"
     assert talk.deleted == []
+
+
+# --- Доставка ---------------------------------------------------------------
+#
+# Весь раздел заведён по факту 15.09. Клавиатуру написали, закоммитили и
+# перезапустили бота — а в чате её не появилось. Носителей оказалось два из
+# полусотни возможных: `/help` и «Готово» мастера. Боевая семья завела карточку
+# 14.09 в 23:00, за час до того, как код клавиатуры вообще появился, а `/help` с
+# тех пор не писала ни разу: по `data/bot.log` после перезапуска в 09:38 пришло
+# десять апдейтов, среди них ни `/help`, ни `/start`. То есть всё, что
+# проверялось выше — метки, порядок роутеров, уборка нажатия, — проверялось на
+# функции, которой в бою не существовало.
+#
+# Вывод, ради которого этот раздел и написан: у фичи, доехавшей до чата одним
+# необязательным путём, нет ни одного пути.
+
+
+@pytest.mark.asyncio
+async def test_a_family_that_never_says_help_still_gets_the_keyboard(wired):
+    """Главный сторож раздела: без единой команды клавиатура обязана доехать.
+
+    Прогоняем ровно то, что делала боевая семья: тап по кнопке записи и реплику
+    с тревожным признаком. Ни `/help`, ни `/start`, ни мастера.
+    """
+    dp, bot, talk, opened = wired
+
+    await _feed(dp, bot, "у неё температура 39", 7)
+    assert keyboards.home() in talk.markups, "ответ триажа обязан нести клавиатуру"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "text",
+    ["/ping", "/stage", "/redflags", "у неё температура 39"],
+    ids=["ping", "stage", "redflags", "красный флаг"],
+)
+async def test_every_ordinary_answer_carries_the_keyboard(wired, text):
+    """Обычный ответ — носитель. Именно этого и не хватило в бою."""
+    dp, bot, talk, opened = wired
+
+    await _feed(dp, bot, text, 7)
+
+    assert talk.markups, f"{text}: бот вообще ничего не ответил"
+    assert keyboards.home() in talk.markups, f"{text}: ответ без клавиатуры"
+
+
+@pytest.mark.asyncio
+async def test_a_question_after_a_tap_carries_the_keyboard(wired):
+    """«Сколько мл?» — носитель, а подтверждение записи им быть не может.
+
+    Оба сообщения приходят из одного `track._say`, и разводит их `markup or
+    keyboards.home()`: у подтверждения своя кнопка отмены, у вопроса — ничего.
+    Одно сообщение обе разметки не носит, поэтому выбор, а не сумма.
+    """
+    dp, bot, talk, opened = wired
+    from bot.db.models import FEED_BOTTLE
+    from bot.keyboards import TrackCB
+
+    await _tap(dp, bot, TrackCB(action="add", kind=FEED_BOTTLE).pack())
+
+    assert keyboards.home() in talk.markups, "вопрос про мл обязан нести клавиатуру"
+    undo = [m for m in talk.markups if m is not None and m != keyboards.home()]
+    assert undo, "подтверждение обязано сохранить свою кнопку отмены"
+
+
+@pytest.mark.asyncio
+async def test_the_sex_prompt_keeps_its_buttons(wired):
+    """Второй сайт идиомы `or`: правка пола отдаёт `keyboards.sex()`, не home."""
+    dp, bot, talk, opened = wired
+    from bot.keyboards import EditCB
+
+    await _tap(dp, bot, EditCB(field="sex").pack())
+
+    assert keyboards.sex() in talk.markups
+    assert keyboards.home() not in talk.markups
+
+
+# --- Приветствие при добавлении в группу ------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_greeting_carries_the_keyboard(bot, family):
+    """Иначе до первой команды клавиатуры в чате нет вообще.
+
+    Перенос `Family_planer/tests/test_registration.py:127` — там этот сторож
+    стоит с самого начала, и ровно его отсутствие здесь стоило захода.
+    """
+    await common.bot_added(None, bot, family)
+
+    assert bot.sent == [(family.chat_id, texts.GREETING)]
+    assert bot.kwargs[0]["reply_markup"] == keyboards.home()
+
+
+def test_telegram_is_asked_for_my_chat_member():
+    """Апдейт приходит только потому, что на него есть хендлер.
+
+    `bot/__main__.py` отдаёт `allowed_updates=dp.resolve_used_update_types()`, а
+    тип, который никто не наблюдает, Telegram не присылает вовсе. Тот, кто
+    заменит вызов явным списком, выключит приветствие — и симптомом будет
+    тишина. Проверяем по боевому `handlers.routers`, а не по своему списку:
+    свой доказывал бы работу механизма и молчал бы о том, что зарегистрировано
+    на самом деле.
+
+    Эту половину стенд закрыть не может в принципе: он собирает диспетчер сам и
+    кормит его сам, то есть про `allowed_updates` не знает ничего.
+    """
+    dp = Dispatcher()
+    order = tuple(handlers.routers)
+    for router in order:
+        dp.include_router(router)
+    try:
+        assert "my_chat_member" in dp.resolve_used_update_types()
+    finally:
+        for router in order:
+            router._parent_router = None
+
+
+def _admin(user: User) -> ChatMemberAdministrator:
+    """Администратор с выключенными правами.
+
+    Флаги перечисляются по схеме, а не руками: у администратора их полтора
+    десятка, список растёт от версии к версии Telegram, и выписанный здесь он
+    краснел бы на обновлении aiogram, ничего при этом не проверив. Тесту важен
+    один-единственный факт — `status`.
+    """
+    flags = {
+        name: False
+        for name, field in ChatMemberAdministrator.model_fields.items()
+        if field.is_required() and name != "user"
+    }
+    return ChatMemberAdministrator(user=user, **flags)
+
+
+def _joined(me: User, old, new) -> Update:
+    return Update(
+        update_id=99,
+        my_chat_member=ChatMemberUpdated(
+            chat=CHAT, from_user=AUTHOR, date=NOW,
+            old_chat_member=old, new_chat_member=new,
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_the_greeting_goes_out_when_the_bot_is_added(wired):
+    """Положительный двойник теста ниже.
+
+    Без него «приветствие не ушло» доказывало бы ровно ничего: апдейт мог не
+    дойти до хендлера по десятку причин, и тест остался бы зелёным на пустом
+    месте.
+    """
+    dp, bot, talk, opened = wired
+    me = User(id=42, is_bot=True, first_name="Бот")
+
+    await dp.feed_update(bot, _joined(me, ChatMemberLeft(user=me), ChatMemberMember(user=me)))
+
+    assert texts.GREETING in talk.sent
+    assert keyboards.home() in talk.markups
+
+
+@pytest.mark.asyncio
+async def test_the_greeting_ignores_promotion(wired):
+    """`member → administrator` приветствием не является.
+
+    Переход случается через минуту после добавления, когда боту дают права на
+    закрепление и уборку. Второе приветствие на выдачу прав было бы первой же
+    поломкой, поэтому фильтр стоит на `IS_NOT_MEMBER >> IS_MEMBER`, а не на
+    «стал участником».
+    """
+    dp, bot, talk, opened = wired
+    me = User(id=42, is_bot=True, first_name="Бот")
+
+    await dp.feed_update(bot, _joined(me, ChatMemberMember(user=me), _admin(me)))
+
+    assert texts.GREETING not in talk.sent
+
+
+@pytest.mark.asyncio
+async def test_the_panel_never_carries_the_keyboard(
+    session_maker, family, child, bot, monkeypatch
+):
+    """Уцелевший инвариант, проверенный фактом, а не типом.
+
+    `edit_message_text` reply-клавиатуру не принимает вовсе, а одно сообщение не
+    носит обе разметки. Панель поэтому носителем быть не может ни при каком
+    способе доставки — и правка 15.09, раздавшая клавиатуру полусотне мест, её
+    не тронула.
+    """
+    from bot.services import panel
+
+    monkeypatch.setattr(panel, "Session", session_maker)
+    await panel.refresh(bot, family.id)
+
+    for kwargs in bot.kwargs + bot.edit_kwargs:
+        assert not isinstance(kwargs.get("reply_markup"), ReplyKeyboardMarkup)

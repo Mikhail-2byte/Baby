@@ -106,6 +106,27 @@ async def set_panel(
     await session.commit()
 
 
+async def set_checkin(
+    session: AsyncSession, family: Family, hours: int, now: datetime
+) -> None:
+    """Включить или выключить периодический опрос. `hours = 0` — выключен.
+
+    Отметка ставится в момент включения, а не оставляется пустой: пустая
+    означает «спросить на ближайшем тике», то есть бот заговорил бы через
+    минуту после того, как его включили. Первый вопрос обязан прийти через
+    интервал — та же доктрина, что у `schedule.first_fire_at`.
+    """
+    family.checkin_hours = hours
+    family.checkin_last_at = now if hours > 0 else None
+    await session.commit()
+
+
+async def mark_checkin(session: AsyncSession, family: Family, now: datetime) -> None:
+    """Вопрос задан — засечь время. Двойник отметки дайджеста."""
+    family.checkin_last_at = now
+    await session.commit()
+
+
 async def all_families(session: AsyncSession) -> list[Family]:
     """Все семьи — для фоновых обходов тикера."""
     return list(await session.scalars(select(Family)))
@@ -249,6 +270,34 @@ async def any_open_event(session: AsyncSession, child_id: int) -> Event | None:
         .order_by(Event.started_at.desc())
         .limit(1)
     )
+
+
+async def close_running(
+    session: AsyncSession, child_id: int, now: datetime
+) -> Event | None:
+    """Закрыть идущий таймер, если он есть. Возвращает закрытый.
+
+    Инвариант «ровно один открытый таймер на ребёнка» держит `repo`, а не база
+    (см. докстроку `Event`), — значит и закрывать предыдущий должен `repo`, а
+    не каждый вызывающий по-своему. Вызывающих двое: кнопка «начали»
+    (`handlers/track`) и диктовка «уснула» (`handlers/voice`), и две пары голых
+    вызовов `any_open_event` + `close_event` разошлись бы молча — например, в
+    тот день, когда одному из них понадобится `estimated`.
+
+    Порядок внутри существен: закрывать надо ДО создания новой записи.
+    `any_open_event` сортирует по `started_at desc`, поэтому вызов после
+    создания закрыл бы только что открытый таймер, а прежний остался бы висеть
+    — и дождался бы тикера, который пометит его `estimated`. В отчёте для
+    педиатра это выглядит как измеренный многочасовой сон.
+
+    `estimated` не ставим: время закрытия известно, это «сейчас». Пометка
+    означает догадку тикера, и ставить её здесь значило бы врать в обратную
+    сторону.
+    """
+    running = await any_open_event(session, child_id)
+    if running is None:
+        return None
+    return await close_event(session, running, now)
 
 
 async def start_event(
@@ -404,6 +453,29 @@ async def count_events_since(
         )
         or 0
     )
+
+
+async def has_events_since(
+    session: AsyncSession, child_id: int, since: datetime
+) -> bool:
+    """Записывали ли хоть что-нибудь после `since`.
+
+    Своя функция, а не `count_events_since` с полным набором видов: там фильтр
+    по видам обязателен, а здесь его нет намеренно. Вопрос «что было с
+    прошлого раза?» задаётся не про конкретный вид, а про тишину в дневнике:
+    любая запись означает, что семья сейчас пользуется ботом, и спрашивать её
+    незачем.
+
+    Взвешивания при этом не считаются — они в другой таблице, они редкие, и
+    карточка опроса про них не спрашивает. Семья, которая за три часа только
+    взвесила ребёнка, вопрос получит, и это решение, а не недосмотр.
+    """
+    found = await session.scalar(
+        select(Event.id)
+        .where(Event.child_id == child_id, Event.started_at >= since)
+        .limit(1)
+    )
+    return found is not None
 
 
 async def stale_open_events(session: AsyncSession, now: datetime) -> list[Event]:

@@ -60,7 +60,7 @@ async def send_today(
     перестали бы существовать для того, кто пришёл кнопкой.
     """
     if child is None:
-        await message.answer(texts.NO_CHILD)
+        await message.answer(texts.NO_CHILD, reply_markup=keyboards.home())
         return
     await message.answer(
         await _today(session, family, child), reply_markup=keyboards.stats()
@@ -79,7 +79,7 @@ async def week(
     message: Message, session: AsyncSession, family: Family, child: Child | None
 ) -> None:
     if child is None:
-        await message.answer(texts.NO_CHILD)
+        await message.answer(texts.NO_CHILD, reply_markup=keyboards.home())
         return
     await message.answer(
         await _week(session, family, child), reply_markup=keyboards.stats()
@@ -96,12 +96,12 @@ async def chart(
     а подписать надо каждый — иначе непонятно, что на картинке.
     """
     if child is None:
-        await message.answer(texts.NO_CHILD)
+        await message.answer(texts.NO_CHILD, reply_markup=keyboards.home())
         return
 
     sent = await send_charts(message, session, family, child)
     if not sent:
-        await message.answer(texts.CHART_EMPTY)
+        await message.answer(texts.CHART_EMPTY, reply_markup=keyboards.home())
 
 
 async def send_charts(
@@ -173,6 +173,9 @@ async def stage_now(message: Message, child: Child | None) -> None:
     станут ни то, ни другое.
     """
     if child is None:
-        await message.answer(texts.NO_CHILD)
+        await message.answer(texts.NO_CHILD, reply_markup=keyboards.home())
         return
-    await message.answer(stage.report(child, tu.now_utc()) or texts.STAGE_OVER)
+    await message.answer(
+        stage.report(child, tu.now_utc()) or texts.STAGE_OVER,
+        reply_markup=keyboards.home(),
+    )

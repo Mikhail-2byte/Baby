@@ -11,6 +11,7 @@ from datetime import timedelta
 import pytest
 from aiogram.exceptions import TelegramBadRequest
 
+from bot import keyboards
 from bot.db import repo
 from bot.db.models import DIAPER_WET
 from bot.services import panel
@@ -218,3 +219,57 @@ async def test_force_new_issues_a_fresh_panel(
 
     assert len(bot.sent) == 2
     assert bot.edited == []
+
+
+# --- Раскладка --------------------------------------------------------------
+
+
+def test_the_panel_fits_a_phone():
+    """Не больше двух кнопок в ряду — это замер, а не вкус.
+
+    В нижнем ряду стояло четыре, и Telegram на телефоне резал подписи до «Су…»
+    и «во.»: кнопка переставала называть себя ровно там, где на неё жмут не
+    глядя. Три тоже не помещались — «🍼 Бутылочка» не влезала.
+
+    Сторож механический потому, что поломка невидима из кода: в исходнике ряд
+    из четырёх кнопок выглядит ровно так же аккуратно, как ряд из двух.
+    """
+    for running in (None, "sleep"):
+        markup = keyboards.panel(running_kind=running)
+        for row in markup.inline_keyboard:
+            assert len(row) <= 2, [b.text for b in row]
+
+
+def test_the_panel_does_not_duplicate_the_keyboard_below():
+    """Одно действие — одно место.
+
+    «📊 Сутки» и «❓ Вопрос» уехали с панели под поле ввода, где они доступны
+    всегда, а не только когда панель на экране. Вернуть их на панель значило бы
+    отдать одному действию две кнопки — и одну из них семья нажимала бы зря,
+    потому что вторая ближе.
+    """
+    for running in (None, "sleep"):
+        labels = {
+            button.text
+            for row in keyboards.panel(running_kind=running).inline_keyboard
+            for button in row
+        }
+        assert not (labels & keyboards.HOME_LABELS), labels & keyboards.HOME_LABELS
+
+
+def test_an_instant_event_survives_a_running_timer():
+    """Бутылочка и подгузники доступны при идущем таймере, кормление — нет.
+
+    Мгновенное событие таймеру не мешает: `track._add` его не трогает вовсе.
+    Пока «🍼 Бутылочка» стояла в ряду кормлений, её прятало любое включённое
+    сцеживание — то есть кнопка пропадала по причине, не имеющей к ней
+    отношения.
+    """
+    labels = {
+        button.text
+        for row in keyboards.panel(running_kind="pump").inline_keyboard
+        for button in row
+    }
+    assert "🍼 Бутылочка" in labels
+    assert "💧 Мокрый" in labels
+    assert "🤱 Левая" not in labels, "кормление грудью — таймер, ему место уступают"

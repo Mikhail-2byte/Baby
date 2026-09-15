@@ -113,7 +113,10 @@ async def test_every_preset_is_off_until_asked(wired, session, family):
     await _command(dp, bot)
 
     screen = session_bot.sent[-1]
-    assert screen.count("⬜") == len(sch.PRESETS)
+    # Строк на одну больше, чем пресетов: шестая — периодический опрос. Он не
+    # пресет, строки в `reminders` не заводит и живёт колонкой в семье, но
+    # выключен по умолчанию ровно так же, и проверяется тем же счётом
+    assert screen.count("⬜") == len(sch.PRESETS) + 1
     assert "✅" not in screen
     assert await repo.active_reminders(session, family.id) == []
 
@@ -355,4 +358,4 @@ async def test_manual_reminders_do_not_break_the_screen(wired, session, family, 
     await _command(dp, bot)
     screen = session_bot.sent[-1]
     assert "None" not in screen
-    assert screen.count("⬜") + screen.count("✅") == len(sch.PRESETS)
+    assert screen.count("⬜") + screen.count("✅") == len(sch.PRESETS) + 1

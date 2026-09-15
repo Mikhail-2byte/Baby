@@ -13,15 +13,24 @@
 роутера, и экстренный ответ остаётся фиксированным текстом именно потому, что
 порядок роутеров задан так. Проверки красных флагов внутри Q&A нет и не должно
 быть: вторая копия границы безопасности разойдётся с первой молча.
+
+**Голос (этап 7) — исключение, и оно вынужденное.** Фильтр висит на
+`F.text | F.caption`, а у голосового нет ни того, ни другого: подписей к
+голосовым Telegram не даёт. То есть «у неё судороги», сказанное голосом, этот
+роутер не видит вовсе, и никакой порядок роутеров тут не помогает. Поэтому
+решение разнято на две функции — `assess` и `respond`, — и голосовой хендлер
+зовёт их сам, на расшифровке, до обращения к модели. Это не копия границы: код
+один, вызывающих два.
 """
 
 import logging
+from datetime import datetime
 
 from aiogram import F, Router
 from aiogram.filters import BaseFilter, Command
 from aiogram.types import Message
 
-from bot import texts
+from bot import keyboards, texts
 from bot.db.models import Child, Family
 from bot.filters import IN_GROUP
 from bot.services import growth, pending, redflags
@@ -32,37 +41,47 @@ log = logging.getLogger(__name__)
 router = Router(name="alarm")
 
 
-class HasRedFlag(BaseFilter):
-    """Есть ли в сообщении названные словами тревожные признаки.
+def assess(
+    text: str, child: Child | None, now: datetime | None = None
+) -> tuple[list[redflags.Hit], str]:
+    """Признаки, названные словами, и самый тяжёлый их уровень.
 
-    Возвращает `hits` и `level` хендлеру. Возраст берётся из карточки ребёнка:
-    от него зависит самый важный порог во всём боте — 38 °C у младше трёх
-    месяцев. Без карточки возраст неизвестен, и тогда возрастные признаки
+    Возраст СКОРРЕКТИРОВАННЫЙ — тот же, по которому считаются центили и вехи, и
+    тот, что обещан в шапке `redflags.yaml`. Раньше здесь стоял хронологический,
+    и у ребёнка, родившегося на 34-й неделе, окно «младше трёх месяцев»
+    закрывалось на три недели раньше срока: порог 38.0 переставал работать
+    тогда, когда он ещё нужен. Поправка идёт в сторону лишней тревоги, и это
+    единственная допустимая здесь сторона.
+
+    Без карточки ребёнка возраст неизвестен, и тогда возрастные признаки
     срабатывают все: молчать из-за незаполненной анкеты нельзя.
+
+    `now` параметром, а не `tu.now_utc()` внутри: иначе возраст нельзя задать
+    в тесте, и проверка выбора возраста остаётся обещанием в докстроке. Ровно
+    этим она и была — см. `tests/test_growth.py`.
+
+    Уровень — строка, а не `None` при пустом списке: `respond` объявляет его
+    `str`, и `redflags.worst`, возвращающий `None`, делал бы это объявление
+    неправдой (сегодня это проходит только потому, что аргументы подставляет
+    aiogram, минуя проверку типов).
     """
+    if not text or text.startswith("/"):
+        # Команды разбирают свои роутеры. «/today» тревожных слов не содержит,
+        # но проверять каждую команду незачем
+        return [], ""
 
-    async def __call__(self, message: Message, child: Child | None = None) -> dict | bool:
-        text = message.text or message.caption or ""
-        if not text or text.startswith("/"):
-            # Команды разбирают свои роутеры. «/today» тревожных слов не
-            # содержит, но проверять каждую команду незачем
-            return False
-
-        # Возраст СКОРРЕКТИРОВАННЫЙ — тот же, по которому считаются центили и
-        # вехи, и тот, что обещан в шапке `redflags.yaml`. Раньше здесь стоял
-        # хронологический, и у ребёнка, родившегося на 34-й неделе, окно
-        # «младше трёх месяцев» закрывалось на три недели раньше срока: порог
-        # 38.0 переставал работать тогда, когда он ещё нужен. Поправка идёт в
-        # сторону лишней тревоги, и это единственная допустимая здесь сторона
-        age = growth.corrected_age_days(child, tu.now_utc()) if child is not None else None
-        hits = redflags.triage(text, age)
-        if not hits:
-            return False
-        return {"hits": hits, "level": redflags.worst(hits)}
+    age = (
+        growth.corrected_age_days(child, now or tu.now_utc())
+        if child is not None
+        else None
+    )
+    hits = redflags.triage(text, age)
+    return hits, redflags.worst(hits) or ""
 
 
-@router.message(IN_GROUP, F.text | F.caption, HasRedFlag())
-async def alarm(message: Message, hits: list, level: str, family: Family) -> None:
+async def respond(
+    message: Message, hits: list[redflags.Hit], level: str, family: Family
+) -> None:
     """Фиксированный ответ. Ни генерации, ни разбора — только текст из файла."""
     log.warning(
         "Триаж сработал (%s): %s",
@@ -78,11 +97,44 @@ async def alarm(message: Message, hits: list, level: str, family: Family) -> Non
 
     # Отвечаем реплаем на исходное сообщение: в семейном чате в этот момент
     # может идти другая переписка, и ответ обязан быть привязан к тому, что его
-    # вызвало
-    await message.reply(texts.triage_alert(hits, level))
+    # вызвало. На голосовом пути это тем более так — там исходное сообщение
+    # вообще не текст
+    # Клавиатура прикладывается здесь, внутри общей функции, а не у двух
+    # вызывающих. Вызывающих ровно двое — роутер и голосовой хендлер, — и
+    # разнесли их под девизом «код один, вызывающих два»; вторая копия даже
+    # такой мелочи, как разметка, была бы второй копией представления границы
+    # безопасности. Только так носителем становится голосовой канал, где триаж —
+    # единственный текстовый ответ до карточки.
+    #
+    # На сеть и на модель это не влияет никак: разметка — представление, и
+    # `test_triage_makes_no_network_calls` по-прежнему рвёт сокеты
+    await message.reply(texts.triage_alert(hits, level), reply_markup=keyboards.home())
+
+
+class HasRedFlag(BaseFilter):
+    """Есть ли в сообщении названные словами тревожные признаки.
+
+    Возвращает `hits` и `level` хендлеру. Пустой список обязан давать `False`, а
+    не словарь: фильтр, вернувший словарь, считается сошедшимся, и этот роутер
+    забирал бы себе каждое сообщение чата. Тот же механизм, что у ожидания
+    вопроса в `qa.py`, и тот же способ им всё сломать.
+    """
+
+    async def __call__(self, message: Message, child: Child | None = None) -> dict | bool:
+        hits, level = assess(message.text or message.caption or "", child)
+        if not hits:
+            return False
+        return {"hits": hits, "level": level}
+
+
+@router.message(IN_GROUP, F.text | F.caption, HasRedFlag())
+async def alarm(message: Message, hits: list, level: str, family: Family) -> None:
+    await respond(message, hits, level, family)
 
 
 @router.message(IN_GROUP, Command("redflags", "sos"))
 async def show_list(message: Message) -> None:
     """Весь список — чтобы прочитать спокойно, а не встретить впервые в панике."""
-    await message.answer(texts.redflags_list(list(redflags.FLAGS)))
+    await message.answer(
+        texts.redflags_list(list(redflags.FLAGS)), reply_markup=keyboards.home()
+    )

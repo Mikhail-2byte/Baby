@@ -9,9 +9,9 @@ Telegram такой id отвергает, и это не мелочь: в `hand
 
 Поэтому `answerCallbackQuery` замкнут на себя, а всё остальное — sendMessage,
 sendPhoto, sendDocument, editMessageText, pinChatMessage, deleteMessage —
-уходит в настоящий Telegram настоящей группе. Побочная выгода: тексты всплывашек («Пошло время»,
-«Записал», «Таймер уже закрыт») попадают в протокол, тогда как в живом чате их
-не увидел бы никто.
+уходит в настоящий Telegram настоящей группе. Побочная выгода: тексты
+всплывашек («Пошло время», «Записал», «Таймер уже закрыт») попадают в
+протокол, тогда как в живом чате их не увидел бы никто.
 
 Здесь же запоминаются `message_id` всего отправленного: без них тап по кнопке
 отмены пришлось бы адресовать выдуманному сообщению, и `edit_reply_markup`
@@ -34,8 +34,13 @@ from aiogram.types import Message
 
 log = logging.getLogger("stand.session")
 
-# Методы, которые несут файл, а не текст: в протоколе их видно по имени файла
-FILE_METHODS = frozenset({"SendPhoto", "SendDocument", "SendVideo", "SendAudio"})
+# Методы, которые несут файл, а не текст: в протоколе их видно по имени файла.
+# `SendVoice` здесь потому, что им стенд кладёт в чат реплику человека: без
+# записи в этом множестве метод падал бы в «service», и в протоколе шаг с
+# голосовым выглядел бы пустой строкой без имени файла
+FILE_METHODS = frozenset(
+    {"SendPhoto", "SendDocument", "SendVideo", "SendAudio", "SendVoice"}
+)
 
 # Telegram пускает в одну группу около двадцати сообщений в минуту. Живая
 # семья в этот потолок не упирается никогда, а стенд упёрся на двадцать
@@ -153,7 +158,7 @@ class StandSession(AiohttpSession):
             kind = "service"
 
         extra: dict[str, Any] = {}
-        for key in ("photo", "document"):
+        for key in ("photo", "document", "voice"):
             value = payload.get(key)
             filename = getattr(value, "filename", None)
             if filename:

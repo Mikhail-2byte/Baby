@@ -193,3 +193,96 @@ def test_help_mentions_only_what_exists():
     mentioned = set(re.findall(r"(?<!<)/([a-z_]+)", texts.HELP))
     missing = mentioned - _registered_commands()
     assert not missing, f"/help обещает несуществующее: {sorted(missing)}"
+
+
+# --- Описание бота: то, что он рассказывает о себе сам ----------------------
+
+
+def test_the_descriptions_fit_what_telegram_accepts():
+    """Лимиты API: 120 знаков на короткое описание, 512 на длинное.
+
+    Превышение обрезает не проект, а Telegram, — то есть молча и посреди фразы.
+    Запас оставлен намеренно: строка, упирающаяся в лимит ровно, роняет первую
+    же будущую правку.
+    """
+    assert len(texts.SHORT_DESCRIPTION) <= 120
+    assert len(texts.DESCRIPTION) <= 512
+
+
+def test_the_description_mentions_only_what_exists():
+    """Описание — обещание, как меню и /help, и сторожится так же."""
+    import re
+
+    mentioned = set(re.findall(r"(?<!<)/([a-z_]+)", texts.DESCRIPTION))
+    missing = mentioned - _registered_commands()
+    assert not missing, f"описание обещает несуществующее: {sorted(missing)}"
+
+
+def test_the_description_tells_about_the_voice():
+    """Про голос обязано быть сказано, и это не вкусовщина.
+
+    У голоса нет ни команды, ни кнопки — это единственная возможность бота, о
+    которой нельзя догадаться, глядя на экран. Не сказав о ней, бот получает
+    функцию, которой никто не воспользуется: жена узнает о ней только если ей
+    расскажут словами.
+    """
+    for text in (texts.DESCRIPTION, texts.SHORT_DESCRIPTION, texts.HELP):
+        assert "голос" in text.lower()
+
+
+def test_the_description_says_where_the_bot_works():
+    """Описание видно только в личке — а в личке бот отвечает отказом.
+
+    Значит единственный, кто его читает, — человек, открывший личный чат, и
+    ему надо сказать про группу прежде, чем он напишет и получит отказ.
+    """
+    assert "групп" in texts.DESCRIPTION.lower() or "чат" in texts.DESCRIPTION.lower()
+
+
+def test_the_profile_is_published_at_startup():
+    """Описание уезжает в Telegram кодом, а не выставляется руками.
+
+    Выставленное руками у BotFather, оно расходится с тем, что бот умеет, и
+    заметить это можно только открыв BotFather. До этапа 7 оба описания были
+    пусты — именно потому, что публиковать их было некому.
+    """
+    import inspect
+
+    from bot import __main__ as entry
+
+    source = inspect.getsource(entry._publish_profile)
+    assert "set_my_description" in source
+    assert "set_my_short_description" in source
+    assert "set_my_commands" in source
+    # И зовётся из старта, а не просто написано
+    assert "_publish_profile(bot)" in inspect.getsource(entry.main)
+
+
+def test_a_failed_publish_does_not_take_the_others_down():
+    """Три вызова — три `try`. Упавший первый не отменяет остальные.
+
+    Это тот же контракт, что у порядка остановки в `main`: сбой одного шага не
+    должен съедать следующие. Проверяется фактом — с одним общим `try` второй и
+    третий вызовы не состоялись бы вовсе.
+    """
+    import asyncio
+    from types import SimpleNamespace
+
+    from bot import __main__ as entry
+
+    done: list[str] = []
+
+    async def ok(name):
+        done.append(name)
+
+    async def boom(name):
+        done.append(name)
+        raise RuntimeError("Telegram отказал")
+
+    bot = SimpleNamespace(
+        set_my_commands=lambda *a, **k: boom("commands"),
+        set_my_description=lambda **k: ok("description"),
+        set_my_short_description=lambda **k: ok("short"),
+    )
+    asyncio.run(entry._publish_profile(bot))
+    assert done == ["commands", "description", "short"]

@@ -43,6 +43,7 @@ from bot.db.models import (
     SLEEP,
     WEIGHT,
 )
+from bot.services import checkin
 
 # Порядок обязателен: сначала то, что ссылается, потом то, на что ссылаются
 WIPE_ORDER = (
@@ -289,6 +290,90 @@ def stage_weight_loss(
         )
         conn.commit()
         return value
+    finally:
+        conn.close()
+
+
+def stage_checkin(db: Path, family_id: int, hours: int, now: datetime) -> None:
+    """Опрос включён и уже созрел: отметка отодвинута на интервал плюс минуту.
+
+    Приём тот же, что у `stage_digest`: расписание переставляется на «только
+    что прошло». Ни один порог при этом не правится — сдвигаются данные.
+    """
+    stamp = now - timedelta(hours=hours, minutes=1)
+    conn = _conn(db)
+    try:
+        conn.execute(
+            "UPDATE families SET checkin_hours = ?, checkin_last_at = ? WHERE id = ?",
+            (hours, stamp.isoformat(sep=" "), family_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def stage_checkin_silent(db: Path, child_id: int, member_id: int, now: datetime) -> None:
+    """Свежая запись внутри окна — опрос обязан промолчать."""
+    conn = _conn(db)
+    try:
+        conn.execute(
+            "INSERT INTO events (child_id, author_id, kind, started_at, estimated, created_at) "
+            "VALUES (?, ?, ?, ?, 0, ?)",
+            (
+                child_id,
+                member_id,
+                DIAPER_WET,
+                (now - timedelta(minutes=5)).isoformat(sep=" "),
+                now.isoformat(sep=" "),
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+# Зоны на весь круг смещений, от UTC-11 до UTC+14. Список, а не арифметика со
+# смещением: `in_quiet` судит по имени зоны, и подсовывать ей выдуманный сдвиг
+# значило бы проверять не тот код, который работает в бою
+_TIMEZONES = (
+    "Pacific/Midway", "Pacific/Honolulu", "America/Anchorage", "America/Los_Angeles",
+    "America/Denver", "America/Chicago", "America/New_York", "America/Halifax",
+    "America/Sao_Paulo", "Atlantic/South_Georgia", "Atlantic/Azores", "UTC",
+    "Europe/Berlin", "Europe/Kyiv", "Europe/Moscow", "Asia/Dubai", "Asia/Karachi",
+    "Asia/Dhaka", "Asia/Bangkok", "Asia/Shanghai", "Asia/Tokyo",
+    "Australia/Brisbane", "Pacific/Guadalcanal", "Pacific/Auckland",
+    "Pacific/Kiritimati",
+)
+
+
+def stage_checkin_night(db: Path, family_id: int, now: datetime) -> str:
+    """Подменить зону семьи на ту, где сейчас ночь. Возвращает прежнюю.
+
+    Часы боту не подкрутишь, а ночное окно — локальное, поэтому ночь
+    подставляется зоной. Зона именно ВЫЧИСЛЯЕТСЯ через боевую `in_quiet`, а не
+    зашита: правка границ окна в файле не должна делать этот шаг
+    ложнозелёным — при зашитой зоне он остался бы зелёным, проверяя не то.
+
+    Прежнюю зону обязан вернуть вызывающий: от неё зависят ещё и панель, и
+    дайджест, и все локальные времена в сводках.
+    """
+    row = _conn(db).execute("SELECT tz FROM families WHERE id = ?", (family_id,)).fetchone()
+    previous = row[0] if row else "UTC"
+
+    night = next((name for name in _TIMEZONES if checkin.in_quiet(name, now)), None)
+    if night is None:  # окно шире нуля — значит какая-то зона в него попадает
+        raise RuntimeError("Не нашлось зоны, где сейчас ночь по границам файла")
+
+    set_timezone(db, family_id, night)
+    return previous
+
+
+def set_timezone(db: Path, family_id: int, tz: str) -> None:
+    """Сменить зону семьи. Отдельно от `stage_checkin_night` — ею же и возвращают."""
+    conn = _conn(db)
+    try:
+        conn.execute("UPDATE families SET tz = ? WHERE id = ?", (tz, family_id))
+        conn.commit()
     finally:
         conn.close()
 

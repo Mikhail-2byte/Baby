@@ -30,7 +30,18 @@ from typing import Any
 
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
-from aiogram.types import CallbackQuery, Chat, Message, Update, User
+from aiogram.types import (
+    CallbackQuery,
+    Chat,
+    ChatMemberLeft,
+    ChatMemberMember,
+    ChatMemberUpdated,
+    FSInputFile,
+    Message,
+    Update,
+    User,
+    Voice,
+)
 
 from bot import handlers
 from bot.config import settings
@@ -165,7 +176,9 @@ class Stand:
         self._fallback_message_id += 1
         return self._fallback_message_id
 
-    def _incoming(self, text: str, *, private: bool = False) -> Message:
+    def _incoming(
+        self, text: str, *, private: bool = False, voice: Voice | None = None
+    ) -> Message:
         chat = (
             Chat(id=self.user.id, type="private", first_name=self.user.first_name)
             if private
@@ -176,7 +189,12 @@ class Stand:
             date=datetime.now(),
             chat=chat,
             from_user=self.user,
-            text=text,
+            # У голосового текста нет вовсе, и подставленная пустая строка — не
+            # мелочь: `alarm` висит на `F.text | F.caption`, и голосовое с
+            # текстом проверялось бы триажом по тексту. Стенд проверял бы не тот
+            # путь, ради которого затеян
+            text=text or None,
+            voice=voice,
         )
 
     async def _feed(self, body: dict[str, Any]) -> None:
@@ -217,6 +235,76 @@ class Stand:
         if real_id is not None:
             message = message.model_copy(update={"message_id": real_id})
         await self._feed({"message": message})
+
+    async def speak(self, path: Path, *, duration: int | None = None) -> None:
+        """Человек прислал голосовое.
+
+        Файл уходит в чат **по-настоящему**, и `file_id` из ответа Telegram тем
+        же объектом кладётся в поддельный апдейт. Тогда `bot.download` в
+        хендлере скачивает настоящий файл настоящей сетью — а `StandSession`
+        наследует `AiohttpSession` и перехватывает ровно
+        `answerCallbackQuery`, так что для скачивания дописывать нечего.
+
+        Подделать это нельзя по двум причинам сразу. Расшифровке нужен живой
+        `file_id`, а `alarm.respond` отвечает реплаем — реплай на сообщение,
+        которого в чате нет, Telegram отвергает.
+
+        Отправка идёт под `echo_depth`, как в `_echo`: иначе своя же реплика
+        попадёт в протокол сообщением бота, и каждый `expect_silence` на шаге
+        сломается.
+
+        Подписи нет намеренно — см. `_incoming`.
+
+        `duration` подменяет длительность в апдейте, не трогая сам файл: шаг про
+        отказ «запись слишком длинная» иначе требовал бы двухминутной записи,
+        загружаемой ради заведомого отказа. Проверка в хендлере стоит до
+        скачивания, так что подмена честная — она проверяет ровно ту ветку.
+        """
+        self.session.echo_depth += 1
+        try:
+            sent = await self.bot.send_voice(self.chat.id, FSInputFile(path))
+        finally:
+            self.session.echo_depth -= 1
+
+        if sent.voice is None:  # pragma: no cover — Telegram всегда отдаёт объект
+            raise RuntimeError(f"Telegram не вернул voice для {path}")
+        voice = sent.voice
+        if duration is not None:
+            voice = voice.model_copy(update={"duration": duration})
+
+        message = self._incoming("", voice=voice).model_copy(
+            update={"message_id": sent.message_id}
+        )
+        await self._feed({"message": message})
+
+    async def join(self) -> None:
+        """Бота добавили в группу.
+
+        Единственный способ проверить приветствие насквозь, не выгоняя бота из
+        живой группы и не добавляя его руками. Апдейт подделан, но подделан
+        честно: хендлеру приходит ровно тот объект, который пришлёт Telegram, и
+        дальше всё настоящее — `sending.send` отправляет приветствие в чат, а
+        `session.py` записывает, доехала ли с ним клавиатура.
+
+        Чего этот шаг доказать НЕ может: что Telegram вообще **присылает**
+        `my_chat_member`. Это зависит от `allowed_updates`, которые
+        `bot/__main__.py` считает через `dp.resolve_used_update_types()`, а
+        диспетчер стенд собирает и кормит сам. Ту половину закрывает
+        `test_telegram_is_asked_for_my_chat_member`, и по отдельности ни одна из
+        половин не достаточна.
+        """
+        me = await self.bot.me()
+        await self._feed(
+            {
+                "my_chat_member": ChatMemberUpdated(
+                    chat=self.chat,
+                    from_user=self.user,
+                    date=datetime.now(),
+                    old_chat_member=ChatMemberLeft(user=me),
+                    new_chat_member=ChatMemberMember(user=me),
+                )
+            }
+        )
 
     async def tap(self, data: str, *, on: str | int = "panel") -> None:
         """Человек нажал кнопку.
@@ -325,6 +413,7 @@ class StepReport:
         self._expect_absent: list[str] = []
         self._expect_silence = False
         self._expect_kinds: list[str] = []
+        self._expect_keyboard: bool | None = None
 
     def expect(self, *fragments: str) -> None:
         """Подстроки, которые обязаны встретиться в отправленном."""
@@ -338,6 +427,16 @@ class StepReport:
 
     def expect_kind(self, *kinds: str) -> None:
         self._expect_kinds.extend(kinds)
+
+    def expect_keyboard(self, present: bool = True) -> None:
+        """Доехала ли с ответом клавиатура под полем ввода.
+
+        Заведено по факту 15.09: `extra["keyboard"]` в протокол писался, но
+        никем не проверялся — на его месте стояла `r.note`, а `note` ничего не
+        утверждает. Клавиатура не доезжала до боевого чата вовсе, и протокол
+        стенда при этом был зелёным.
+        """
+        self._expect_keyboard = present
 
     def note(self, line: str) -> None:
         self.stand.protocol.write(f"    · {line}")
@@ -381,6 +480,15 @@ class StepReport:
         for fragment in self._expect_absent:
             if fragment in blob:
                 self.stand.protocol.fail(step, f"в отправленном есть лишнее {fragment!r}")
+        if self._expect_keyboard is not None:
+            got = any(r.extra.get("keyboard") for r in self.seen)
+            if got != self._expect_keyboard:
+                self.stand.protocol.fail(
+                    step,
+                    "клавиатура не доехала"
+                    if self._expect_keyboard
+                    else "клавиатура уехала там, где её быть не должно",
+                )
         for kind in self._expect_kinds:
             if not any(r.kind == kind for r in self.seen):
                 self.stand.protocol.fail(
