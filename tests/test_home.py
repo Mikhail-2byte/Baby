@@ -558,3 +558,126 @@ async def test_the_panel_never_carries_the_keyboard(
 
     for kwargs in bot.kwargs + bot.edit_kwargs:
         assert not isinstance(kwargs.get("reply_markup"), ReplyKeyboardMarkup)
+
+
+# --- Кнопка окончания -------------------------------------------------------
+#
+# Живёт в этом файле не по смыслу, а по машинерии: здесь единственная в проекте
+# фикстура с боевым диспетчером и конструктором тапа. Проверять структуру
+# клавиатуры незачем — это делает `tests/test_panel.py`; здесь проверяется, что
+# `track._start` действительно ею пользуется.
+
+
+@pytest.mark.asyncio
+async def test_starting_a_timer_offers_to_finish_it_right_there(wired):
+    """Жалоба из чата: «кнопка завершения где-то сверху в панели».
+
+    Так и было: подтверждение «Сцеживание — начали в 23:40» несло только
+    «↩️ Отменить», а «⏹ Закончить» оставалось в панели выше — да ещё и за
+    служебной строкой о закреплении. То есть в секунду, когда таймер запущен и
+    человек смотрит на последнее сообщение, до остановки надо было прокручивать
+    чат.
+
+    Структурный сторож этого не поймал бы: `keyboards.running` могла бы быть
+    идеальной и не использоваться.
+    """
+    dp, bot, talk, opened = wired
+    from bot.db.models import SLEEP
+    from bot.keyboards import TrackCB
+
+    await _tap(dp, bot, TrackCB(action="start", kind=SLEEP).pack())
+
+    assert talk.markups, "бот не подтвердил начало"
+    labels = [
+        button.text
+        for markup in talk.markups
+        if markup is not None and hasattr(markup, "inline_keyboard")
+        for row in markup.inline_keyboard
+        for button in row
+    ]
+    assert "⏹ Закончить" in labels, labels
+    assert "↩️ Отменить" in labels, labels
+
+
+# --- Случайный тап ----------------------------------------------------------
+#
+# Вопрос из чата: «некоторые действия могут быть нажаты по случайности, что
+# тогда делать?». Проверка показала две дыры, и обе про одно: закрытие таймера
+# было необратимым. Под ответом об окончании стояла кнопка «↩️ Отменить», и она
+# удаляла запись целиком — то есть промах по окончанию сна лечился потерей
+# всего сна. А «начали» поверх идущего таймера закрывало предыдущий молча.
+
+
+@pytest.mark.asyncio
+async def test_a_misfired_finish_can_be_taken_back(wired, session, child):
+    """«Не заканчивать» возвращает таймеру ход, а запись оставляет целой.
+
+    Главное здесь — что это НЕ удаление: `ended_at` снова пуст, а событие на
+    месте. Прежняя кнопка отмены стирала его, и сон переставал существовать.
+    """
+    from bot.db import repo
+    from bot.db.models import SLEEP
+    from bot.keyboards import TrackCB, UndoCB
+
+    dp, bot, talk, opened = wired
+    await _tap(dp, bot, TrackCB(action="start", kind=SLEEP).pack())
+    started = await repo.any_open_event(session, child.id)
+    assert started is not None
+
+    await _tap(dp, bot, TrackCB(action="stop", kind=SLEEP).pack())
+    assert await repo.any_open_event(session, child.id) is None
+
+    await _tap(dp, bot, UndoCB(what="reopen", row_id=started.id).pack())
+
+    again = await repo.any_open_event(session, child.id)
+    assert again is not None, "таймер обязан снова идти"
+    assert again.id == started.id, "это та же запись, а не новая"
+    assert again.estimated is False
+
+
+@pytest.mark.asyncio
+async def test_reopening_never_cuts_off_another_timer(wired, session, child):
+    """Инвариант «ровно один открытый таймер» сильнее удобства.
+
+    Человек просил вернуть один таймер, а не оборвать другой. Молча закрыть
+    идущий ради этого — значит починить промах вторым промахом.
+    """
+    from bot.db import repo
+    from bot.db.models import PUMP, SLEEP
+    from bot.keyboards import TrackCB, UndoCB
+
+    dp, bot, talk, opened = wired
+    await _tap(dp, bot, TrackCB(action="start", kind=SLEEP).pack())
+    sleep_event = await repo.any_open_event(session, child.id)
+    await _tap(dp, bot, TrackCB(action="stop", kind=SLEEP).pack())
+    await _tap(dp, bot, TrackCB(action="start", kind=PUMP).pack())
+
+    await _tap(dp, bot, UndoCB(what="reopen", row_id=sleep_event.id).pack())
+
+    assert texts.ANOTHER_TIMER_RUNS in talk.sent
+    running = await repo.any_open_event(session, child.id)
+    assert running.kind == PUMP, "чужой таймер обязан остаться идти"
+    await session.refresh(sleep_event)
+    assert sleep_event.ended_at is not None, "закрытый так и остался закрытым"
+
+
+@pytest.mark.asyncio
+async def test_starting_over_a_running_timer_says_so(wired, session, child):
+    """Закрытие предыдущего больше не молчит.
+
+    Молчало по причине, которая сломалась вместе с интерфейсом: «панель
+    меняется под пальцем, закрытие видно сразу». С клавиатурой под полем ввода
+    панель чаще всего выше по чату, и человек узнавал о закрытии только из
+    статистики — то есть никогда.
+    """
+    from bot.db.models import PUMP, SLEEP
+    from bot.keyboards import TrackCB
+
+    dp, bot, talk, opened = wired
+    await _tap(dp, bot, TrackCB(action="start", kind=SLEEP).pack())
+    before = len(talk.sent)
+
+    await _tap(dp, bot, TrackCB(action="start", kind=PUMP).pack())
+
+    said = " ".join(talk.sent[before:])
+    assert "Закрыл предыдущее" in said, talk.sent[before:]

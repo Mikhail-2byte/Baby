@@ -273,3 +273,41 @@ def test_an_instant_event_survives_a_running_timer():
     assert "🍼 Бутылочка" in labels
     assert "💧 Мокрый" in labels
     assert "🤱 Левая" not in labels, "кормление грудью — таймер, ему место уступают"
+
+
+def test_the_panel_keeps_its_own_finish_button():
+    """Панель кнопку остановки не отдала — она главный экран.
+
+    «Закончить» появилось под подтверждением начала, но не вместо панели:
+    человек, вернувшийся к чату через час, ищет её именно там.
+    """
+    labels = {
+        button.text
+        for row in keyboards.panel(running_kind="sleep").inline_keyboard
+        for button in row
+    }
+    assert "⏹ Закончить" in labels
+
+
+def test_the_start_confirmation_can_finish_and_undo():
+    """Под сообщением о начале — обе кнопки, и обе рабочие.
+
+    Отмена нужна от промаха, окончание — от того, ради чего таймер заведён.
+    Одна вместо другой не годится: промахнуться и закончить — разные события,
+    и второе оставляет запись, а первое нет.
+    """
+    from bot.keyboards import TrackCB, UndoCB
+
+    row = keyboards.running("sleep", row_id=7).inline_keyboard[0]
+    assert [b.text for b in row] == ["⏹ Закончить", "↩️ Отменить"]
+
+    stop = TrackCB.unpack(row[0].callback_data)
+    assert (stop.action, stop.kind) == ("stop", "sleep")
+    undo = UndoCB.unpack(row[1].callback_data)
+    assert (undo.what, undo.row_id) == ("event", 7)
+
+
+def test_a_voice_card_offers_only_finishing():
+    """У карточки голосового отменять нечего: записей под ней может быть много."""
+    row = keyboards.running("pump").inline_keyboard[0]
+    assert [b.text for b in row] == ["⏹ Закончить"]

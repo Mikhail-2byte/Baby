@@ -386,7 +386,7 @@ async def _still_running(
         source_message_id=_last_id(call),
     )
     if closed is not None:
-        await _say(call, texts.voice_closed(closed, family.tz))
+        await _say(call, texts.closed_previous(closed, family.tz))
     await _written(call, bot, family, event)
 
 

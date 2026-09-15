@@ -252,7 +252,14 @@ async def tap(
     # Раньше перерисовки карточки: записи уже в базе, и сбой рендера не должен
     # оставить панель без них
     panel.schedule(bot, family.id, call.message.message_id)
-    await call.message.edit_text(texts.voice_saved(lines))
+    # Голосом тоже можно открыть таймер («начала кормить»), и тогда карточка —
+    # последнее, на что человек смотрит. Кнопка отмены здесь не нужна: записей
+    # под карточкой может быть несколько, а отменять их поштучно нечем
+    running = await repo.any_open_event(session, child.id)
+    await call.message.edit_text(
+        texts.voice_saved(lines),
+        reply_markup=keyboards.running(running.kind) if running else None,
+    )
 
 
 async def _save(
@@ -279,7 +286,7 @@ async def _save(
             # Тот же случай, что кнопка «начали»: сперва закрываем идущий
             closed = await repo.close_running(session, child.id, started_at)
             if closed is not None:
-                lines.append(texts.voice_closed(closed, family.tz))
+                lines.append(texts.closed_previous(closed, family.tz))
             event = await repo.start_event(
                 session,
                 child.id,

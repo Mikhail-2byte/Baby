@@ -112,10 +112,13 @@ async def _start(
     # предыдущее») в три часа ночи означает, что человек нажмёт ещё раз,
     # не поймёт, почему ничего не происходит, и бросит запись вовсе.
     #
-    # Молча — потому что панель меняется под пальцем и закрытие видно сразу.
-    # На голосовом пути это не так (перерисовка отложена дебаунсом), и там о
-    # закрытии говорится вслух
-    await repo.close_running(session, child.id, now)
+    # И говорим об этом вслух. Раньше кнопка закрывала молча, и в докстроке
+    # стояло почему: «панель меняется под пальцем, закрытие видно сразу». Довод
+    # сломался вместе с интерфейсом — с клавиатурой под полем ввода панель чаще
+    # всего выше по чату. Молчание превратилось в тихую потерю: промахнувшись по
+    # «начали» при идущем таймере, человек получал закрытый «сейчас» предыдущий
+    # и отменить мог только новый
+    closed = await repo.close_running(session, child.id, now)
 
     event = await repo.start_event(
         session,
@@ -128,7 +131,14 @@ async def _start(
         source_message_id=_last_id(call),
     )
     await call.answer("Пошло время")
-    await _say(call, texts.started(event, family.tz), keyboards.undo("event", event.id))
+    if closed is not None:
+        await _say(call, texts.closed_previous(closed, family.tz))
+    # «Закончить» рядом с «Отменить», а не только в панели: в эту секунду
+    # человек смотрит на подтверждение, а панель уже выше по чату. И оно идёт
+    # последним, чтобы кнопка окончания осталась под рукой
+    await _say(
+        call, texts.started(event, family.tz), keyboards.running(data.kind, row_id=event.id)
+    )
 
 
 async def _stop(
@@ -150,7 +160,7 @@ async def _stop(
     await repo.close_event(session, running, now)
     await call.answer("Записал")
     await _say(
-        call, texts.finished(running, family.tz), keyboards.undo("event", running.id)
+        call, texts.finished(running, family.tz), keyboards.stopped(running.id)
     )
 
     if running.kind == PUMP:
@@ -201,11 +211,20 @@ async def undo(
     bot: Bot,
     family: Family,
 ) -> None:
-    """Удалить только что записанное.
+    """Отменить только что сделанное: удалить запись или вернуть таймеру ход.
 
     Ограничения по времени нет намеренно: кнопка живёт под своим сообщением, и
     нажать её можно только у той записи, о которой бот отчитался.
+
+    `reopen` — отдельная ветка, а не частный случай удаления, и разница тут не
+    косметическая. Промах по «Закончить» означает «сон продолжается», а не
+    «сна не было»; до этой ветки под ответом об окончании стояла одна кнопка
+    отмены, и она стирала весь сон целиком — то есть лечила промах потерей.
     """
+    if callback_data.what == "reopen":
+        await _reopen(call, callback_data.row_id, session, bot, family)
+        return
+
     if callback_data.what == "event":
         event = await repo.get_event(session, callback_data.row_id)
         found = event is not None
@@ -225,6 +244,37 @@ async def undo(
     await call.answer(texts.UNDONE)
     if isinstance(call.message, Message):
         # Убираем кнопку, чтобы второй тап не спрашивал про уже удалённое
+        await call.message.edit_reply_markup(reply_markup=None)
+    panel.schedule(bot, family.id, _last_id(call))
+
+
+async def _reopen(
+    call: CallbackQuery,
+    row_id: int,
+    session: AsyncSession,
+    bot: Bot,
+    family: Family,
+) -> None:
+    """Вернуть ход закрытому таймеру.
+
+    Инвариант «ровно один открытый таймер» проверяется здесь, а не в `repo`:
+    молча закрыть чужой таймер ради этого нельзя — человек просил вернуть один,
+    а не оборвать другой. Случай редкий, но достижимый: закончили сон, начали
+    кормление, спохватились про сон.
+    """
+    event = await repo.get_event(session, row_id)
+    if event is None or event.ended_at is None:
+        # Запись уже удалили или таймер уже вернули — второй тап по той же кнопке
+        await call.answer(texts.NOTHING_TO_UNDO, show_alert=True)
+        return
+
+    if await repo.any_open_event(session, event.child_id) is not None:
+        await call.answer(texts.ANOTHER_TIMER_RUNS, show_alert=True)
+        return
+
+    await repo.reopen_event(session, event)
+    await call.answer(texts.REOPENED)
+    if isinstance(call.message, Message):
         await call.message.edit_reply_markup(reply_markup=None)
     panel.schedule(bot, family.id, _last_id(call))
 
