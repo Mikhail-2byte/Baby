@@ -134,6 +134,26 @@ def _minutes_ago(moment: datetime) -> float:
     return (tu.now_utc() - moment).total_seconds() / 60
 
 
+def _daytime(now: datetime, tz: str) -> datetime:
+    """Тот же момент, но заведомо вне ночного окна семьи.
+
+    Опрос не приходит в тишину, а прогон тестов случается в любой час. Пять
+    тестов этого файла были красными каждую ночь с 23:00 до 07:00 по Москве и
+    зелёными днём — 16.09 они и покраснели, в 06:15 московского времени.
+
+    Хуже второе, и оно не видно вовсе: тесты, ждущие МОЛЧАНИЯ, в те же часы
+    зеленели по неверной причине — из-за ночи, а не из-за проверяемого
+    условия. Поэтому сдвиг ставится и им, а не только красневшим.
+
+    Сдвигается момент, а не подменяются часы: `now` здесь и так задаёт тест.
+    Граница берётся из файла через боевую `in_quiet`, а не зашивается — правка
+    `checkin_ru.yaml` не должна делать эти тесты ложнозелёными.
+    """
+    while checkin.in_quiet(tz, now):
+        now += timedelta(hours=1)
+    return now
+
+
 # --- Созревание -------------------------------------------------------------
 
 
@@ -221,7 +241,7 @@ async def test_the_checkin_says_nothing_when_there_are_records(
     Без этой проверки бот спрашивал бы «что было с прошлого раза?» сразу после
     тапа по панели, то есть ровно у тех, кто и так всё записывает.
     """
-    now = tu.now_utc()
+    now = _daytime(tu.now_utc(), family.tz)
     family.checkin_hours = 3
     family.checkin_last_at = now - timedelta(hours=3)
     await repo.add_event(
@@ -242,7 +262,7 @@ async def test_a_silent_checkin_leaves_the_clock_alone(
     Двинутая отметка отложила бы следующий вопрос на два интервала вместо
     одного, и заметить это можно было бы только сверкой часов с логом.
     """
-    now = tu.now_utc()
+    now = _daytime(tu.now_utc(), family.tz)
     stamp = now - timedelta(hours=3)
     family.checkin_hours = 3
     family.checkin_last_at = stamp
@@ -265,7 +285,7 @@ async def test_the_window_is_sliding_not_since_the_last_question(
     пусто — значит спрашиваем. Окно «с прошлого вопроса» захватило бы то
     кормление и промолчало бы, хотя последние три часа в дневнике тишина.
     """
-    now = tu.now_utc()
+    now = _daytime(tu.now_utc(), family.tz)
     family.checkin_hours = 3
     family.checkin_last_at = now - timedelta(hours=9)
     await repo.add_event(
@@ -285,7 +305,7 @@ async def test_a_missed_checkin_is_never_caught_up(session, family, child, bot):
     те догоняются, и сводка «пропустил 7 напоминаний: • Что было с прошлого
     раза?» была бы бессмыслицей.
     """
-    now = tu.now_utc()
+    now = _daytime(tu.now_utc(), family.tz)
     family.checkin_hours = 3
     family.checkin_last_at = now - timedelta(hours=20)
 
@@ -298,7 +318,7 @@ async def test_a_missed_checkin_is_never_caught_up(session, family, child, bot):
 @pytest.mark.asyncio
 async def test_the_card_comes_with_buttons(session, family, child, bot):
     """Вопрос без кнопок — это не опрос, а укор."""
-    now = tu.now_utc()
+    now = _daytime(tu.now_utc(), family.tz)
     family.checkin_hours = 3
     family.checkin_last_at = now - timedelta(hours=4)
 
@@ -317,7 +337,7 @@ async def test_the_stamp_is_not_set_when_telegram_says_retry(
     session, family, child, bot, monkeypatch
 ):
     """Сеть подвела — вопрос обязан прийти следующим тиком, а не пропасть."""
-    now = tu.now_utc()
+    now = _daytime(tu.now_utc(), family.tz)
     stamp = now - timedelta(hours=4)
     family.checkin_hours = 3
     family.checkin_last_at = stamp
@@ -340,7 +360,7 @@ async def test_a_broken_card_is_not_resent_every_tick(
     Без отметки битая карточка лезла бы в Telegram каждую минуту до полуночи —
     та же доктрина, что у напоминаний в `ticker._handle`.
     """
-    now = tu.now_utc()
+    now = _daytime(tu.now_utc(), family.tz)
     family.checkin_hours = 3
     family.checkin_last_at = now - timedelta(hours=4)
 
@@ -356,7 +376,7 @@ async def test_a_broken_card_is_not_resent_every_tick(
 @pytest.mark.asyncio
 async def test_a_family_without_a_child_gets_no_question(session, family, bot):
     """Спрашивать «что было с ребёнком» не о ком — и в Telegram не ходим вовсе."""
-    now = tu.now_utc()
+    now = _daytime(tu.now_utc(), family.tz)
     family.checkin_hours = 3
     family.checkin_last_at = now - timedelta(hours=4)
 
@@ -370,7 +390,7 @@ async def test_one_broken_family_does_not_stop_the_others(
     session, family, child, bot, monkeypatch
 ):
     """Контракт проекта: сбой одной семьи не срывает обход остальных."""
-    now = tu.now_utc()
+    now = _daytime(tu.now_utc(), family.tz)
     family.checkin_hours = 3
     family.checkin_last_at = now - timedelta(hours=4)
 
@@ -389,7 +409,7 @@ async def test_the_ticker_actually_runs_the_checkin(session, family, child, bot)
     путь один и он обязательный, поэтому и проверяется целиком — через
     `tick_once`, а не через `send_pending`.
     """
-    now = tu.now_utc()
+    now = _daytime(tu.now_utc(), family.tz)
     family.checkin_hours = 3
     family.checkin_last_at = now - timedelta(hours=4)
     # Дайджест в этот же тик не нужен: он про другое и отправил бы два графика
@@ -755,7 +775,7 @@ async def test_turning_the_checkin_on_does_not_ask_within_a_minute(
     await _tap(dp, wired_bot, "on", hours=3, update_id=67)
 
     assert family.checkin_last_at is not None
-    assert checkin.due(family, tu.now_utc()) is False
+    assert checkin.due(family, _daytime(tu.now_utc(), family.tz)) is False
 
 
 @pytest.mark.asyncio

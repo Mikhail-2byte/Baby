@@ -47,6 +47,18 @@ async def get_or_create_family(
     return family
 
 
+async def family_by_chat(session: AsyncSession, chat_id: int) -> Family | None:
+    """Найти семью, НЕ заводя её. Отдельно от `get_or_create_family`.
+
+    Нужна там, где заводить нельзя: у апдейта, который никто не обработает,
+    семьи быть не должно, но уже заведённую надо отдать хендлеру как обычно.
+    Разница выражена именами, а не флагом `create=False`: флаг читается на месте
+    вызова как «наверное, заведёт», и один такой вызов уже стоил лишней семьи в
+    боевой базе.
+    """
+    return await session.scalar(select(Family).where(Family.chat_id == chat_id))
+
+
 async def get_family_by_id(session: AsyncSession, family_id: int) -> Family | None:
     return await session.get(Family, family_id)
 

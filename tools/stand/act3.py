@@ -37,6 +37,12 @@ async def run(stand: Stand) -> None:
     await stand.mark("Стенд: акт 3, доводка")
 
     async with stand.step("47б", "тревога по данным: потеря веса") as r:
+        # Отметка снимается, иначе шаг невозможен в тот же день: тревога
+        # поднимается раз в сутки, а акт 2 её сегодня уже поднял. Доводка,
+        # которая краснеет именно тогда, когда второй акт отработал верно, —
+        # это не доводка, а приученное «на красное не смотрим»
+        cleared = seed.clear_alert(db, child_id, "weight_loss")
+        r.note(f"снято суточных отметок weight_loss: {cleared}")
         value = seed.stage_weight_loss(db, child_id, member_id, now, birth_weight)
         percent = (birth_weight - value) / birth_weight * 100
         r.note(f"взвешивание {value} г при {birth_weight} г — потеря {percent:.1f}%")
@@ -51,7 +57,10 @@ async def run(stand: Stand) -> None:
 
     async with stand.step("47в", "она же на следующем тике — молчит") as r:
         await stand.settle(TICK_WAIT)
-        r.expect_silence()
+        # Не `expect_silence`: шаг судит о тревоге, значит и спрашивать обязан
+        # про неё. Слепая тишина краснеет на перерисовке панели и на соседнем
+        # стороже, то есть на исправном боте
+        r.expect_absent("ниже веса при рождении")
         r.show("alerts", "SELECT flag_id, raised_on FROM alerts")
 
     await stand.mark("Акт 3 закончен")

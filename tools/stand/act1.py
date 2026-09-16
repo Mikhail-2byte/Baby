@@ -171,17 +171,75 @@ async def run(stand: Stand) -> None:
         await stand.settle(1.0)
         await stand.tap(TrackCB(action="start", kind=FEED_BREAST, side="R").pack())
         r.expect("Пошло время")
+        r.expect("Закрыл предыдущее")
         r.show(
             "два последних",
             "SELECT id, side, ended_at FROM events ORDER BY id DESC LIMIT 2",
         )
         r.note("Ждём: предыдущий закрыт, новый открыт, ругани нет")
+        r.note("«Пошло время» одного мало: эта всплывашка была и когда бот молчал")
 
     async with stand.step("9", "двойной «Закончить»") as r:
         await stand.tap(TrackCB(action="stop", kind=FEED_BREAST).pack())
         await stand.settle(1.0)
         await stand.tap(TrackCB(action="stop", kind=FEED_BREAST).pack())
         r.expect("Таймер уже закрыт")
+
+    async with stand.step("9б", "случайное «Закончить» обратимо") as r:
+        # Ради этого шага правка и делалась: до неё под ответом об окончании
+        # стояла одна кнопка отмены, и она удаляла запись целиком — промах по
+        # окончанию сна лечился потерей всего сна.
+        #
+        # Вердикт выносится ПО БАЗЕ, а не по протоколу, и это не перестраховка.
+        # Inline-разметку протокол не пишет вовсе, так что «кнопка есть» им не
+        # доказать; а `tap(on="last")` адресует вслепую — соседний акт уже
+        # получил ложно-зелёный шаг ровно на этом. Если тап уедет не туда,
+        # `ended_at` не обнулится и шаг покраснеет.
+        await stand.tap(TrackCB(action="start", kind=SLEEP).pack())
+        await stand.settle(1.5)
+        doomed = _last_event_id(stand)
+        await stand.tap(TrackCB(action="stop", kind=SLEEP).pack())
+        await stand.settle(1.5)
+        closed = stand.one(
+            "SELECT ended_at FROM events WHERE id = ?", (doomed,)
+        )
+        r.note(f"закрыт: {closed}")
+        await stand.tap(UndoCB(what="reopen", row_id=doomed).pack(), on="last")
+        await stand.settle(1.5)
+        r.expect("снова идёт")
+        r.show(
+            "тот же сон",
+            "SELECT id, kind, ended_at, estimated FROM events WHERE id = ?",
+            (doomed,),
+        )
+        again = stand.one(
+            "SELECT ended_at FROM events WHERE id = ?", (doomed,)
+        )
+        if again is None:
+            stand.protocol.fail("шаг 9б", "запись исчезла — это удаление, а не возврат")
+        elif again[0] is not None:
+            stand.protocol.fail("шаг 9б", "таймер не вернулся: ended_at на месте")
+        r.note("Та же запись, не новая: id совпадает с закрытым")
+
+    async with stand.step("9в", "вернуть ход нельзя поверх чужого таймера") as r:
+        # Инвариант «ровно один открытый таймер» сильнее удобства: человек
+        # просил вернуть один, а не оборвать другой
+        await stand.tap(TrackCB(action="stop", kind=SLEEP).pack())
+        await stand.settle(1.5)
+        sleep_id = _last_event_id(stand)
+        await stand.tap(TrackCB(action="start", kind=PUMP).pack())
+        await stand.settle(1.5)
+        await stand.tap(UndoCB(what="reopen", row_id=sleep_id).pack(), on="panel")
+        r.expect("идёт другой таймер")
+        r.show(
+            "оба",
+            "SELECT id, kind, ended_at FROM events ORDER BY id DESC LIMIT 2",
+        )
+        r.note("Ждём: сцеживание идёт, сон так и остался закрытым")
+
+    async with stand.step("9г", "убираем сцеживание, чтобы не мешало дальше") as r:
+        await stand.tap(TrackCB(action="stop", kind=PUMP).pack())
+        r.expect("Записал")
 
     async with stand.step("10", "сон: начали и закончили") as r:
         await stand.tap(TrackCB(action="start", kind=SLEEP).pack())
@@ -296,7 +354,7 @@ async def run(stand: Stand) -> None:
         r.note(f"панель {before} -> {after}")
         if before == after:
             stand.protocol.fail("шаг 20а", "панель не выпущена заново")
-        r.note("Шаг красный на «не было delete» — у бота нет права удалять")
+        r.note("Если шаг красный на delete — значит у бота нет права удалять")
 
     async with stand.step("20а2", "обычный ответ несёт клавиатуру") as r:
         # Шаг, которого не хватило 15.09. Не /help, не мастер — рядовой ответ

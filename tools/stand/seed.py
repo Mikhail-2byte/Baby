@@ -45,13 +45,20 @@ from bot.db.models import (
 )
 from bot.services import checkin
 
-# Порядок обязателен: сначала то, что ссылается, потом то, на что ссылаются
+# Порядок обязателен: сначала то, что ссылается, потом то, на что ссылаются.
+#
+# `reminders` стоит выше `children` не для красоты: у строки календаря есть
+# `child_id`, и снимок боевой базы, где семья подписана на прививки, чистился
+# бы до первого `DELETE FROM children` и падал на нём с `FOREIGN KEY
+# constraint failed`. Год порядок был неверным и молчал — пока в боевых
+# `reminders` не появилось ни одной строки с ребёнком. Сторож —
+# `tests/test_stand_seed.py`.
 WIPE_ORDER = (
     "alerts",
     "events",
     "measurements",
-    "children",
     "reminders",
+    "children",
     "members",
     "families",
 )
@@ -232,13 +239,21 @@ def stage_stale_timer(db: Path, child_id: int, member_id: int, now: datetime) ->
 
 
 def stage_digest(db: Path, family_id: int, local_now: datetime) -> None:
-    """Дайджест на сегодня и на уже прошедшее время; отметка снята."""
+    """Дайджест на сегодня и на уже прошедшее время; отметка снята.
+
+    Время ставится полуночью, а не «сейчас минус пять минут». Разница видна
+    один час в сутки и ровно в него всё и ломается: в 00:04 «минус пять минут»
+    даёт 23:59, `digest.due` сверяет `local_time >= digest_time` — и дайджест,
+    объявленный сегодняшним, не наступает до вечера. Акт при этом краснеет на
+    боте, который ведёт себя правильно. Полночь прошла к любому часу, когда
+    шаг может выполниться.
+    """
     conn = _conn(db)
     try:
         conn.execute(
-            "UPDATE families SET digest_dow = ?, digest_time = ?, last_digest_on = NULL "
-            "WHERE id = ?",
-            (local_now.weekday(), (local_now - timedelta(minutes=5)).strftime("%H:%M"), family_id),
+            "UPDATE families SET digest_dow = ?, digest_time = '00:00', "
+            "last_digest_on = NULL WHERE id = ?",
+            (local_now.weekday(), family_id),
         )
         conn.commit()
     finally:
@@ -312,6 +327,56 @@ def stage_checkin(db: Path, family_id: int, hours: int, now: datetime) -> None:
         conn.close()
 
 
+def stage_empty_window(db: Path, child_id: int, now: datetime, hours: int) -> int:
+    """Отодвинуть все записи за пределы окна опроса. Возвращает, сколько сдвинуто.
+
+    Опрос молчит, если в скользящее окно попала хоть одна запись. К пятьдесят
+    второму шагу их там десятки: акт 1 целиком состоит из записей, а окно —
+    последние три часа. Без этого шаг «опрос созрел и пришёл карточкой»
+    проверял бы ровно то же, что шаг 55, — молчание при непустом окне, — но под
+    чужим заголовком и с обратным ожиданием.
+
+    Записи сдвигаются, а не удаляются: удаление поменяло бы сводки, на которые
+    смотрят соседние шаги. Сдвиг данных — тот же приём, которым здесь ускорено
+    всё остальное.
+    """
+    edge = (now - timedelta(hours=hours)).isoformat(sep=" ")
+    shift = f"-{hours + 1} hours"
+    conn = _conn(db)
+    try:
+        cursor = conn.execute(
+            "UPDATE events SET started_at = datetime(started_at, ?), "
+            "ended_at = CASE WHEN ended_at IS NULL THEN NULL "
+            "ELSE datetime(ended_at, ?) END "
+            "WHERE child_id = ? AND started_at >= ?",
+            (shift, shift, child_id, edge),
+        )
+        conn.commit()
+        return cursor.rowcount
+    finally:
+        conn.close()
+
+
+def clear_alert(db: Path, child_id: int, flag_id: str) -> int:
+    """Снять суточную отметку тревоги. Возвращает, сколько снято.
+
+    Тревога по данным поднимается раз в сутки, и отметка лежит в `alerts` —
+    без неё семья получала бы одно и то же сообщение каждую минуту. Отсюда
+    следствие для стенда: шаг, проверяющий тревогу, невозможно переиграть в тот
+    же день. Акт 3 — это и есть переигровка второго акта, то есть он краснел бы
+    ровно тогда, когда акт 2 отработал правильно.
+    """
+    conn = _conn(db)
+    try:
+        cursor = conn.execute(
+            "DELETE FROM alerts WHERE child_id = ? AND flag_id = ?", (child_id, flag_id)
+        )
+        conn.commit()
+        return cursor.rowcount
+    finally:
+        conn.close()
+
+
 def stage_checkin_silent(db: Path, child_id: int, member_id: int, now: datetime) -> None:
     """Свежая запись внутри окна — опрос обязан промолчать."""
     conn = _conn(db)
@@ -365,6 +430,32 @@ def stage_checkin_night(db: Path, family_id: int, now: datetime) -> str:
         raise RuntimeError("Не нашлось зоны, где сейчас ночь по границам файла")
 
     set_timezone(db, family_id, night)
+    return previous
+
+
+def stage_checkin_day(db: Path, family_id: int, now: datetime) -> str:
+    """Подменить зону семьи на ту, где сейчас НЕ ночь. Возвращает прежнюю.
+
+    Зеркало `stage_checkin_night`, и заведено оно по факту: 16.09 акт пошёл в
+    00:10 по Екатеринбургу, то есть внутри ночного окна 23:00-07:00. Опрос не
+    пришёл — бот вёл себя ровно так, как написано, — а шаги 52-56 объявили это
+    расхождением и проверили не то, что у них в заголовке. Прогон случается в
+    любой час, и ни один шаг не вправе этого не знать.
+
+    Зона так же ВЫЧИСЛЯЕТСЯ боевой `in_quiet`, а не зашивается: правка границ
+    окна в `checkin_ru.yaml` не должна делать шаг ложнозелёным.
+
+    Прежнюю зону обязан вернуть вызывающий — от неё зависят панель, дайджест и
+    все локальные времена в сводках.
+    """
+    row = _conn(db).execute("SELECT tz FROM families WHERE id = ?", (family_id,)).fetchone()
+    previous = row[0] if row else "UTC"
+
+    day = next((name for name in _TIMEZONES if not checkin.in_quiet(name, now)), None)
+    if day is None:  # окно уже суток — значит какая-то зона в него не попадает
+        raise RuntimeError("Не нашлось зоны, где сейчас день по границам файла")
+
+    set_timezone(db, family_id, day)
     return previous
 
 

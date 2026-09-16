@@ -113,6 +113,19 @@ class FamilyMiddleware(BaseMiddleware):
     `child` может быть `None` — пока карточку не завели. Хендлеры, которым он
     обязателен, проверяют это сами и отвечают `texts.NO_CHILD`: заворачивать
     апдейт здесь значило бы, что `/baby` тоже не сработает.
+
+    **Собственное эхо бота семью не заводит.** Апдейт, автор которого — сам
+    бот, приходит ровно один: служебное сообщение Telegram о закреплении, за
+    которым стоит наша же `panel._pin`. Обработчика у него нет ни одного, а
+    авторегистрация всё равно срабатывала — и это не теория. Стенд работает тем
+    же токеном в отдельной группе; на каждом прогоне он закреплял панель, и
+    боевой бот заводил у себя семью «Testy» по чужому чату. Дальше сторож
+    `is_production_chat`, написанный ровно против прогона по боевой группе,
+    спотыкался о собственную грязь и отказывал следующему акту.
+
+    Заведённую семью при этом отдаём как обычно: у настоящей семьи панель
+    закрепляется на каждом перевыпуске, и потерять `family` на этом апдейте
+    значило бы уронить резолв аргументов у любого будущего хендлера.
     """
 
     async def __call__(
@@ -134,19 +147,33 @@ class FamilyMiddleware(BaseMiddleware):
                 # Чат уехал в супергруппу — под старым chat_id семью не заводим
                 return None
 
-            family = await repo.get_or_create_family(session, chat.id, chat.title)
+            # Отсекаем себя, а не «любого бота»: сообщение от анонимного админа
+            # приходит от `GroupAnonymousBot` с `is_bot=True`, и проверка по
+            # этому флагу решила бы иначе. Считается один раз и используется
+            # дважды — для заведения семьи и для ключа `member`
+            bot: Bot | None = data.get("bot")
+            me = await bot.me() if bot is not None else None
+            ours = user is not None and me is not None and user.id == me.id
+
+            family = (
+                await repo.family_by_chat(session, chat.id)
+                if ours
+                else await repo.get_or_create_family(session, chat.id, chat.title)
+            )
+            if family is None:
+                # Наше эхо в чате, где семьи нет и заводить её не на чем.
+                # `family` в `data` не кладём вовсе: хендлер, которому она
+                # нужна, до такого апдейта не доберётся — у служебного
+                # сообщения нет ни текста, ни подписи, ни голоса
+                return await handler(event, data)
+
             data["family"] = family
             data["child"] = await repo.active_child(session, family.id)
 
-            # Отсекаем себя, а не «любого бота»: сообщение от анонимного админа
-            # приходит от `GroupAnonymousBot` с `is_bot=True`, и проверка по
-            # этому флагу не положила бы ключ `member`. А его объявляют почти
-            # все хендлеры — aiogram упал бы на резолве аргумента, и апдейт
-            # потерялся бы навсегда: offset Telegram сдвигается независимо
-            # от исхода обработки
-            bot: Bot | None = data.get("bot")
-            me = await bot.me() if bot is not None else None
-            if user is not None and (me is None or user.id != me.id):
+            # `member` объявляют почти все хендлеры — aiogram упал бы на
+            # резолве аргумента, и апдейт потерялся бы навсегда: offset
+            # Telegram сдвигается независимо от исхода обработки
+            if user is not None and not ours:
                 data["member"] = await repo.get_or_create_member(
                     session, family.id, user.id, _display_name(user)
                 )
