@@ -12,6 +12,7 @@
 * ни одного слова, которое можно прочитать как оценку родителей.
 """
 
+from collections.abc import Sequence
 from datetime import date, datetime, timedelta
 from typing import TYPE_CHECKING
 
@@ -98,8 +99,8 @@ DESCRIPTION = (NL * 2).join(
         "голосовое, я расшифрую, покажу, что услышал, и спрошу, записывать "
         "ли. Голосом пишется и то, чего нет на кнопках: лекарство, "
         "температура, заметка, время задним числом.",
-        "Работаю в семейном чате, а не в личке: записи общие, и оба родителя "
-        "видят одно и то же.",
+        "Работаю в групповом чате, а не в личке: записи общие, их видят оба "
+        "родителя. Нажмите «Начать» — покажу, как настроить.",
     ]
 )
 
@@ -329,9 +330,13 @@ def logged(event: Event, tz: str) -> str:
     )
 
 
+# Обещание здесь обязано быть исполнимым, и до кнопки оно таким не было:
+# текст звал в `/today`, где отдельных записей не видно вовсе, а обработчика у
+# слова «поправьте» не существовало ни одного. Теперь под сообщением висит
+# `keyboards.record_fix` с номером ровно той записи, которую тикер закрыл.
 AUTO_CLOSED = (
     "⏱ Таймер «{name}» висел дольше {hours:g} ч — закрыл его сам, "
-    "длительность приблизительная. Если знаете точное время, поправьте: /today"
+    "длительность приблизительная. Знаете точное время — поправьте кнопкой ниже."
 )
 
 UNDONE = "↩️ Запись удалена."
@@ -346,6 +351,242 @@ NOTHING_TO_UNDO = "Эту запись уже удалили."
 
 CANCELLED = "Отменил."
 NOTHING_TO_CANCEL = "Сейчас нечего отменять."
+
+
+# --- Правка записей -------------------------------------------------------
+#
+# Экраны собираются из тех же `started`/`finished`/`logged`, что и
+# подтверждения, — иначе одна и та же запись выглядела бы в ленте и в карточке
+# по-разному, и человек не узнал бы её в списке.
+
+RECORD_GONE = "Этой записи уже нет — её удалили."
+RECORD_STALE = "Кнопка устарела: запись изменилась. Откройте её заново."
+
+# Отдельный текст, а не `RECORD_STALE`, и разница не косметическая. «Кнопка
+# устарела» объясняет гонку двоих, а здесь ничего не двигали: этот вид записи
+# невозможен в принципе. Человек, прочитавший неверную причину, нажмёт ещё раз
+# и получит то же самое — то есть увидит сломавшегося бота
+RECORD_WRONG_KIND = (
+    "Так поменять вид нельзя: мгновенная запись не становится длящейся и "
+    "наоборот. Откройте запись заново."
+)
+RECORD_EMPTY = "За эти сутки записей нет."
+RECORD_ASK_ML = "Сколько мл? Напишите числом. Не ответите — останется как было."
+RECORD_ASK_DELETE = "Удалить эту запись? Вернуть её будет нечем."
+RECORD_BIRTH_WEIGHT = (
+    "Это вес при рождении. Он живёт ещё и в карточке ребёнка, поэтому правится "
+    "там: /baby. Поправив здесь, мы развели бы карточку с графиком."
+)
+RECORD_PICK = "Какую поправить?"
+
+
+def record_line(row: Event | Measurement, tz: str) -> str:
+    """Одна строка списка: время слева, суть справа.
+
+    Время вынесено вперёд намеренно. Список читают, ища глазами «тот самый сон
+    в восемь», а не «сон вообще», — и колонка времени сканируется быстрее, чем
+    время, спрятанное в конце фразы.
+    """
+    if isinstance(row, Measurement):
+        local = tu.to_local(row.taken_at, tz)
+        name = MEASURE_NAMES.get(row.kind, row.kind)
+        value = weight_str(row.value) if row.kind == WEIGHT else f"{row.value:g}"
+        return f"{local:%H:%M}  ⚖️ {name.capitalize()}, {value}"
+
+    local = tu.to_local(row.started_at, tz)
+    name = KIND_NAMES.get(row.kind, row.kind)
+    side = f" ({SIDE_NAMES[row.side]})" if row.side else ""
+    tag = f" ({html_escape(row.subtype)})" if row.subtype else ""
+    icon = KIND_ICONS.get(row.kind, "📝")
+
+    tail = ""
+    if row.ended_at is not None:
+        tail = f" — {duration(row.ended_at - row.started_at)}"
+        if row.estimated:
+            tail += " (прибл.)"
+    elif row.kind in TIMED_KINDS:
+        tail = " — идёт"
+    elif row.value_num is not None:
+        tail = f", {row.value_num:g}"
+        if row.kind in (FEED_BOTTLE, PUMP):
+            tail += " мл"
+        elif row.kind == TEMP:
+            tail += " °C"
+
+    return f"{local:%H:%M}  {icon} {name.capitalize()}{side}{tag}{tail}"
+
+
+def records_screen(
+    rows: Sequence[Event | Measurement],
+    tz: str,
+    day: date,
+    today: date,
+    *,
+    first: int,
+    total: int,
+) -> str:
+    """Список записей за сутки с нумерацией, совпадающей с кнопками."""
+    when = tu.day_label(day, today) or ""
+    stamp = tu.day_stamp(day)
+    head = f"📋 Записи · {when}, {stamp}" if when else f"📋 Записи · {stamp}"
+    if not rows:
+        return f"{head}\n\n{RECORD_EMPTY}"
+
+    lines = [head, ""]
+    for offset, row in enumerate(rows):
+        lines.append(f"{first + offset}. {record_line(row, tz)}")
+    lines.append("")
+    if total > len(rows):
+        last = first + len(rows) - 1
+        lines.append(f"Показаны {first}–{last} из {total}. {RECORD_PICK}")
+    else:
+        lines.append(RECORD_PICK)
+    return "\n".join(lines)
+
+
+def record_card(row: Event | Measurement, tz: str, now: datetime) -> str:
+    """Карточка одной записи: всё, что о ней известно, и кто её сделал.
+
+    «Кто записал: Аня», а не «Записала Аня»: имя автора — данные, а форма
+    глагола была бы догадкой о поле родителя. Тот же довод, по которому бот
+    говорит о ребёнке без рода.
+    """
+    author = row.author.display_name if row.author is not None else "—"
+
+    if isinstance(row, Measurement):
+        name = MEASURE_NAMES.get(row.kind, row.kind)
+        value = weight_str(row.value) if row.kind == WEIGHT else f"{row.value:g}"
+        return "\n".join(
+            [
+                f"⚖️ {name.capitalize()}",
+                "",
+                f"Когда: {tu.fmt_when(row.taken_at, tz, now)}",
+                f"Сколько: {value}",
+                f"Кто записал: {html_escape(author)}",
+            ]
+        )
+
+    name = KIND_NAMES.get(row.kind, row.kind)
+    side = f" ({SIDE_NAMES[row.side]})" if row.side else ""
+    tag = f" ({html_escape(row.subtype)})" if row.subtype else ""
+    icon = KIND_ICONS.get(row.kind, "📝")
+
+    lines = [f"{icon} {name.capitalize()}{side}{tag}", ""]
+    lines.append(f"Начало: {tu.fmt_when(row.started_at, tz, now)}")
+
+    if row.ended_at is not None:
+        lines.append(f"Конец: {tu.fmt_when(row.ended_at, tz, now)}")
+        went = duration(row.ended_at - row.started_at)
+        if row.estimated:
+            lines.append(f"Длилось: {went} (приблизительно — закрыл таймер сам)")
+        else:
+            lines.append(f"Длилось: {went}")
+    elif row.kind in TIMED_KINDS:
+        lines.append(f"Идёт: {duration(now - row.started_at)}")
+
+    if row.value_num is not None:
+        unit = " мл" if row.kind in (FEED_BOTTLE, PUMP) else ""
+        lines.append(f"Сколько: {row.value_num:g}{unit}")
+    if row.note:
+        lines.append(f"Заметка: {html_escape(row.note)}")
+
+    lines.append(f"Кто записал: {html_escape(author)}")
+    return "\n".join(lines)
+
+
+FIELD_NAMES = {"s": "начало", "e": "конец", "t": "время"}
+
+
+def record_time(
+    row: Event | Measurement,
+    tz: str,
+    field: str,
+    was: datetime,
+    becomes: datetime,
+    now: datetime,
+) -> str:
+    """Экран сдвига: что было и чем станет.
+
+    «Станет» печатается всегда, даже при нулевом сдвиге, и это не шум: строка
+    объявляет, что в базе пока ничего не изменилось. Без неё экран выглядел бы
+    так, будто каждый тап уже записан.
+    """
+    if isinstance(row, Measurement):
+        title = MEASURE_NAMES.get(row.kind, row.kind).capitalize()
+        icon = "⚖️"
+    else:
+        title = KIND_NAMES.get(row.kind, row.kind).capitalize()
+        icon = KIND_ICONS.get(row.kind, "📝")
+    what = FIELD_NAMES.get(field, "время")
+    return "\n".join(
+        [
+            f"🕐 {icon} {title} · правим {what}",
+            "",
+            f"Было: {tu.fmt_when(was, tz, now)}",
+            f"Станет: {tu.fmt_when(becomes, tz, now)}",
+        ]
+    )
+
+
+RECORD_KINDS_ASK = "Какая это запись на самом деле?"
+
+
+def record_moved(row: Event | Measurement, tz: str, field: str, was: datetime) -> str:
+    """Подтверждение сдвига в ленту: откуда и куда уехала граница.
+
+    Названы обе точки, а не только новая. Подтверждение читает и второй
+    родитель, который экрана правки не видел, — «конец 03:40» сказало бы ему,
+    что запись такой и была.
+    """
+    if isinstance(row, Measurement):
+        title = MEASURE_NAMES.get(row.kind, row.kind).capitalize()
+        became = row.taken_at
+    else:
+        title = KIND_NAMES.get(row.kind, row.kind).capitalize()
+        became = row.ended_at if field == "e" and row.ended_at else row.started_at
+    what = FIELD_NAMES.get(field, "время")
+    return (
+        f"🕐 {title}: {what} {tu.to_local(was, tz):%H:%M} → "
+        f"{tu.to_local(became, tz):%H:%M}"
+    )
+
+
+def record_kind_changed(event: Event, tz: str, was: str, dropped: str | None) -> str:
+    """Подтверждение смены вида, и вслух — что при этом снялось.
+
+    Молча стёртый объём означал бы, что число исчезло из дневника без единого
+    слова. Пометка `estimated` тем же правилом объявляется тикером, а
+    погашенные подписки — экраном напоминаний.
+    """
+    became = KIND_NAMES.get(event.kind, event.kind).capitalize()
+    side = f" ({SIDE_NAMES[event.side]})" if event.side else ""
+    icon = KIND_ICONS.get(event.kind, "📝")
+    line = f"✏️ Было «{was}», стало «{icon} {became}{side}»."
+    return f"{line} {dropped}" if dropped else line
+
+
+def record_value_dropped(kind: str, value: float) -> str:
+    """Вид записи здесь не склоняется намеренно.
+
+    «У «сон» его не бывает» — именительный падеж в родительном месте, и чинить
+    это пришлось бы вторым словарём имён на одиннадцать видов. Оборот «у этого
+    вида» обходится без него и не устаревает от нового вида в `models.py`.
+    """
+    return f"Объём {value:g} мл убрал: у этого вида его не бывает."
+
+
+ESTIMATE_DROPPED = "Пометку «приблизительно» снял: конец назвали вы, а не таймер."
+
+
+def record_deleted(row: Event | Measurement, tz: str) -> str:
+    """Удаление называет запись целиком, и это вместо отмены.
+
+    Вернуть удалённое нечем: черновиков в памяти здесь нет по доктрине, а
+    возить все поля события в `callback_data` не даёт потолок в 64 байта.
+    Единственная страховка от промаха — возможность завести запись заново, не
+    вспоминая, что в ней было.
+    """
+    return f"🗑 Удалил: {record_line(row, tz)}"
 
 
 # --- Голос и карточка разбора ---------------------------------------------
@@ -942,23 +1183,77 @@ def preset_turned_off(preset: "Preset", count: int) -> str:
 
 # --- Прочее ---------------------------------------------------------------
 
-PRIVATE_ONLY = (
-    "Я работаю в семейном чате, а не в личке: записи общие, и оба родителя "
-    "должны их видеть. Добавьте меня в группу с женой или мужем."
-)
+# Первое слово бота человеку, которому его переслали. Раньше здесь стоял отказ
+# из двух строк («работаю в семейном чате»), и он был верен ровно для того, кто
+# уже знал, что делать дальше. Незнакомому человеку он не говорил ни что за
+# группа, ни кого туда звать, ни зачем боту права, — а всё это написано только
+# в `README.md`, то есть для того, кто разворачивает бота, а не пользуется им.
+#
+# Четвёртым пунктом напрашивалось «напишите /baby», и его здесь нет намеренно:
+# в группе на это будет кнопка, а тут он стал бы четвёртым поручением подряд.
+PRIVATE_GUIDE = """👶 Я семейный дневник: кормления, сон, подгузники, вес — в один тап.
+
+Записи общие, поэтому работаю в групповом чате, а не здесь: оба родителя
+должны видеть одно и то же и не спрашивать друг у друга «ты её кормил?».
+
+Что сделать:
+
+1. Создайте группу. Позвать в неё можно кого угодно — мужа, жену, бабушку,
+няню. Годится и та группа, которая у вас уже есть.
+
+2. Добавьте меня в неё кнопкой ниже.
+
+3. Там же Telegram спросит про права администратора — оставьте отмеченными
+«Закреплять сообщения» и «Удалять сообщения». Буду держать панель внизу чата
+и убирать нажатия кнопок из ленты. Без прав всё работает, просто в чате
+будет неопрятнее.
+
+Дальше поздороваюсь уже в группе и покажу, с чего начать."""
 
 GREETING = """👶 Я семейный дневник: кормления, сон, подгузники, вес — в один тап.
 
 Кнопки под полем ввода уже здесь: «📋 Панель», «❓ Вопрос», «📊 Сутки».
 Команду для них писать не надо.
 
-Начните с /baby — имя, дата рождения и вес. Без карточки не будет ни сводок,
-ни центилей ВОЗ.
-
-Сделайте меня администратором: буду закреплять панель и убирать нажатия
-кнопок из ленты. Без прав всё работает, просто в чате будет неопрятнее.
+Записывать можно и голосом: пришлите голосовое, я расшифрую и спрошу,
+записывать ли.
 
 Что умею целиком — /help."""
+
+# Подклеивается к приветствию через пустую строку и только тогда, когда прав
+# нет. Статус лежит в самом апдейте о добавлении, спрашивать Telegram не надо —
+# а пришедший по ссылке из лички добавляется сразу администратором, и просьба
+# о том, что уже дали, в первом же слове бота читалась бы как невнимательность.
+ADMIN_WHY = (
+    "Сделайте меня администратором: буду закреплять панель и убирать нажатия "
+    "кнопок из ленты. Без прав всё работает, просто в чате будет неопрятнее."
+)
+
+ADMIN_THANKS = (
+    "Права получил. Панель теперь буду закреплять, а нажатия кнопок — убирать "
+    "из ленты."
+)
+
+# Говорится один раз за жизнь семьи, в конце мастера. Один раз получается не
+# отметкой в базе, а устройством: мастер проходят однажды.
+ADMIN_REMINDER = (
+    "Кстати, прав администратора у меня нет — панель не закрепится и нажатия "
+    "кнопок останутся в ленте. Всё остальное работает. Дать права: меню чата → "
+    "«Администраторы» → добавить меня."
+)
+
+# Второе сообщение приветствия. Отдельным, потому что одно сообщение не носит
+# сразу и клавиатуру под полем ввода, и inline-кнопку.
+FIRST_STEP = (
+    "Первым делом — карточка ребёнка: имя, пол, дата рождения и вес. Без неё "
+    "не будет ни сводок, ни центилей ВОЗ."
+)
+
+OWNER_ONLY = (
+    "Это команда владельца бота: в копии лежит база целиком, со всеми семьями "
+    "сразу. Ваши записи никуда не денутся — они и так на диске и в ежедневном "
+    "снимке."
+)
 
 
 HELP = """👶 <b>Что я умею</b>
@@ -974,6 +1269,11 @@ HELP = """👶 <b>Что я умею</b>
 Промахнулись? Под каждым ответом есть кнопка. «↩️ Отменить» убирает
 запись; если случайно закончили таймер — «↩️ Не заканчивать» вернёт
 его, а запись останется целой.
+
+<b>Поправить</b> — «✏️ Поправить» под ответом, а если он уже уехал вверх,
+то «📊 Сутки» → «📋 Записи» и номер нужной. Там можно подвинуть начало и
+конец, сменить вид, поправить объём и удалить. Забытый таймер чинится
+кнопкой прямо под сообщением о нём.
 
 <b>Слушать</b> — просто пришлите голосовое, нажимать ничего не надо.
 Расшифрую, покажу, что услышал, и спрошу, записывать ли. Голосом
@@ -1206,11 +1506,6 @@ QA_NOT_FOUND = (
 
 QA_FOUND_ONLY = "Вот что нашлось по этому вопросу в источниках."
 
-QA_DISCLAIMER = (
-    "<i>Я не врач. Я нашёл это в документе и показываю, где написано, — "
-    "ничего не оценивал и не советовал от себя. Решение принимаете вы.</i>"
-)
-
 # Сколько знаков цитаты показываем. Фрагмент бывает до 1200, а в сообщении их
 # несколько, и у Telegram потолок 4096
 QUOTE_LIMIT = 400
@@ -1228,11 +1523,15 @@ def html_escape(text: str) -> str:
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
+def _cut(text: str, limit: int) -> str:
+    """Обрезать по слову, а не по букве."""
+    if len(text) <= limit:
+        return text
+    return text[:limit].rsplit(" ", 1)[0] + "…"
+
+
 def _quote(chunk: "Chunk") -> str:
-    text = " ".join(chunk.text.split())
-    if len(text) > QUOTE_LIMIT:
-        text = text[:QUOTE_LIMIT].rsplit(" ", 1)[0] + "…"
-    return html_escape(text)
+    return html_escape(_cut(" ".join(chunk.text.split()), QUOTE_LIMIT))
 
 
 # Путь заголовков в документе доходит до двух с половиной сотен знаков —
@@ -1240,43 +1539,34 @@ def _quote(chunk: "Chunk") -> str:
 # Целиком он в шапке над цитатой в одну строку выглядит дико
 HEAD_LIMIT = 90
 
+# Название документа бывает не короче: «Консультирование по грудному
+# вскармливанию: курс обучения (часть 2: положение у груди, трудности
+# кормления)». Обрезается отдельно от заголовка, а не вместе с ним: общий
+# потолок на двоих съедал бы то одно, то другое, смотря какой документ
+TITLE_LIMIT = 70
+
 
 def _fragment(chunk: "Chunk") -> str:
-    head = chunk.heading or chunk.title
-    if len(head) > HEAD_LIMIT:
-        head = head[:HEAD_LIMIT].rsplit(" ", 1)[0] + "…"
-    return f"<b>{html_escape(head)}</b>\n<blockquote>{_quote(chunk)}</blockquote>\n"
+    """Цитата, подписанная документом.
 
+    Название стоит здесь, а не списком «Источники» под сообщением: список
+    повторял то же самое пятью строками со ссылками, а ночное сообщение и без
+    него длинное. Правка 19.09.2026 по просьбе владельца.
 
-def qa_sources(chunks: "tuple[Chunk, ...]") -> str:
-    """Документы под ответом, без повторов, отечественные первыми.
+    Совсем без подписи цитату оставлять нельзя. Абзац из клинических
+    рекомендаций тогда неотличим от абзаца, сочинённого моделью, — а вся
+    разница между этим ботом и чатом с моделью в том, что он показывает, где
+    написано.
 
-    Порядок по тиру — это то, ради чего тир вообще заведён. Случай не
-    выдуманный: российский порог 37.5 °C уже расходился с международными 38.0,
-    и правильным ответом был российский, потому что семья пойдёт к российскому
-    педиатру. Когда в одном ответе сошлись документы разного веса, человек
-    должен видеть, какой из них чей.
-
-    Подпись тира появляется только при смешанной выдаче. Когда все источники
-    одного уровня — а так чаще всего и бывает, — она не несёт ничего, кроме
-    лишней строки над и без того длинным сообщением.
+    Потеряно при этом одно, и это надо знать: уровень источника (тир) в
+    сообщении больше не печатается. На отбор он влияет по-прежнему
+    (`TIER_BONUS` в `kb.py`), но глазами «это российские рекомендации, а это
+    зарубежные» теперь различается только по названию документа.
     """
-    seen: dict[str, Chunk] = {}
-    for chunk in chunks:
-        seen.setdefault(chunk.source_id, chunk)
-    ordered = sorted(seen.values(), key=lambda chunk: chunk.tier)
-    mixed = len({chunk.tier for chunk in ordered}) > 1
-
-    lines = ["<b>Источники</b>"]
-    tier = ""
-    for chunk in ordered:
-        if mixed and chunk.tier != tier:
-            tier = chunk.tier
-            lines.append(f"<i>{html_escape(chunk.tier_name)}</i>")
-        lines.append(
-            f'• <a href="{html_escape(chunk.url)}">{html_escape(chunk.title)}</a>'
-            f" — {html_escape(chunk.publisher)}"
-        )
+    lines = [f"<b>{html_escape(_cut(chunk.title, TITLE_LIMIT))}</b>"]
+    if chunk.heading:
+        lines.append(f"<i>{html_escape(_cut(chunk.heading, HEAD_LIMIT))}</i>")
+    lines.append(f"<blockquote>{_quote(chunk)}</blockquote>\n")
     return "\n".join(lines)
 
 
@@ -1289,8 +1579,7 @@ def qa_answer(answer: str, chunks: "tuple[Chunk, ...]") -> str:
     """
     lines = [html_escape(answer), ""]
     lines += [_fragment(chunk) for chunk in chunks[:2]]
-    lines += [qa_sources(chunks), "", QA_DISCLAIMER]
-    return "\n".join(lines)
+    return "\n".join(lines).rstrip()
 
 
 def qa_extract(chunks: "tuple[Chunk, ...]") -> str:
@@ -1307,8 +1596,7 @@ def qa_extract(chunks: "tuple[Chunk, ...]") -> str:
     """
     lines = [QA_FOUND_ONLY, ""]
     lines += [_fragment(chunk) for chunk in chunks[:3]]
-    lines += [qa_sources(chunks), "", QA_DISCLAIMER]
-    return "\n".join(lines)
+    return "\n".join(lines).rstrip()
 
 
 # --- Периодический опрос --------------------------------------------------

@@ -122,11 +122,11 @@ async def number_reply(
     if ask.row_id is None:
         return
     event = await repo.get_event(session, ask.row_id)
-    if event is None:
-        # Запись успели отменить кнопкой, пока человек набирал число
+    if event is None or event.child_id != child.id:
+        # Запись успели отменить кнопкой, пока человек набирал число, — или
+        # номер пришёл не от этого ребёнка: id сквозные по всей базе
         return
-    event.value_num = value
-    await session.commit()
+    await repo.set_event_value(session, event, value)
     await message.answer(f"Записал: {value:g} мл", reply_markup=keyboards.home())
     panel.schedule(bot, family.id, message.message_id)
 

@@ -75,7 +75,15 @@ async def test_burst_of_taps_makes_one_edit(
 
     for _ in range(5):
         panel.schedule(bot, family.id)
-    await asyncio.sleep(0.1)
+    # Ждём саму задачу, а не время. Фиксированные 0.1 с тут стояли и были
+    # бюджетом, а не ожиданием: выжившая задача досыпает дебаунс, открывает
+    # сессию и правит панель, и на загруженной машине не всегда укладывается.
+    # Тест краснел от роста НАБОРА, то есть в месте, к дебаунсу отношения не
+    # имеющем, — худший вид сторожа. Ссылку берём до ожидания: отработав,
+    # задача вычёркивает себя из `_tasks` сама
+    survivor = panel._tasks.get(family.id)
+    assert survivor is not None, "дебаунс обязан был поставить задачу"
+    await asyncio.gather(survivor, return_exceptions=True)
 
     assert len(bot.edited) == 1
 

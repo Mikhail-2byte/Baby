@@ -20,7 +20,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot import keyboards, texts
 from bot.db import repo
+from bot.db.models import Family
 from bot.db.session import Session
+from bot.services import sending
 
 log = logging.getLogger(__name__)
 
@@ -107,6 +109,42 @@ def _message_of(event: TelegramObject) -> Message | None:
     return event if isinstance(event, Message) else None
 
 
+def _announces_the_join(message: Message) -> bool:
+    """Это служебное сообщение о том, что бот появился в чате?
+
+    Поймано живьём 19.09.2026, в первый же день: семья, добавившая бота,
+    получила приветствие **дважды**.
+
+    Причина в том, что на добавление Telegram присылает два апдейта, а не
+    один: `my_chat_member` и служебное сообщение «такой-то добавил такого-то».
+    Второе приходит от человека, а не от бота, поэтому `ours` его не отсекает;
+    текста у него нет и обработчика тоже нет — в логе оно так и лежит,
+    `is not handled`. Для опоздавшего приветствия это выглядело первой
+    репликой семьи, то есть второй путь срабатывал ровно тогда, когда первый
+    работает.
+
+    Отсюда и формулировка условия: второй путь существует для случая, когда
+    апдейт о добавлении **потерян**. Сообщение, которое об этом же добавлении
+    и рассказывает, — доказательство обратного.
+
+    Три вида, и каждый назван: бота добавили в существующую группу
+    (`new_chat_members`); группу создали вместе с ботом — обычную
+    (`group_chat_created`) и сразу супергруппу (`supergroup_chat_created`).
+
+    Цена, названная вслух: если человек напишет настоящую реплику в тот же миг,
+    когда бота добавляют, и она обработается раньше `my_chat_member`,
+    приветствие уйдёт дважды. Закрыть это отметкой нельзя — `bot_added`
+    здоровается безусловно, и правильно делает: бота, вернувшегося после
+    изгнания, надо встретить заново. Лишнее приветствие раз в жизни чата
+    дешевле, чем семья, оставшаяся без клавиатуры.
+    """
+    return bool(
+        message.new_chat_members
+        or message.group_chat_created
+        or message.supergroup_chat_created
+    )
+
+
 class FamilyMiddleware(BaseMiddleware):
     """Кладёт в data `session`, `family`, `member` и `child`.
 
@@ -178,7 +216,51 @@ class FamilyMiddleware(BaseMiddleware):
                     session, family.id, user.id, _display_name(user)
                 )
 
-            return await handler(event, data)
+            result = await handler(event, data)
+
+            message = _message_of(event)
+            if (
+                bot is not None
+                and not ours
+                and family.greeted_at is None
+                and message is not None
+                and not _announces_the_join(message)
+            ):
+                await self._greet_late(bot, session, family, data.get("child"))
+            return result
+
+    @staticmethod
+    async def _greet_late(
+        bot: Bot, session: AsyncSession, family: Family, child: Any
+    ) -> None:
+        """Поздороваться, если первый путь приветствия не доехал.
+
+        Это не запасной вариант, а вторая половина одного. Первый путь —
+        апдейт `my_chat_member` о добавлении — на домашней машине теряется:
+        `bot/__main__.py` зовёт `delete_webhook(drop_pending_updates=True)`, то
+        есть всё, что пришло, пока ПК спал, выбрасывается. Семья создала группу
+        и добавила бота ночью — приветствия не будет **никогда**, а вместе с ним
+        не будет и клавиатуры под полем ввода, то есть половины бота. Ровно тот
+        класс, про который в проекте записано: у фичи, доезжающей одним
+        необязательным путём, нет ни одного пути.
+
+        Стоит ПОСЛЕ хендлера, по образцу `drop_wizard_state`: ответ на саму
+        реплику важнее. Реплику это не съедает — middleware хендлеру не
+        конкурент, он его зовёт.
+
+        Про права здесь приходится спрашивать: статуса, который лежит в апдейте
+        о добавлении, тут нет. `None` от зонда означает молчание про права — то
+        же правило, что в конце мастера.
+
+        **Импорт внутри функции намеренно.** Зависимости в проекте идут от
+        хендлеров к middleware; модульный импорт назад цикла не даёт сегодня и
+        даст в тот день, когда хендлеру понадобится что-нибудь отсюда.
+        """
+        from bot.handlers.common import greet
+
+        await greet(
+            bot, session, family, child, admin=await sending.is_admin(bot, family)
+        )
 
     @staticmethod
     async def _handle_migration(

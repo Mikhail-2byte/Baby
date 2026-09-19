@@ -170,6 +170,15 @@ class StandSession(AiohttpSession):
         markup = payload.get("reply_markup") or {}
         if isinstance(markup, dict) and "keyboard" in markup:
             extra["keyboard"] = sum(len(row) for row in markup["keyboard"])
+        # Inline-кнопки протокол не видел вовсе, и шаг «кнопка есть» был бы
+        # зелёным на её отсутствии — та же порода, что `expect_keyboard` до
+        # этапа 9. Подписи, а не число: проверять надо ту самую кнопку
+        if isinstance(markup, dict) and "inline_keyboard" in markup:
+            extra["inline"] = [
+                button.get("text", "")
+                for row in markup["inline_keyboard"]
+                for button in row
+            ]
 
         self.records.append(
             Outgoing(

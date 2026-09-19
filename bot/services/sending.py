@@ -14,6 +14,7 @@
 import logging
 
 from aiogram import Bot
+from aiogram.enums import ChatMemberStatus
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
 from aiogram.types import (
     ForceReply,
@@ -112,6 +113,30 @@ async def delete_one(bot: Bot, family: Family, message_id: int) -> bool:
             "Сообщение %s в чате %s осталось", message_id, family.chat_id, exc_info=True
         )
         return False
+
+
+async def is_admin(bot: Bot, family: Family) -> bool | None:
+    """Есть ли у бота права администратора в чате семьи. Не падает никогда.
+
+    Единственное в проекте обращение к Telegram с вопросом о собственных
+    правах. Зовут его ровно там, где ответ меняет текст, и оба места случаются
+    один раз за жизнь семьи: напоминание в конце мастера `/baby` и опоздавшее
+    приветствие, у которого нет апдейта о добавлении со статусом внутри.
+    Постоянной проверки нет нигде: и закрепление, и уборка нажатий —
+    украшения, они молча глотают отказ и работают дальше.
+
+    **Три значения, а не два.** `None` означает «спросить не удалось»: сеть,
+    прокси, что угодно. Свернуть его в `False` значило бы напоминать про права
+    на каждом сетевом сбое, свернуть в `True` — читается задом наперёд.
+    Догадка остаётся догадкой и объявляется — вызывающий на `None` молчит.
+    """
+    try:
+        me = await bot.me()
+        member = await bot.get_chat_member(family.chat_id, me.id)
+    except Exception:
+        log.info("Не спросить про права в чате %s", family.chat_id, exc_info=True)
+        return None
+    return member.status == ChatMemberStatus.ADMINISTRATOR
 
 
 async def edit(

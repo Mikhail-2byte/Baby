@@ -20,7 +20,7 @@ from aiogram import Bot
 from dateutil.rrule import rrulestr
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from bot import texts
+from bot import keyboards, texts
 from bot.config import settings
 from bot.db import repo
 from bot.db.models import (
@@ -191,6 +191,11 @@ async def close_stale_timers(
         family = await _family_of(session, event.child_id)
         if family is None:
             continue
+        # Кнопка на ту же запись, а не ссылка на сводку. «Забыла выключить» —
+        # это ровно тот промах, о котором бот сообщает сам, и правило «у
+        # каждого промаха есть кнопка, и она лечит ровно этот промах» здесь
+        # исполняется буквально. До неё текст звал в `/today`, где отдельных
+        # записей не видно вовсе, и обработчика у обещания не было ни одного
         await sending.deliver(
             bot,
             family,
@@ -198,6 +203,7 @@ async def close_stale_timers(
                 name=texts.KIND_NAMES.get(event.kind, event.kind),
                 hours=settings.open_timer_max_hours,
             ),
+            reply_markup=keyboards.record_fix(event.id, field="e"),
         )
         log.info("Таймер #%s закрыт автоматически", event.id)
 

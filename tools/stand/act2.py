@@ -15,7 +15,7 @@ from pathlib import Path
 
 from bot.config import settings
 from bot.db.models import SLEEP
-from bot.keyboards import CheckinCB
+from bot.keyboards import CheckinCB, RecordCB
 from bot.services import timeutil as tu
 from tools.stand import seed
 from tools.stand.harness import Stand, StepReport
@@ -105,6 +105,46 @@ async def run(stand: Stand) -> None:
             "WHERE kind = 'sleep' ORDER BY id DESC LIMIT 1",
         )
         r.note("Ждём estimated = 1: молча закрытый выглядел бы как измеренный")
+
+    async with stand.step("44а", "забытый таймер чинится кнопкой из своего же сообщения") as r:
+        # Главный шаг всей правки и единственный, которого нельзя сделать в
+        # первом акте: сообщение о закрытом таймере присылает тикер. До кнопки
+        # текст обещал «поправьте: /today», и обработчика у обещания не было
+        stale = stand.one(
+            "SELECT id, ended_at, estimated FROM events WHERE kind = 'sleep' "
+            "ORDER BY id DESC LIMIT 1"
+        )
+        if stale is None:
+            stand.protocol.fail("шаг 44а", "нечего чинить: шаг 44 не закрыл таймер")
+        else:
+            row_id = int(stale[0])
+            message = stand.session.last_message_id
+            await stand.tap(
+                RecordCB(action="card", row_id=row_id, field="e").pack(), on=message
+            )
+            await stand.settle(2.0)
+            r.expect("Станет")
+            await stand.tap(
+                RecordCB(action="save", row_id=row_id, field="e", mins=-60).pack(),
+                on="last",
+            )
+            await stand.settle(2.0)
+            r.expect("конец")
+            r.show(
+                "поправленный сон",
+                "SELECT id, ended_at, estimated FROM events WHERE id = ?",
+                (row_id,),
+            )
+            fixed = stand.one(
+                "SELECT ended_at, estimated FROM events WHERE id = ?", (row_id,)
+            )
+            if fixed is not None and fixed[0] == stale[1]:
+                stand.protocol.fail("шаг 44а", "конец не сдвинулся")
+            if fixed is not None and fixed[1]:
+                stand.protocol.fail(
+                    "шаг 44а", "пометка «приблизительно» пережила названный конец"
+                )
+        r.note("Ждём сдвинутый ended_at и estimated = 0: конец назвал человек")
 
     async with stand.step("45", "тревога по данным: мало мокрых подгузников") as r:
         left = seed.stage_few_wet_diapers(db, child_id, now)

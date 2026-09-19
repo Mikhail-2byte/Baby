@@ -207,7 +207,7 @@ async def _answer(question: str) -> Result:
         return _extract(chunks, llm.QUOTA)
 
     reply = await llm.ask(SYSTEM, build_user(question, chunks), models=llm.answer_chain())
-    result = _decide(question, chunks, reply)
+    result = decide(question, chunks, reply)
     qa_log.write(
         event="qa",
         question=question,
@@ -252,8 +252,13 @@ def _cites_nothing(data: dict) -> bool:
     return isinstance(used, list) and not used
 
 
-def _decide(question: str, chunks: tuple[kb.Chunk, ...], reply: llm.Answer) -> Result:
+def decide(question: str, chunks: tuple[kb.Chunk, ...], reply: llm.Answer) -> Result:
     """Вердикт по ответу модели. Отделён от записи в лог намеренно.
+
+    Публичная, и не для красоты: её зовёт `kb/eval_qa.py` — замер моделей
+    ответов судит боевым вердиктом, а не своей копией. Копия разошлась бы с
+    ботом молча, и замер начал бы мерить себя. Тот же довод, по которому
+    `kb/eval_kb.py` импортирует боевой `kb.search`.
 
     Запись принимает исход аргументом и потому не может разойтись с тем, что
     увидел человек. Так было не всегда: `qa_log.write` стоял выше и писал

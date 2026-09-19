@@ -429,10 +429,18 @@ def test_numbers_inside_a_range_are_seen():
 # --- Из чего собран ответ ---------------------------------------------------
 
 
-def test_answer_carries_the_source_and_the_disclaimer():
+def test_answer_names_the_document_over_the_quote():
+    """Подпись под цитатой обязана быть, и теперь она одна.
+
+    Блок «Источники» убран 19.09.2026, а название документа переехало в шапку
+    цитаты. Без него абзац из клинических рекомендаций неотличим от абзаца,
+    сочинённого моделью, — то есть исчезает ровно то, чем этот бот отличается
+    от чата с моделью.
+    """
     text = texts.qa_answer("Прикладывают рано.", (_chunk(),))
-    assert "https://example.invalid/kr" in text
-    assert texts.QA_DISCLAIMER in text
+    assert "Здоровый новорождённый" in text
+    assert "Источники" not in text
+    assert "Я не врач" not in text
 
 
 def test_answer_shows_the_fragment_next_to_itself():
@@ -441,15 +449,11 @@ def test_answer_shows_the_fragment_next_to_itself():
     assert "первые 30 минут" in text
 
 
-def test_extract_carries_the_source_and_the_disclaimer():
+def test_extract_names_the_document_over_the_quote():
     text = texts.qa_extract((_chunk(),))
-    assert "https://example.invalid/kr" in text
-    assert texts.QA_DISCLAIMER in text
-
-
-def test_sources_are_listed_once_per_document():
-    text = texts.qa_sources((_chunk(), _chunk(heading="Другой раздел")))
-    assert text.count("https://example.invalid/kr") == 1
+    assert "Здоровый новорождённый" in text
+    assert "Источники" not in text
+    assert "Я не врач" not in text
 
 
 def test_angle_brackets_from_the_document_are_escaped():
@@ -516,31 +520,38 @@ async def test_the_guard_still_sees_every_fragment(found, model):
 # --- Тир: чем он вообще занят ------------------------------------------------
 
 
-def test_russian_sources_are_listed_first():
-    """Порядок по тиру — то, ради чего тир заведён.
+def test_each_quote_names_its_own_document():
+    """Документ называется над каждой цитатой, а не общим списком.
 
-    Случай не выдуманный: российский порог 37.5 °C уже расходился с
-    международными 38.0, и правильным был российский — семья пойдёт к
-    российскому педиатру.
+    Со снятием блока «Источники» подпись тира из сообщения ушла: уровень
+    источника (`T1` против `T3`) в чате больше не печатается, и различать
+    российские рекомендации и зарубежные приходится по названию документа.
+    На отбор тир влияет по-прежнему — `TIER_BONUS` в `kb.py`, — и сторож
+    этого механизма живёт в `tests/test_kb.py`.
     """
     foreign = replace(
         _chunk("aap"), tier="T3", tier_name="Зарубежные общества", title="Safe Sleep"
     )
-    russian = _chunk("kr_newborn_2025")
-    text = texts.qa_sources((foreign, russian))
-    assert text.index("Здоровый новорождённый") < text.index("Safe Sleep")
+    text = texts.qa_answer("Ответ.", (_chunk("kr_newborn_2025"), foreign))
+    assert "Здоровый новорождённый" in text
+    assert "Safe Sleep" in text
 
 
-def test_tier_is_named_only_when_sources_are_mixed():
-    """При одном уровне подпись не несёт ничего, кроме лишней строки."""
-    same = texts.qa_sources((_chunk(), _chunk("feeding_2019")))
-    assert "Клинические рекомендации Минздрава России" not in same
+def test_a_long_title_does_not_eat_the_heading():
+    """Название и путь заголовков обрезаются порознь.
 
-    foreign = replace(
-        _chunk("aap"), tier="T3", tier_name="Зарубежные общества", title="Safe Sleep"
+    Общий потолок на двоих съедал бы то одно, то другое, смотря какой
+    документ попался: у курса ВОЗ одно название длиннее ста знаков.
+    """
+    long_title = replace(
+        _chunk(),
+        title="Консультирование по грудному вскармливанию: курс обучения "
+        "(часть 2: положение у груди, трудности кормления и их преодоление)",
+        heading="Трещины сосков",
     )
-    mixed = texts.qa_sources((_chunk(), foreign))
-    assert "Зарубежные общества" in mixed
+    text = texts.qa_answer("Ответ.", (long_title,))
+    assert "Трещины сосков" in text
+    assert "…" in text
 
 # --- Квота ------------------------------------------------------------------
 
@@ -585,7 +596,7 @@ def test_the_order_of_routers_is_the_one_everything_rests_on():
 
     `alarm` выше `qa` — иначе вопрос про судороги уйдёт в модель.
     `qa` выше `measure` — иначе апдейт до него не дойдёт вовсе.
-    `common` первым — отказ для лички раньше всего остального.
+    `common` первым — гид для лички раньше всего остального.
     """
     order = [router.name for router in handlers.routers]
     assert order[0] == "common"

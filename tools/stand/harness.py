@@ -33,6 +33,7 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.types import (
     CallbackQuery,
     Chat,
+    ChatMemberAdministrator,
     ChatMemberLeft,
     ChatMemberMember,
     ChatMemberUpdated,
@@ -81,6 +82,23 @@ class Protocol:
 
     def close(self) -> None:
         self._fh.close()
+
+
+
+def _admin(user: User) -> ChatMemberAdministrator:
+    """Администратор с выключенными правами.
+
+    Флаги перечисляются по схеме, а не руками: их полтора десятка, список
+    растёт от версии к версии Telegram, и выписанный здесь он ломался бы на
+    обновлении aiogram, ничего при этом не проверяя. Стенду важен один факт —
+    `status`.
+    """
+    flags = {
+        name: False
+        for name, field in ChatMemberAdministrator.model_fields.items()
+        if field.is_required() and name != "user"
+    }
+    return ChatMemberAdministrator(user=user, **flags)
 
 
 class Stand:
@@ -227,7 +245,7 @@ class Stand:
     async def say(self, text: str, *, private: bool = False) -> None:
         """Человек написал в чат."""
         if private:
-            # В личке эхо не нужно и некуда: бот отвечает отказом, не реплаем
+            # В личке эхо не нужно и некуда: бот отвечает гидом, не реплаем
             await self._feed({"message": self._incoming(text, private=True)})
             return
         real_id = await self._echo(text)
@@ -277,7 +295,34 @@ class Stand:
         )
         await self._feed({"message": message})
 
-    async def join(self) -> None:
+    async def promote(self, *, again: bool = False) -> None:
+        """Боту дали права администратора.
+
+        Отдельно от `join(as_admin=True)`, и разница существенная: то
+        знакомство, а это повышение. Бот отвечает на них разным, и фильтры у
+        них не пересекаются — см. `common.bot_promoted`.
+
+        `again=True` — не повышение, а правка набора галочек уже у
+        администратора: `administrator → administrator`. Telegram шлёт такой
+        апдейт на каждое изменение прав, и бот обязан на него промолчать.
+        Параметр нужен именно потому, что без него шаг «поправили права»
+        подавал бы тот же переход, что и «повысили», и проверял бы не то, что
+        написано в его заголовке, — а протокол выглядел бы осмысленно.
+        """
+        me = await self.bot.me()
+        await self._feed(
+            {
+                "my_chat_member": ChatMemberUpdated(
+                    chat=self.chat,
+                    from_user=self.user,
+                    date=datetime.now(),
+                    old_chat_member=_admin(me) if again else ChatMemberMember(user=me),
+                    new_chat_member=_admin(me),
+                )
+            }
+        )
+
+    async def join(self, *, as_admin: bool = False) -> None:
         """Бота добавили в группу.
 
         Единственный способ проверить приветствие насквозь, не выгоняя бота из
@@ -285,6 +330,17 @@ class Stand:
         честно: хендлеру приходит ровно тот объект, который пришлёт Telegram, и
         дальше всё настоящее — `sending.send` отправляет приветствие в чат, а
         `session.py` записывает, доехала ли с ним клавиатура.
+
+        **Апдейта подаётся два, и это не полнота ради полноты.** На добавление
+        бота Telegram шлёт и `my_chat_member`, и служебное сообщение «такой-то
+        добавил такого-то» — от человека, без текста и без обработчика. Пока
+        `join` подделывал только первый, стенд был зелёным дважды подряд, а
+        боевая семья 19.09.2026 получила приветствие дважды: опоздавшее
+        приветствие принимало служебное сообщение за первую реплику семьи.
+
+        Подделка «честная» оказалась честной **поштучно**: каждый объект был
+        ровно тем, что пришлёт Telegram, а последовательность — нет. Поломка
+        жила в стыке двух апдейтов, то есть ровно там, куда стенд не смотрел.
 
         Чего этот шаг доказать НЕ может: что Telegram вообще **присылает**
         `my_chat_member`. Это зависит от `allowed_updates`, которые
@@ -294,6 +350,14 @@ class Stand:
         половин не достаточна.
         """
         me = await self.bot.me()
+        # Порядок тот же, что в боевом логе: служебное сообщение пришло первым
+        await self._feed(
+            {
+                "message": self._incoming("").model_copy(
+                    update={"new_chat_members": [me]}
+                )
+            }
+        )
         await self._feed(
             {
                 "my_chat_member": ChatMemberUpdated(
@@ -301,7 +365,7 @@ class Stand:
                     from_user=self.user,
                     date=datetime.now(),
                     old_chat_member=ChatMemberLeft(user=me),
-                    new_chat_member=ChatMemberMember(user=me),
+                    new_chat_member=_admin(me) if as_admin else ChatMemberMember(user=me),
                 )
             }
         )
@@ -414,6 +478,8 @@ class StepReport:
         self._expect_silence = False
         self._expect_kinds: list[str] = []
         self._expect_keyboard: bool | None = None
+        self._expect_buttons: list[str] = []
+        self._expect_once: list[str] = []
 
     def expect(self, *fragments: str) -> None:
         """Подстроки, которые обязаны встретиться в отправленном."""
@@ -437,6 +503,25 @@ class StepReport:
         стенда при этом был зелёным.
         """
         self._expect_keyboard = present
+
+    def expect_button(self, *labels: str) -> None:
+        """Подписи inline-кнопок, которые обязаны доехать с ответом.
+
+        Заведено вместе с `extra["inline"]` и по тому же доводу, что
+        `expect_keyboard`: до этого протокол inline-кнопок не видел вовсе, и
+        шаг «под приветствием есть кнопка в мастер» был бы зелёным на её
+        отсутствии.
+        """
+        self._expect_buttons.extend(labels)
+
+    def expect_once(self, *fragments: str) -> None:
+        """Подстрока обязана встретиться ровно в одном отправленном сообщении.
+
+        `expect` этого не ловит: он проверяет «встретилось хоть где-то», и
+        приветствие, ушедшее дважды, проходило бы его молча. Заведено по той
+        самой поломке 19.09.2026.
+        """
+        self._expect_once.extend(fragments)
 
     def note(self, line: str) -> None:
         self.stand.protocol.write(f"    · {line}")
@@ -489,6 +574,18 @@ class StepReport:
                     if self._expect_keyboard
                     else "клавиатура уехала там, где её быть не должно",
                 )
+        for fragment in self._expect_once:
+            hits = sum(1 for r in self.seen if fragment in r.text)
+            if hits != 1:
+                self.stand.protocol.fail(
+                    step, f"{fragment!r} ушло {hits} раз, а должно ровно один"
+                )
+        shown = [
+            label for r in self.seen for label in r.extra.get("inline", []) or []
+        ]
+        for label in self._expect_buttons:
+            if not any(label in one for one in shown):
+                self.stand.protocol.fail(step, f"нет inline-кнопки {label!r}")
         for kind in self._expect_kinds:
             if not any(r.kind == kind for r in self.seen):
                 self.stand.protocol.fail(

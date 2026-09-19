@@ -24,8 +24,8 @@ from bot import keyboards, texts
 from bot.db import repo
 from bot.db.models import WEIGHT, Child, Family, Member
 from bot.filters import IN_GROUP, IN_GROUP_CB
-from bot.keyboards import EditCB, SexCB
-from bot.services import panel, schedule
+from bot.keyboards import EditCB, SexCB, StartCB
+from bot.services import panel, schedule, sending
 from bot.services import timeutil as tu
 
 log = logging.getLogger(__name__)
@@ -94,19 +94,58 @@ def parse_grams(text: str) -> int | None:
     return grams if MIN_BIRTH_G <= grams <= MAX_BIRTH_G else None
 
 
-@router.message(IN_GROUP, Command("baby"))
-async def baby(
+async def _open(
     message: Message, state: FSMContext, child: Child | None, family: Family
 ) -> None:
-    """Показать карточку или начать мастер, если её ещё нет."""
+    """Показать карточку или начать мастер, если её ещё нет.
+
+    Тело общее у команды `/baby` и у кнопки из приветствия, и общее оно не ради
+    экономии строк: кнопка живёт в истории чата неограниченно долго, и тап по
+    годовалому приветствию обязан ответить осмысленно. Здесь он отвечает тем
+    же, чем `/baby`, — показывает готовую карточку.
+
+    **`state.clear()`, а не голый `set_state`.** Тап посреди мастера иначе
+    вернул бы на первый шаг, но оставил бы в `state.get_data()` половину
+    прежнего черновика — и «Готово» собрало бы карточку из двух разных заходов.
+    Отдельного «предыдущий ввод отменил» не нужно: ответом служит «Как зовут?»,
+    и это и есть видимое начало сначала.
+    """
     if child is not None:
         await message.answer(
             texts.baby_card(child, tu.now_utc(), family.tz),
             reply_markup=keyboards.edit_child(),
         )
         return
+    await state.clear()
     await state.set_state(New.name)
     await message.answer(texts.BABY_ASK_NAME, reply_markup=keyboards.home())
+
+
+@router.message(IN_GROUP, Command("baby"))
+async def baby(
+    message: Message, state: FSMContext, child: Child | None, family: Family
+) -> None:
+    await _open(message, state, child, family)
+
+
+@router.callback_query(IN_GROUP_CB, StartCB.filter())
+async def start_from_button(
+    call: CallbackQuery, state: FSMContext, child: Child | None, family: Family
+) -> None:
+    """Кнопка «Завести карточку» из приветствия — первый шаг в один тап.
+
+    До неё вход в мастер был один: набрать `/baby` руками. Для семьи, которая
+    только что добавила бота и ещё не знает ни одной его команды, это шаг,
+    который должен выполнить человек, — то есть дыра.
+
+    Состояние FSM снимает `_open`, а не middleware: `drop_wizard_state` висит на
+    `dp.message` и колбэка не видит вовсе. Искать ветку там, по аналогии с
+    метками постоянной клавиатуры, бесполезно.
+    """
+    await call.answer()
+    if not isinstance(call.message, Message):
+        return
+    await _open(call.message, state, child, family)
 
 
 @router.message(New.name, F.text)
@@ -205,6 +244,23 @@ async def _finish(
     # контакт новой семьи с кнопками под полем ввода
     await message.answer(texts.BABY_SAVED, reply_markup=keyboards.home())
     await panel.refresh(bot, family.id, force_new=True)
+
+    # Единственное за всю жизнь семьи напоминание о правах, и единственный за ту
+    # же жизнь зонд. «Один раз» здесь получается не отметкой в базе, а
+    # устройством: мастер проходят однажды — ровно по этой причине в нём вообще
+    # оставлен FSM. Отсюда же место: ни ветки в тикере, ни риска напомнить на
+    # каждом тике.
+    #
+    # Зонд стоит ПОСЛЕ подтверждения и панели: это сетевой запрос через прокси,
+    # и ставить его перед ответом в самый важный момент онбординга значило бы
+    # нарушить «ответ человеку уходит раньше, чем перерисовывается панель».
+    # Заодно напоминание ложится прямо под незакреплённой панелью — под
+    # собственным доказательством.
+    #
+    # `None` — «спросить не удалось», и на нём молчим: напоминать про права из-за
+    # сетевого сбоя хуже, чем не напомнить вовсе
+    if await sending.is_admin(bot, family) is False:
+        await message.answer(texts.ADMIN_REMINDER, reply_markup=keyboards.home())
 
 
 # --- Правка карточки ------------------------------------------------------

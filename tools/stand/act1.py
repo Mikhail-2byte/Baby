@@ -29,8 +29,10 @@ from bot.keyboards import (
     AskCB,
     EditCB,
     MeasureCB,
+    RecordCB,
     RemindCB,
     SexCB,
+    StartCB,
     StatsCB,
     TrackCB,
     UndoCB,
@@ -58,17 +60,53 @@ async def run(stand: Stand) -> None:
     born = tu.to_local(tu.now_utc(), tz) - timedelta(days=BORN_DAYS_AGO)
     born_text = born.strftime("%d.%m.%Y %H:%M")
 
+    # Номера сообщений, на которых живут экраны правки: они правятся на месте,
+    # и адресовать их `on="last"` значило бы стрелять вслепую
+    screen = 0
+    target = 0
+
     await stand.mark("Стенд: акт 1, всё что отвечает сразу")
 
     # --- знакомство ---------------------------------------------------
 
     async with stand.step("0", "бота добавили в группу: приветствие и клавиатура") as r:
         await stand.join()
-        r.expect("/baby")
+        r.expect("Кнопки под полем ввода")
+        r.expect("администратором")
         r.expect_keyboard()
+        r.expect_button("Завести карточку")
+        r.expect_once("Я семейный дневник")
+        r.note("Апдейта два — служебное сообщение и my_chat_member, — а")
+        r.note("приветствие обязано уйти одно: боевая поломка 19.09")
+        r.note("Сообщений два: клавиатура на первом, кнопка в мастер на втором —")
+        r.note("одно сообщение обе разметки не носит")
+        r.note("Про права просим только потому, что добавили участником")
         r.note("Клавиатура обязана доехать до первой команды, а не после неё")
         r.note("Что шаг НЕ проверяет: что Telegram присылает my_chat_member —")
         r.note("это про allowed_updates, и закрыто юнит-сторожем")
+
+    async with stand.step("0б", "кнопка из приветствия открывает мастер") as r:
+        await stand.tap(StartCB(action="baby").pack(), on="last")
+        r.expect("Как зовут")
+        r.note("До неё вход в мастер был один: набрать /baby руками")
+        await stand.say("/cancel")
+
+    async with stand.step("0в", "боту дали права: спасибо и новая панель") as r:
+        await stand.promote()
+        await stand.settle(3.0)
+        r.expect("Права получил")
+        r.expect_kind("message")
+        r.show("панель", "SELECT panel_message_id FROM families")
+        r.note("Панель перевыпускается, иначе до закрепления дело не доходит")
+
+    async with stand.step("0г", "правка прав второй благодарности не даёт") as r:
+        await stand.promote(again=True)
+        await stand.settle(2.0)
+        r.expect_absent("Права получил")
+        r.expect_silence()
+        r.note("administrator -> administrator Telegram шлёт на каждую правку")
+        r.note("галочек, и бот обязан промолчать. Ловится только точным")
+        r.note("переходом: IS_MEMBER включает ADMINISTRATOR")
 
     async with stand.step("1", "первый апдейт из группы: семья заводится сама") as r:
         await stand.say("/ping")
@@ -293,6 +331,158 @@ async def run(stand: Stand) -> None:
         r.expect("удал")
         r.show("удалённое", "SELECT id FROM events WHERE id = ?", (doomed,))
         r.note("Ждём: первый тап удалил, второй сказал «уже удалили»")
+
+    # --- правка записей ---------------------------------------------------
+    #
+    # Блок стоит до `/export`: в CSV обязана уехать уже исправленная запись, а
+    # вместе с ней — снятая пометка « прибл.». Проверять правку после выгрузки
+    # значило бы проверять её не там, где видно результат.
+    #
+    # Вердикт везде по базе. Экраны правятся на месте, поэтому `on="last"`
+    # адресует вслепую — в соседнем акте на этом уже был ложно-зелёный шаг.
+
+    async with stand.step("15а", "список записей: со сводки в «📋 Записи»") as r:
+        await stand.tap(StatsCB(period="today").pack(), on="last")
+        await stand.settle(1.0)
+        await stand.tap(RecordCB(action="list").pack(), on="last")
+        screen = stand.session.last_message_id
+        r.expect("Записи", "Какую поправить")
+        r.show(
+            "события суток",
+            "SELECT id, kind, started_at, ended_at FROM events "
+            "WHERE child_id = ? ORDER BY started_at",
+            (stand.child_id(),),
+        )
+        r.note("Ждём столько же номеров в списке, сколько строк в базе")
+
+    # Свежий сон заводится намеренно: тикер в этом акте не работает, а нужна
+    # запись с известными границами, которую не жалко двигать
+    async with stand.step("15б", "подготовка: сон, который будем править") as r:
+        await stand.tap(TrackCB(action="start", kind=SLEEP).pack())
+        await stand.settle(1.0)
+        await stand.tap(TrackCB(action="stop", kind=SLEEP).pack())
+        await stand.settle(1.0)
+        target = _last_event_id(stand)
+        r.show(
+            "сон",
+            "SELECT id, started_at, ended_at, estimated FROM events WHERE id = ?",
+            (target,),
+        )
+        r.note(f"Правим запись #{target}")
+
+    async with stand.step("15в", "два тапа по «−15» ничего не пишут в базу") as r:
+        before = stand.one(
+            "SELECT started_at FROM events WHERE id = ?", (target,)
+        )
+        await stand.tap(
+            RecordCB(action="time", row_id=target, field="s").pack(), on=screen
+        )
+        await stand.settle(1.0)
+        await stand.tap(
+            RecordCB(action="shift", row_id=target, field="s", mins=-15).pack(),
+            on=screen,
+        )
+        await stand.settle(1.0)
+        await stand.tap(
+            RecordCB(action="shift", row_id=target, field="s", mins=-30).pack(),
+            on=screen,
+        )
+        r.expect("Станет")
+        after = stand.one("SELECT started_at FROM events WHERE id = ?", (target,))
+        if before != after:
+            stand.protocol.fail("шаг 15в", "черновик уехал в базу до «Готово»")
+        r.note("Ждём: экран показывает «Станет», а в базе всё по-старому")
+
+    async with stand.step("15г", "«✅ Готово» сдвигает начало ровно на полчаса") as r:
+        await stand.tap(
+            RecordCB(action="save", row_id=target, field="s", mins=-30).pack(),
+            on=screen,
+        )
+        r.expect("начало")
+        r.show(
+            "сдвинутый сон",
+            "SELECT id, started_at, ended_at, estimated FROM events WHERE id = ?",
+            (target,),
+        )
+        r.note("Ждём started_at на 30 минут раньше, чем в шаге 15б")
+
+    async with stand.step("15д", "подделанный сдвиг в будущее отбивается") as r:
+        before = stand.one("SELECT ended_at FROM events WHERE id = ?", (target,))
+        await stand.tap(
+            RecordCB(action="save", row_id=target, field="e", mins=100000).pack(),
+            on=screen,
+        )
+        after = stand.one("SELECT ended_at FROM events WHERE id = ?", (target,))
+        if before != after:
+            stand.protocol.fail("шаг 15д", "конец уехал в будущее — сводка сломана")
+        r.note("Кнопки такого шага не рисуют, но callback_data приходит с клиента")
+
+    async with stand.step("15е", "подготовка: бутылочка с объёмом 60 мл") as r:
+        await stand.tap(TrackCB(action="add", kind=FEED_BOTTLE).pack())
+        await stand.settle(1.0)
+        bottle = _last_event_id(stand)
+        await stand.say("60")
+        r.show(
+            "бутылочка",
+            "SELECT id, kind, value_num FROM events WHERE id = ?",
+            (bottle,),
+        )
+        r.note(f"Правим объём у записи #{bottle}")
+
+    async with stand.step("15ж", "правка объёма: тот же вопрос, тот же разбор") as r:
+        # Шаг заведён по пробелу, найденному первым же прогоном: в предыдущей
+        # версии «Сколько мл?» приходило от `track` сразу после создания
+        # записи, и путь правки объёма вживую не проверялся вовсе. Разница
+        # видна по тексту вопроса: у `track` хвост «Или не отвечайте — запишу
+        # без объёма», и при правке он врёт
+        await stand.tap(RecordCB(action="ml", row_id=bottle).pack(), on=screen)
+        await stand.settle(1.0)
+        r.expect("Сколько мл")
+        r.expect_absent("запишу без объёма")
+        await stand.say("95")
+        r.show(
+            "поправленный объём",
+            "SELECT id, kind, value_num FROM events WHERE id = ?",
+            (bottle,),
+        )
+        r.note("Ждём 95 вместо 60: ожидание числа одно на проект, своего разбора нет")
+
+    async with stand.step("15з", "смена вида: бутылочка с объёмом становится стулом") as r:
+        await stand.tap(
+            RecordCB(action="setkind", row_id=bottle, kind=DIAPER_DIRTY).pack(),
+            on=screen,
+        )
+        r.expect("Объём", "убрал")
+        r.show(
+            "бывшая бутылочка",
+            "SELECT id, kind, value_num FROM events WHERE id = ?",
+            (bottle,),
+        )
+        r.note("Ждём diaper_dirty и пустой value_num: «стул, 95 мл» видит только выгрузка")
+
+    async with stand.step("15и", "подгузник не может стать сном") as r:
+        await stand.tap(
+            RecordCB(action="setkind", row_id=bottle, kind=SLEEP).pack(), on=screen
+        )
+        r.expect("мгновенная запись не становится длящейся")
+        r.show("он же", "SELECT id, kind FROM events WHERE id = ?", (bottle,))
+        r.note("Ждём прежний kind: иначе это идущий таймер задним числом")
+        r.note("И названную причину: «кнопка устарела» здесь было бы неправдой")
+
+    async with stand.step("15к", "удаление спрашивает, потом удаляет") as r:
+        await stand.tap(RecordCB(action="ask", row_id=bottle).pack(), on=screen)
+        await stand.settle(1.0)
+        alive = stand.one("SELECT id FROM events WHERE id = ?", (bottle,))
+        if alive is None:
+            stand.protocol.fail("шаг 15к", "вопрос удалил запись, не дожидаясь ответа")
+        await stand.tap(RecordCB(action="del", row_id=bottle).pack(), on=screen)
+        r.expect("Удалил")
+        r.show("удалённое", "SELECT id FROM events WHERE id = ?", (bottle,))
+        r.note("Ждём: подтверждение называет запись целиком — отмены у него нет")
+
+    async with stand.step("15л", "тап по кнопке уже удалённой записи") as r:
+        await stand.tap(RecordCB(action="open", row_id=bottle).pack(), on=screen)
+        r.note("Ждём всплывашку «этой записи уже нет», а не тишину")
 
     # --- вес и центили ----------------------------------------------------
 
@@ -605,8 +795,18 @@ async def run(stand: Stand) -> None:
         await stand.settle(5.0)
         r.expect_kind("file")
 
-    async with stand.step("42", "личка боту — отказ") as r:
+    async with stand.step("42", "личка боту — гид по настройке") as r:
         await stand.say("привет", private=True)
-        r.expect("группу")
+        r.expect("Создайте группу")
+        r.expect("Закреплять сообщения")
+        r.expect_button("Добавить в группу")
+        r.expect_keyboard(False)
+        r.note("Кнопка — ссылка startgroup=true с уже отмеченными правами")
+        r.note("Что шаг НЕ проверяет: что клиент Telegram эту ссылку так и")
+        r.note("откроет. Кода за этим нет вовсе — только руками, на телефоне")
+
+    async with stand.step("43", "/backup из чужого чата") as r:
+        r.note("Проверяется только руками: нужен второй чат с тем же ботом")
+        r.note("и заполненный OWNER_CHAT_ID. Ожидание — отказ, а не файл")
 
     await stand.mark("Акт 1 закончен")

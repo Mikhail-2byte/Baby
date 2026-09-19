@@ -57,6 +57,19 @@ TIMED_KINDS = frozenset({FEED_BREAST, SLEEP, PUMP})
 DIAPER_KINDS = frozenset({DIAPER_WET, DIAPER_DIRTY, DIAPER_MIXED})
 FEED_KINDS = frozenset({FEED_BREAST, FEED_BOTTLE, FEED_SOLID})
 
+# Мгновенные виды, перечисленные поимённо. `ended_at` у них пуст всегда — это
+# моменты, а не отрезки, — и граница между этим множеством и `TIMED_KINDS`
+# определяет, во что запись можно переделать, промахнувшись по кнопке. Перейдя
+# границу, мгновенная запись стала бы идущим таймером задним числом, и тикер
+# закрыл бы её на отметке «плюс четыре часа» с пометкой `estimated`; закрытая,
+# наоборот, унесла бы непустой `ended_at` к виду, у которого его не бывает, и
+# `events_between` потащила бы её в чужие окна по ветке `ended_at > start`.
+#
+# `MED`, `TEMP` и `NOTE` сюда не входят: кнопок у них нет вовсе, они приходят
+# только голосом, и промахнуться по ним нечем.
+INSTANT_KINDS = DIAPER_KINDS | frozenset({FEED_BOTTLE, FEED_SOLID})
+
+
 # Стороны груди
 LEFT = "L"
 RIGHT = "R"
@@ -100,6 +113,16 @@ class Family(Base):
     # момент: сравнение идёт с `local_today`, как и у `last_digest_on`
     panel_message_id: Mapped[int | None] = mapped_column(Integer)
     panel_day: Mapped[date | None] = mapped_column(Date)
+
+    # Когда бот поздоровался в этом чате. Приветствие — носитель постоянной
+    # клавиатуры, то есть без него у семьи нет кнопок вовсе, и доезжать оно
+    # обязано наверняка. Первый путь — апдейт `my_chat_member` о добавлении —
+    # теряется: бот живёт на домашней машине, а `delete_webhook` на старте идёт
+    # с `drop_pending_updates=True`. Добавили ночью, ПК спал — апдейта не будет
+    # никогда. Отсюда второй путь, по первой реплике человека, и отметка, без
+    # которой его нечем погасить: `created_at` говорит о заведении семьи, а не
+    # о сказанном слове
+    greeted_at: Mapped[datetime | None] = mapped_column(DateTime)
 
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 

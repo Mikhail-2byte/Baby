@@ -961,7 +961,7 @@ from typing import Any  # noqa: E402
 from aiogram import Bot, Dispatcher  # noqa: E402
 from aiogram.client.session.base import BaseSession  # noqa: E402
 from aiogram.fsm.context import FSMContext  # noqa: E402
-from aiogram.methods import TelegramMethod  # noqa: E402
+from aiogram.methods import GetMe, TelegramMethod  # noqa: E402
 from aiogram.types import (  # noqa: E402
     CallbackQuery,
     Chat,
@@ -979,6 +979,8 @@ from bot.services import llm, pending  # noqa: E402
 CHAT = Chat(id=-1001, type="supergroup", title="Малышка")
 PRIVATE = Chat(id=222, type="private", first_name="Аня")
 AUTHOR = User(id=222, is_bot=False, first_name="Аня")
+# Имя бота нужно ссылке «добавить в группу» в гиде для лички
+ME = User(id=42, is_bot=True, first_name="Бот", username="BabyBot")
 
 
 class RecordingSession(BaseSession):
@@ -996,6 +998,9 @@ class RecordingSession(BaseSession):
     async def make_request(
         self, bot: Any, method: TelegramMethod[Any], timeout: int | None = None
     ) -> Any:
+        if isinstance(method, GetMe):
+            # Гид в личке собирает ссылку из имени бота
+            return ME
         payload = method.model_dump(exclude_none=True)
         self.methods.append(type(method).__name__)
         text = payload.get("text")
@@ -1218,14 +1223,19 @@ async def test_a_voice_reaches_its_router(wired):
 
 
 @pytest.mark.asyncio
-async def test_a_voice_in_private_gets_the_refusal(wired):
-    """В личке работает `common`, и он стоит первым — до голоса дело не доходит."""
+async def test_a_voice_in_private_gets_the_guide(wired):
+    """В личке работает `common`, и он стоит первым — до голоса дело не доходит.
+
+    Отказ стал гидом, но свойство осталось тем же и проверяется тем же: голос
+    в личке не разбирается вовсе, то есть ни одна реплика из лички не уходит в
+    чужой API.
+    """
     wired.transcribes("покормила 20 минут левой")
     wired.parses(_result(_feed_record()))
 
     await wired.speak(private=True)
 
-    assert texts.PRIVATE_ONLY in wired.talk.blob
+    assert texts.PRIVATE_GUIDE in wired.talk.blob
     assert wired.parsed == []
 
 

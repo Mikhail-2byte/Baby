@@ -65,6 +65,42 @@ class UndoCB(CallbackData, prefix="undo"):
     row_id: int
 
 
+class RecordCB(CallbackData, prefix="rec"):
+    """Правка уже сделанной записи: список, карточка, сдвиг времени, вид.
+
+    Полей девять, и это самый широкий класс проекта — шире `CheckinCB`. Все
+    девять используются с первого дня: запасных «на потом» здесь нет по той же
+    причине, что у `VoiceCB`, а добавить их потом нельзя — старые кнопки в
+    истории чата перестанут распаковываться. Поэтому они заведены сразу.
+    Худший `pack()` укладывается в 64 байта с запасом, и это проверяет тест.
+
+    `what`: `e` — событие, `m` — измерение. Таблицы разные, а id в них
+    пересекаются — та же развилка, что у `UndoCB`.
+
+    `action` различает `open` и `card` не для полноты: первое правит то
+    сообщение, под которым нажали, второе присылает новое. Кнопка «Поправить»
+    живёт под подтверждением записи, а подтверждение — это общий журнал семьи;
+    превратив его в экран настроек, мы стёрли бы то, ради чего подтверждения
+    вообще уходят отдельными сообщениями.
+
+    `mins` — **накопленный** сдвиг, а не примененный: экран сдвига времени
+    держит черновик в собственных кнопках и пишет в базу только по «Готово».
+
+    `day` — суток назад от **момента нажатия**, как `CheckinCB.back`. Вшитая
+    дата у кнопки, живущей в истории вечно, завтра соврала бы.
+    """
+
+    action: str
+    what: str = "e"
+    row_id: int = 0
+    field: str = ""
+    kind: str = ""
+    side: str = ""
+    mins: int = 0
+    day: int = 0
+    page: int = 0
+
+
 class StatsCB(CallbackData, prefix="st"):
     period: str
 
@@ -105,6 +141,22 @@ class EditCB(CallbackData, prefix="edit"):
     """
 
     field: str
+
+
+class StartCB(CallbackData, prefix="new"):
+    """Кнопка «Завести карточку» под приветствием в группе.
+
+    Отдельный класс, а не `EditCB`: тот про правку уже заведённой карточки, а
+    это первый шаг новой семьи. Сценарии разные, и классы обязаны стареть
+    независимо — см. докстроку модуля.
+
+    Поле одно, и оно есть, хотя значение пока единственное. Пустой класс
+    пришлось бы расширять **полем**, а от нового поля старые кнопки в истории
+    чата перестают распаковываться; новое **значение** их не трогает. Так уже
+    было с `UndoCB.what="reopen"`.
+    """
+
+    action: str
 
 
 class RemindCB(CallbackData, prefix="rmd"):
@@ -206,6 +258,56 @@ def home() -> ReplyKeyboardMarkup:
     )
 
 
+# Права, которые просим отметить на экране добавления бота в группу. Ровно те
+# два, которые бот умеет использовать: закрепление панели (`panel._pin`) и
+# уборка нажатий постоянной клавиатуры (`sending.delete_one`). Просить больше
+# значило бы просить впрок — а человек видит этот список в ту секунду, когда
+# решает, доверять боту или нет.
+ADD_RIGHTS = "pin_messages+delete_messages"
+
+
+def add_to_group(username: str) -> InlineKeyboardMarkup:
+    """Единственная кнопка проекта со ссылкой, а не с `callback_data`.
+
+    `?startgroup=true` — механизм самого Telegram: клиент открывает выбор
+    группы и добавляет бота туда. `&admin=` заодно отмечает галочки прав, то
+    есть превращает пункт инструкции «сделайте администратором» в уже сделанное
+    действие. Клиент, который параметр проигнорирует, ничего не ломает: о
+    правах попросит приветствие в группе, а потом один раз напомнит мастер.
+
+    У `url`-кнопки нет обработчика, и это её главное свойство здесь: она не
+    стареет в истории чата и не может молча ничего не сделать.
+
+    Запреты, записанные выше для меток постоянной клавиатуры — без U+FE0F и без
+    слов из `redflags.yaml`, — к этой подписи **не относятся**: подпись
+    inline-кнопки видят только глаза, обратно в бота она не возвращается.
+    """
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="➕ Добавить в группу",
+                    url=f"https://t.me/{username}?startgroup=true&admin={ADD_RIGHTS}",
+                )
+            ]
+        ]
+    )
+
+
+def start_card() -> InlineKeyboardMarkup:
+    """Вход в мастер `/baby` из приветствия — чтобы первый шаг был одним тапом."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="👶 Завести карточку",
+                    callback_data=StartCB(action="baby").pack(),
+                )
+            ]
+        ]
+    )
+
+
 def panel(*, running_kind: str | None) -> InlineKeyboardMarkup:
     """Главная клавиатура. Вид зависит от того, идёт ли таймер.
 
@@ -291,6 +393,19 @@ def panel(*, running_kind: str | None) -> InlineKeyboardMarkup:
     return builder.as_markup()
 
 
+def _fix_button(what: str, row_id: int) -> InlineKeyboardButton:
+    """«Поправить» под подтверждением: короткий путь в карточку записи.
+
+    Второй вход в правку существует рядом со списком не для симметрии. Список
+    нужен утром, когда подтверждение уехало вверх; эта кнопка — тому, кто
+    заметил промах в ту же секунду, и ему искать сводку незачем.
+    """
+    return InlineKeyboardButton(
+        text="✏️ Поправить",
+        callback_data=RecordCB(action="card", what=what, row_id=row_id).pack(),
+    )
+
+
 def running(kind: str, *, row_id: int | None = None) -> InlineKeyboardMarkup:
     """«Закончить» под сообщением о начатом таймере, рядом с отменой.
 
@@ -307,6 +422,11 @@ def running(kind: str, *, row_id: int | None = None) -> InlineKeyboardMarkup:
 
     `row_id` необязателен: у карточки голосового отменять нечего — она правится
     на месте, и записи под ней не одна.
+
+    «Поправить» идёт вторым рядом, а не третьей кнопкой в первом: ряд из трёх
+    Telegram на телефоне режет, и это уже замерено на панели. Нужна она здесь
+    ровно за тем, за чем заведена правка вообще, — «начали в 23:40» бывает
+    неправдой, когда кнопку нажали через полчаса после начала.
     """
     row = [
         InlineKeyboardButton(
@@ -314,14 +434,18 @@ def running(kind: str, *, row_id: int | None = None) -> InlineKeyboardMarkup:
             callback_data=TrackCB(action="stop", kind=kind).pack(),
         )
     ]
-    if row_id is not None:
-        row.append(
-            InlineKeyboardButton(
-                text="↩️ Отменить",
-                callback_data=UndoCB(what="event", row_id=row_id).pack(),
-            )
+    if row_id is None:
+        return InlineKeyboardMarkup(inline_keyboard=[row])
+
+    row.append(
+        InlineKeyboardButton(
+            text="↩️ Отменить",
+            callback_data=UndoCB(what="event", row_id=row_id).pack(),
         )
-    return InlineKeyboardMarkup(inline_keyboard=[row])
+    )
+    return InlineKeyboardMarkup(
+        inline_keyboard=[row, [_fix_button("e", row_id)]]
+    )
 
 
 def stopped(row_id: int) -> InlineKeyboardMarkup:
@@ -335,6 +459,11 @@ def stopped(row_id: int) -> InlineKeyboardMarkup:
     терял весь сон.
 
     Отсюда и порядок: сперва то, что чинит промах, потом то, что стирает.
+
+    Третий случай — «закончили, но не тогда»: таймер шёл, пока его не
+    выключили, и настоящий конец был часом раньше. Возврат хода тут не лечит
+    ничего, удаление стирает весь сон, а «✏️ Поправить» ведёт прямо на сдвиг
+    времени. Ряд свой, потому что ряд из трёх Telegram режет.
     """
     return InlineKeyboardMarkup(
         inline_keyboard=[
@@ -347,7 +476,8 @@ def stopped(row_id: int) -> InlineKeyboardMarkup:
                     text="🗑 Удалить запись",
                     callback_data=UndoCB(what="event", row_id=row_id).pack(),
                 ),
-            ]
+            ],
+            [_fix_button("e", row_id)],
         ]
     )
 
@@ -357,6 +487,10 @@ def undo(what: str, row_id: int) -> InlineKeyboardMarkup:
 
     Отмена нужна чаще, чем кажется: тап мимо в темноте — обычное дело, а
     «лишнее кормление» в статистике недели искажает её заметно.
+
+    Рядом «✏️ Поправить»: промах бывает не только лишней записью, но и записью
+    не того вида и не в то время, — а удалять и заводить заново значит терять
+    и то, что было верно.
     """
     return InlineKeyboardMarkup(
         inline_keyboard=[
@@ -364,7 +498,8 @@ def undo(what: str, row_id: int) -> InlineKeyboardMarkup:
                 InlineKeyboardButton(
                     text="↩️ Отменить",
                     callback_data=UndoCB(what=what, row_id=row_id).pack(),
-                )
+                ),
+                _fix_button("m" if what == "measure" else "e", row_id),
             ]
         ]
     )
@@ -626,6 +761,16 @@ def checkin_hours(choices: Sequence[int]) -> InlineKeyboardMarkup:
 
 
 def stats() -> InlineKeyboardMarkup:
+    """Переключатель периода под сводкой — и вход в список записей.
+
+    «Записи» стоят вторым рядом, а не четвёртой кнопкой в первом: там уже три
+    подписи, и четвёртая упёрлась бы ровно в тот замер, из-за которого панель
+    держит по две кнопки в ряду.
+
+    Вход в правку живёт здесь потому, что сводка — единственный экран, куда
+    ведёт один тап с постоянной клавиатуры. «📊 Сутки» → «📋 Записи» — два
+    тапа, и это единственный путь к записи, которая уже уехала из ленты.
+    """
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
@@ -638,6 +783,339 @@ def stats() -> InlineKeyboardMarkup:
                 InlineKeyboardButton(
                     text="Месяц", callback_data=StatsCB(period="month").pack()
                 ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="📋 Записи", callback_data=RecordCB(action="list").pack()
+                )
+            ],
+        ]
+    )
+
+
+# --- Правка записей -------------------------------------------------------
+
+
+def records(
+    rows: Sequence[tuple[int, str, int]],
+    *,
+    day: int,
+    page: int,
+    earlier: bool,
+    later: bool,
+    back_day: bool,
+    forward_day: bool,
+) -> InlineKeyboardMarkup:
+    """Номера записей за сутки, листание страниц и переход по дням.
+
+    Кнопки — голые номера, а не подписи видов: подпись уже напечатана строкой
+    выше, и повторять её значит потерять ряд на то, что человек только что
+    прочитал.
+
+    По четыре в ряду, и это **названное исключение** из правила «не больше
+    двух». Замер, из-за которого панель держит по две, был про обрезанные
+    подписи — «Сцеживание» превращалось в «Сцеж…». Цифру Telegram не режет, а
+    двенадцать номеров по двое дали бы шесть рядов вместо трёх. То же решение,
+    что у `checkin_how_long`, где длительности идут по четыре.
+
+    «Позже» при сегодняшнем дне не рисуется: кнопка, ведущая в пустоту, — это
+    клампинг молчанием. «⬅️ К сводке» уводит через `StatsCB`, а не через свой
+    экран: это тот же обработчик, что у переключателя периода.
+    """
+    builder = InlineKeyboardBuilder()
+    for number, what, row_id in rows:
+        builder.button(
+            text=str(number),
+            callback_data=RecordCB(
+                action="open", what=what, row_id=row_id, day=day, page=page
+            ),
+        )
+    builder.adjust(4)
+
+    pages = []
+    if earlier:
+        pages.append(
+            InlineKeyboardButton(
+                text="⬆️ Раньше",
+                callback_data=RecordCB(action="list", day=day, page=page - 1).pack(),
+            )
+        )
+    if later:
+        pages.append(
+            InlineKeyboardButton(
+                text="⬇️ Позже",
+                callback_data=RecordCB(action="list", day=day, page=page + 1).pack(),
+            )
+        )
+    if pages:
+        builder.row(*pages)
+
+    days = []
+    if back_day:
+        days.append(
+            InlineKeyboardButton(
+                text="⬅️ Днём раньше",
+                callback_data=RecordCB(action="list", day=day + 1).pack(),
+            )
+        )
+    if forward_day:
+        days.append(
+            InlineKeyboardButton(
+                text="Днём позже ➡️",
+                callback_data=RecordCB(action="list", day=day - 1).pack(),
+            )
+        )
+    if days:
+        builder.row(*days)
+
+    builder.row(
+        InlineKeyboardButton(
+            text="⬅️ К сводке", callback_data=StatsCB(period="today").pack()
+        )
+    )
+    return builder.as_markup()
+
+
+def record_card(
+    *,
+    what: str,
+    row_id: int,
+    day: int,
+    page: int,
+    fields: Sequence[str] = (),
+    value: bool = False,
+    kinds: bool = False,
+    delete: bool = True,
+) -> InlineKeyboardMarkup:
+    """Что можно сделать с этой записью.
+
+    Все флаги считает хендлер: доступность зависит от вида, от того, идёт ли
+    таймер, и от того, не точка ли это веса при рождении, — то есть от базы,
+    про которую клавиатура не знает ничего.
+
+    Кнопки, которой нельзя воспользоваться, здесь не бывает вовсе. Серой
+    заглушки Telegram не умеет, а «нажал — ничего не произошло» читается как
+    поломка бота: то же правило, по которому метка постоянной клавиатуры
+    обязана иметь действие.
+    """
+    builder = InlineKeyboardBuilder()
+
+    titles = {"s": "🕐 Начало", "e": "🕐 Конец", "t": "🕐 Время"}
+    times = [
+        InlineKeyboardButton(
+            text=titles[field],
+            callback_data=RecordCB(
+                action="time",
+                what=what,
+                row_id=row_id,
+                field=field,
+                day=day,
+                page=page,
+            ).pack(),
+        )
+        for field in fields
+        if field in titles
+    ]
+    if times:
+        builder.row(*times)
+
+    second = []
+    if value:
+        second.append(
+            InlineKeyboardButton(
+                text="🍼 Объём",
+                callback_data=RecordCB(
+                    action="ml", what=what, row_id=row_id, day=day, page=page
+                ).pack(),
+            )
+        )
+    if kinds:
+        second.append(
+            InlineKeyboardButton(
+                text="✏️ Вид",
+                callback_data=RecordCB(
+                    action="kinds", what=what, row_id=row_id, day=day, page=page
+                ).pack(),
+            )
+        )
+    if second:
+        builder.row(*second)
+
+    last = []
+    if delete:
+        last.append(
+            InlineKeyboardButton(
+                text="🗑 Удалить",
+                callback_data=RecordCB(
+                    action="ask", what=what, row_id=row_id, day=day, page=page
+                ).pack(),
+            )
+        )
+    last.append(
+        InlineKeyboardButton(
+            text="⬅️ К списку",
+            callback_data=RecordCB(action="list", day=day, page=page).pack(),
+        )
+    )
+    builder.row(*last)
+    return builder.as_markup()
+
+
+def record_time(
+    steps: Sequence[tuple[int, str]],
+    *,
+    what: str,
+    row_id: int,
+    field: str,
+    mins: int,
+    day: int,
+    page: int,
+) -> InlineKeyboardMarkup:
+    """Черновик сдвига. Шаги приходят уже отфильтрованными.
+
+    Недопустимый шаг сюда не доезжает и кнопкой не становится — то же правило,
+    что у `services/checkin.durations_for`: клампинг молча поменял бы число,
+    которое человек назвал, а исчезнувшая кнопка видна.
+
+    Накопленный сдвиг едет в `mins` самих кнопок, и до «✅ Готово» в базе не
+    меняется ничего. Отсюда два следствия: брошенный посреди экран не стоит
+    ничего, а в общий чат уходит одно подтверждение на одно намерение, а не по
+    строке на каждый тап. При нулевом сдвиге «Готово» не рисуется: кнопка, не
+    делающая ничего, — та же несуществующая кнопка.
+    """
+    builder = InlineKeyboardBuilder()
+    for step, label in steps:
+        builder.button(
+            text=label,
+            callback_data=RecordCB(
+                action="shift",
+                what=what,
+                row_id=row_id,
+                field=field,
+                mins=mins + step,
+                day=day,
+                page=page,
+            ),
+        )
+    builder.adjust(3)
+
+    if mins:
+        builder.row(
+            InlineKeyboardButton(
+                text="✅ Готово",
+                callback_data=RecordCB(
+                    action="save",
+                    what=what,
+                    row_id=row_id,
+                    field=field,
+                    mins=mins,
+                    day=day,
+                    page=page,
+                ).pack(),
+            )
+        )
+    builder.row(
+        InlineKeyboardButton(
+            text="⬅️ Назад",
+            callback_data=RecordCB(
+                action="open", what=what, row_id=row_id, day=day, page=page
+            ).pack(),
+        )
+    )
+    return builder.as_markup()
+
+
+def record_kinds(
+    choices: Sequence[tuple[str, str, str]], *, row_id: int, day: int, page: int
+) -> InlineKeyboardMarkup:
+    """Чем эта запись могла быть на самом деле — зеркало панели.
+
+    По двое в ряд и в том же порядке, что на панели: промах «нажала не ту
+    кнопку» лечится нажатием той кнопки, которую имели в виду, а не выбором из
+    переупорядоченного списка. Поэтому же здесь есть и текущий вариант — ряд с
+    выпавшей кнопкой сбил бы узнавание раскладки.
+
+    Вид едет полной константой из `models`, а не номером в списке: номер
+    сдвинулся бы от перестановки, и вчерашняя кнопка «мокрый» записала бы
+    «стул». То же решение, что у `CheckinCB`.
+    """
+    builder = InlineKeyboardBuilder()
+    for kind, side, label in choices:
+        builder.button(
+            text=label,
+            callback_data=RecordCB(
+                action="setkind",
+                row_id=row_id,
+                kind=kind,
+                side=side,
+                day=day,
+                page=page,
+            ),
+        )
+    builder.adjust(2)
+    builder.row(
+        InlineKeyboardButton(
+            text="⬅️ Назад",
+            callback_data=RecordCB(
+                action="open", row_id=row_id, day=day, page=page
+            ).pack(),
+        )
+    )
+    return builder.as_markup()
+
+
+def record_delete(
+    *, what: str, row_id: int, day: int, page: int
+) -> InlineKeyboardMarkup:
+    """Спросить перед удалением — единственное необратимое действие правки.
+
+    Под свежим подтверждением «🗑 Удалить запись» спрашивать незачем: промах
+    лечится повторным тапом по панели, то же событие делается заново тем же
+    движением. До записи трёхдневной давности так не дотянуться, а номер в
+    списке легко перепутать с соседним.
+    """
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="🗑 Да, удалить",
+                    callback_data=RecordCB(
+                        action="del", what=what, row_id=row_id, day=day, page=page
+                    ).pack(),
+                ),
+                InlineKeyboardButton(
+                    text="⬅️ Нет",
+                    callback_data=RecordCB(
+                        action="open", what=what, row_id=row_id, day=day, page=page
+                    ).pack(),
+                ),
             ]
         ]
     )
+
+
+def record_fix(row_id: int, *, field: str = "") -> InlineKeyboardMarkup:
+    """Одна кнопка под сообщением тикера о закрытом им таймере.
+
+    Ради неё правка затевалась в первую очередь. «Забыла выключить» — это
+    ровно тот случай, о котором бот пишет **сам**, и починка обязана
+    начинаться прямо из его сообщения. До этой кнопки текст обещал «поправьте:
+    /today», и обработчика у обещания не было ни одного.
+
+    Действие `card`, а не `open`: сообщение тикера — свидетельство о том, что
+    таймер закрыли за семью, и затирать его экраном правки нельзя.
+    """
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="✏️ Поправить время",
+                    callback_data=RecordCB(
+                        action="card", what="e", row_id=row_id, field=field
+                    ).pack(),
+                )
+            ]
+        ]
+    )
+
+

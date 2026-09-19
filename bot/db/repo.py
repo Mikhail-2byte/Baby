@@ -118,6 +118,17 @@ async def set_panel(
     await session.commit()
 
 
+async def mark_greeted(session: AsyncSession, family: Family, moment: datetime) -> None:
+    """Запомнить, что бот в этом чате уже здоровался.
+
+    Момент приходит аргументом, а не берётся здесь: `repo` не знает, который
+    час, — это правило всего файла, и оно же позволяет ревизии проставить
+    отметку задним числом существующим семьям.
+    """
+    family.greeted_at = moment
+    await session.commit()
+
+
 async def set_checkin(
     session: AsyncSession, family: Family, hours: int, now: datetime
 ) -> None:
@@ -413,6 +424,86 @@ async def delete_event(session: AsyncSession, event: Event) -> None:
     await session.commit()
 
 
+# --- Правка событий -------------------------------------------------------
+#
+# Три узкие функции по имени намерения, а не одна широкая с «`None` — не
+# трогать», как у `update_child` и `update_measurement`. Причина не в чистоте:
+# правке вида нужно уметь **стирать** `value_num` и `side`, а общее соглашение
+# пришлось бы ломать sentinel-объектом ради одного вызывающего.
+#
+# Отсюда же второе: каждая пишет всё, чем владеет, — доктрина `set_panel`. У
+# функции, которая пишет поле «иногда», появляется состояние «не тронули», и
+# оно рано или поздно расходится с тем, что человек видел на экране.
+
+
+async def set_event_time(
+    session: AsyncSession,
+    event: Event,
+    *,
+    started_at: datetime,
+    ended_at: datetime | None,
+    estimated: bool,
+) -> Event:
+    """Время правит человек. Все три поля пишутся всегда.
+
+    Проверок правдоподобия здесь нет намеренно: границы зависят от дня
+    рождения ребёнка и от текущего момента, а `repo` не знает ни того, ни
+    другого. Судит `services/records.fits`, и судит дважды — рисуя кнопки и
+    принимая обратно то, что пришло с клиента.
+
+    `estimated` передаёт вызывающий, и это не лень. Пометка означает ровно
+    одно — конец назначил тикер, — поэтому правка **конца** её снимает, а
+    правка **начала** оставляет: конец от сдвинутого начала честнее не стал.
+    Политика эта про смысл операции, а не про строку в таблице, и живёт там
+    же, где инвариант «ровно один открытый таймер», — у вызывающего.
+    """
+    event.started_at = started_at
+    event.ended_at = ended_at
+    event.estimated = estimated
+    await session.commit()
+    return event
+
+
+async def set_event_kind(
+    session: AsyncSession,
+    event: Event,
+    *,
+    kind: str,
+    side: str | None,
+    value_num: float | None,
+) -> Event:
+    """Вид и всё, что от него зависит.
+
+    Сторона и число пишутся здесь же и всегда: оставленные от прежнего вида,
+    они дали бы «😴 Сон, 90 мл» — число, которое печатает выгрузка для
+    педиатра и не печатает ни один экран бота, то есть увидеть его было бы
+    нечем. Что именно переживает смену, решает `records.after_kind_change`.
+
+    `subtype` и `note` не трогаются: это слова человека из голосового разбора,
+    и стереть их молча было бы потерей, а не уборкой.
+    """
+    event.kind = kind
+    event.side = side
+    event.value_num = value_num
+    await session.commit()
+    return event
+
+
+async def set_event_value(
+    session: AsyncSession, event: Event, value_num: float | None
+) -> Event:
+    """Число у записи: миллилитры у бутылочки и сцеживания.
+
+    Заведена не только ради правки. До неё `handlers/measure.number_reply`
+    писал `event.value_num` напрямую — единственное место проекта, где событие
+    менялось в обход `repo`, и потому единственное, которого не видел ни один
+    сторож этого файла.
+    """
+    event.value_num = value_num
+    await session.commit()
+    return event
+
+
 async def get_event(session: AsyncSession, event_id: int) -> Event | None:
     return await session.get(Event, event_id)
 
@@ -599,6 +690,27 @@ async def get_measurement(
     session: AsyncSession, measurement_id: int
 ) -> Measurement | None:
     return await session.get(Measurement, measurement_id)
+
+
+async def measurements_between(
+    session: AsyncSession, child_id: int, start: datetime, end: datetime
+) -> list[Measurement]:
+    """Все измерения ребёнка за полуинтервал [start, end), любого вида.
+
+    Соседка `measurements` фильтрует по одному виду и окна не знает вовсе —
+    она собирает график. Здесь нужен день целиком: список записей показывает
+    взвешивание вперемешку с кормлениями, в том порядке, в каком они были.
+    """
+    result = await session.scalars(
+        select(Measurement)
+        .where(
+            Measurement.child_id == child_id,
+            Measurement.taken_at >= start,
+            Measurement.taken_at < end,
+        )
+        .order_by(Measurement.taken_at)
+    )
+    return list(result)
 
 
 # --- Напоминания ----------------------------------------------------------

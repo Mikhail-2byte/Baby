@@ -19,7 +19,7 @@ import pytest
 from aiogram import Bot, Dispatcher
 from aiogram.client.session.base import BaseSession
 from aiogram.exceptions import TelegramBadRequest
-from aiogram.methods import DeleteMessage, TelegramMethod
+from aiogram.methods import DeleteMessage, GetMe, TelegramMethod
 from aiogram.types import (
     CallbackQuery,
     Chat,
@@ -39,7 +39,10 @@ from bot.middlewares import drop_wizard_state
 from bot.services import pending
 
 CHAT = Chat(id=-1001, type="supergroup", title="Малышка")
+PRIVATE = Chat(id=222, type="private", first_name="Аня")
 AUTHOR = User(id=222, is_bot=False, first_name="Аня")
+# Имя бота нужно ссылке «добавить в группу»: она собирается из `bot.me()`
+ME = User(id=42, is_bot=True, first_name="Бот", username="BabyBot")
 NOW = datetime(2026, 9, 13, 12, 0)
 
 
@@ -139,6 +142,10 @@ class RecordingSession(BaseSession):
     async def make_request(
         self, bot: Any, method: TelegramMethod[Any], timeout: int | None = None
     ) -> Any:
+        if isinstance(method, GetMe):
+            # Гид в личке собирает ссылку из имени бота. Без этой ветки
+            # заглушка вернула бы `Message`, и падало бы на `.username`
+            return ME
         if isinstance(method, DeleteMessage):
             if self.refuse_delete:
                 raise TelegramBadRequest(
@@ -444,16 +451,77 @@ async def test_the_sex_prompt_keeps_its_buttons(wired):
 
 
 @pytest.mark.asyncio
-async def test_greeting_carries_the_keyboard(bot, family):
+async def test_greeting_carries_the_keyboard(bot, session, family):
     """Иначе до первой команды клавиатуры в чате нет вообще.
 
     Перенос `Family_planer/tests/test_registration.py:127` — там этот сторож
     стоит с самого начала, и ровно его отсутствие здесь стоило захода.
-    """
-    await common.bot_added(None, bot, family)
 
-    assert bot.sent == [(family.chat_id, texts.GREETING)]
+    Сообщений стало два, и сторож теперь именно про **первое**: носитель
+    клавиатуры не должен переехать на второе, где у сообщения своя
+    inline-кнопка и клавиатуре места нет вовсе.
+    """
+    await common.greet(bot, session, family, None, admin=True)
+
+    assert bot.sent[0] == (family.chat_id, texts.GREETING)
     assert bot.kwargs[0]["reply_markup"] == keyboards.home()
+
+
+@pytest.mark.asyncio
+async def test_the_greeting_offers_the_card_in_one_tap(bot, session, family):
+    """Первый шаг новой семьи — кнопка, а не набранная руками команда.
+
+    Второе сообщение отдельное не от щедрости: одно сообщение не носит
+    одновременно клавиатуру под полем ввода и inline-кнопку.
+    """
+    await common.greet(bot, session, family, None, admin=True)
+
+    assert len(bot.sent) == 2
+    assert bot.sent[1] == (family.chat_id, texts.FIRST_STEP)
+    markup = bot.kwargs[1]["reply_markup"]
+    packed = [b.callback_data for row in markup.inline_keyboard for b in row]
+    assert keyboards.StartCB(action="baby").pack() in packed
+
+
+@pytest.mark.asyncio
+async def test_the_greeting_skips_the_card_offer_when_the_child_exists(
+    bot, session, family, child
+):
+    """Бота вернули в чат, где ребёнок давно заведён.
+
+    Кнопка «Завести карточку» здесь объяснила бы только то, что нажимать её не
+    надо, — а приветствие с клавиатурой всё равно нужно: после изгнания
+    клавиатуры в чате нет.
+    """
+    await common.greet(bot, session, family, child, admin=True)
+
+    assert len(bot.sent) == 1
+    assert bot.sent[0] == (family.chat_id, texts.GREETING)
+
+
+@pytest.mark.asyncio
+async def test_the_greeting_says_nothing_about_rights_it_cannot_check(
+    bot, session, family, child
+):
+    """`admin=None` — «спросить не удалось», и на неуверенности молчим.
+
+    Мутация «считать `None` за отсутствие прав» красит этот тест: про права
+    всё равно напомнит мастер, а вот попрекнуть семью из-за сетевого сбоя —
+    поломка, которую никто не заметит.
+    """
+    await common.greet(bot, session, family, child, admin=None)
+
+    assert texts.ADMIN_WHY not in bot.sent[0][1]
+
+
+@pytest.mark.asyncio
+async def test_the_greeting_marks_the_family(bot, session, family, child):
+    """Без отметки опоздавшее приветствие повторялось бы на каждой реплике."""
+    assert family.greeted_at is None
+
+    await common.greet(bot, session, family, child, admin=True)
+
+    assert family.greeted_at is not None
 
 
 def test_telegram_is_asked_for_my_chat_member():
@@ -515,12 +583,129 @@ async def test_the_greeting_goes_out_when_the_bot_is_added(wired):
     месте.
     """
     dp, bot, talk, opened = wired
-    me = User(id=42, is_bot=True, first_name="Бот")
 
-    await dp.feed_update(bot, _joined(me, ChatMemberLeft(user=me), ChatMemberMember(user=me)))
+    await dp.feed_update(
+        bot, _joined(ME, ChatMemberLeft(user=ME), ChatMemberMember(user=ME))
+    )
 
-    assert texts.GREETING in talk.sent
+    assert talk.sent[0].startswith(texts.GREETING)
     assert keyboards.home() in talk.markups
+
+
+@pytest.mark.asyncio
+async def test_the_greeting_asks_for_rights_it_does_not_have(wired):
+    """Добавили обычным участником — просьба о правах едет с приветствием.
+
+    Одним сообщением, а не вторым: просьба не самостоятельная мысль, а
+    оговорка к «вот что я умею».
+    """
+    dp, bot, talk, opened = wired
+
+    await dp.feed_update(
+        bot, _joined(ME, ChatMemberLeft(user=ME), ChatMemberMember(user=ME))
+    )
+
+    assert texts.ADMIN_WHY in talk.sent[0]
+
+
+@pytest.mark.asyncio
+async def test_the_greeting_does_not_ask_for_rights_it_already_has(wired):
+    """Пришли по ссылке с `admin=` — бота добавили сразу администратором.
+
+    Просить в первом же слове то, что уже дали, значит выглядеть
+    невнимательным. Статус лежит в самом апдейте, спрашивать Telegram не надо.
+    """
+    dp, bot, talk, opened = wired
+
+    await dp.feed_update(bot, _joined(ME, ChatMemberLeft(user=ME), _admin(ME)))
+
+    assert talk.sent[0].startswith(texts.GREETING)
+    assert texts.ADMIN_WHY not in talk.sent[0]
+
+
+@pytest.mark.asyncio
+async def test_being_added_as_an_admin_is_not_thanked_twice(wired):
+    """Добавление сразу администратором — это знакомство, а не повышение.
+
+    Свойство видимое: человек получает «здравствуйте», а не «здравствуйте» и
+    «спасибо за права» подряд в первую же секунду.
+    """
+    dp, bot, talk, opened = wired
+
+    await dp.feed_update(bot, _joined(ME, ChatMemberLeft(user=ME), _admin(ME)))
+
+    assert texts.ADMIN_THANKS not in talk.sent
+
+
+@pytest.mark.asyncio
+async def test_no_transition_is_claimed_twice():
+    """Два наблюдателя `my_chat_member` не должны пересекаться фильтрами.
+
+    Сторож против `PROMOTED_TRANSITION`, и написан он ровно так потому, что
+    поведенческий тест на два сообщения был бы зелёным и с ним: aiogram
+    останавливается на первом сошедшемся хендлере роутера, а `bot_added`
+    зарегистрирован выше. То есть молчание держалось бы на порядке
+    регистрации — на том, что в коде никак не выражено, и что следующий
+    читатель вправе поменять местами.
+
+    Проверяется поэтому не число сообщений, а само свойство: на каждый переход
+    претендует **не больше одного** хендлера. `PROMOTED_TRANSITION` красит этот
+    тест на `left → administrator`, то есть на обычном добавлении по нашей же
+    ссылке с `admin=`.
+
+    Фильтры берутся боевые, из `common.router`, а не собранные здесь заново:
+    собранные доказывали бы, что механизм работает, и молчали бы о том, что
+    зарегистрировано на самом деле.
+    """
+    observer = common.router.my_chat_member
+    transitions = {
+        "добавили участником": (ChatMemberLeft(user=ME), ChatMemberMember(user=ME)),
+        "добавили администратором": (ChatMemberLeft(user=ME), _admin(ME)),
+        "повысили": (ChatMemberMember(user=ME), _admin(ME)),
+        "поправили права": (_admin(ME), _admin(ME)),
+    }
+
+    for label, (old, new) in transitions.items():
+        event = ChatMemberUpdated(
+            chat=CHAT, from_user=AUTHOR, date=NOW,
+            old_chat_member=old, new_chat_member=new,
+        )
+        matched = []
+        for handler in observer.handlers:
+            if all([await check.call(event) for check in handler.filters or []]):
+                matched.append(handler.callback.__name__)
+        assert len(matched) <= 1, (label, matched)
+
+
+@pytest.mark.asyncio
+async def test_a_promotion_is_thanked_and_repins_the_panel(wired):
+    """Права дали потом — говорим спасибо и выпускаем панель заново.
+
+    Именно заново: `_pin` приватна и зовётся только из `_publish`, а правка на
+    месте до закрепления не доходит вовсе. То есть без `force_new` панель
+    осталась бы незакреплённой при уже выданных правах.
+    """
+    dp, bot, talk, opened = wired
+
+    await dp.feed_update(bot, _joined(ME, ChatMemberMember(user=ME), _admin(ME)))
+
+    assert texts.ADMIN_THANKS in talk.sent
+    assert opened and opened[-1]["force_new"] is True
+
+
+@pytest.mark.asyncio
+async def test_rights_toggled_twice_are_thanked_once(wired):
+    """`administrator → administrator` Telegram шлёт на каждую правку прав.
+
+    Поэтому переход берётся `MEMBER >> ADMINISTRATOR`, а не
+    `IS_MEMBER >> IS_ADMIN`: во второй `IS_MEMBER` включает `ADMINISTRATOR`, и
+    благодарность повторялась бы на каждом щелчке галочки в настройках чата.
+    """
+    dp, bot, talk, opened = wired
+
+    await dp.feed_update(bot, _joined(ME, _admin(ME), _admin(ME)))
+
+    assert texts.ADMIN_THANKS not in talk.sent
 
 
 @pytest.mark.asyncio
@@ -533,11 +718,10 @@ async def test_the_greeting_ignores_promotion(wired):
     «стал участником».
     """
     dp, bot, talk, opened = wired
-    me = User(id=42, is_bot=True, first_name="Бот")
 
-    await dp.feed_update(bot, _joined(me, ChatMemberMember(user=me), _admin(me)))
+    await dp.feed_update(bot, _joined(ME, ChatMemberMember(user=ME), _admin(ME)))
 
-    assert texts.GREETING not in talk.sent
+    assert not any(line.startswith(texts.GREETING) for line in talk.sent)
 
 
 @pytest.mark.asyncio

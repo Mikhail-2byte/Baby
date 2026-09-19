@@ -210,6 +210,7 @@ async def undo(
     session: AsyncSession,
     bot: Bot,
     family: Family,
+    child: Child | None,
 ) -> None:
     """Отменить только что сделанное: удалить запись или вернуть таймеру ход.
 
@@ -221,19 +222,27 @@ async def undo(
     «сна не было»; до этой ветки под ответом об окончании стояла одна кнопка
     отмены, и она стирала весь сон целиком — то есть лечила промах потерей.
     """
-    if callback_data.what == "reopen":
-        await _reopen(call, callback_data.row_id, session, bot, family)
+    if child is None:
+        await call.answer(texts.NO_CHILD, show_alert=True)
         return
 
+    if callback_data.what == "reopen":
+        await _reopen(call, callback_data.row_id, session, bot, family, child)
+        return
+
+    # `row_id` приходит с клиента, а id сквозные по всей базе: без сверки с
+    # ребёнком чат, знающий номер, стирал бы чужой дневник. Долго это было
+    # почти теорией — пока экран правки не начал раздавать номера записей в
+    # чат пачками
     if callback_data.what == "event":
         event = await repo.get_event(session, callback_data.row_id)
-        found = event is not None
-        if event is not None:
+        found = event is not None and event.child_id == child.id
+        if found and event is not None:
             await repo.delete_event(session, event)
     else:
         measurement = await repo.get_measurement(session, callback_data.row_id)
-        found = measurement is not None
-        if measurement is not None:
+        found = measurement is not None and measurement.child_id == child.id
+        if found and measurement is not None:
             await repo.delete_measurement(session, measurement)
 
     if not found:
@@ -254,6 +263,7 @@ async def _reopen(
     session: AsyncSession,
     bot: Bot,
     family: Family,
+    child: Child,
 ) -> None:
     """Вернуть ход закрытому таймеру.
 
@@ -263,7 +273,7 @@ async def _reopen(
     кормление, спохватились про сон.
     """
     event = await repo.get_event(session, row_id)
-    if event is None or event.ended_at is None:
+    if event is None or event.child_id != child.id or event.ended_at is None:
         # Запись уже удалили или таймер уже вернули — второй тап по той же кнопке
         await call.answer(texts.NOTHING_TO_UNDO, show_alert=True)
         return
