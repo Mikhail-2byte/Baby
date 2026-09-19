@@ -217,6 +217,11 @@ async def _answer(question: str) -> Result:
         # пропустили в модель — единственное, по чему судят о воротах
         sources=[chunk.source_id for chunk in chunks],
         coverage=round(chunks[0].coverage, 2),
+        # Сколько из найденного назвал смысл, а не слова. Без этого числа по
+        # логу не отличить «плотный поиск промолчал» от «его не было вовсе»:
+        # провайдер векторов может лежать неделю, и снаружи это выглядит как
+        # поиск, который просто стал хуже отвечать
+        dense=sum(1 for chunk in chunks if chunk.by_meaning),
         model=reply.model,
         detail=reply.detail[:160],
         calls=reply.calls,

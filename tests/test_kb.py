@@ -11,8 +11,8 @@ import sqlite3
 import pytest
 
 from bot.config import settings
+from bot.services import embed, morph
 from bot.services import kb as search
-from bot.services import morph
 from kb import build_kb
 
 
@@ -776,3 +776,280 @@ def test_a_paragraph_of_solid_names_is_dropped():
         "Тутельян В. А., Бушуева Т. В. Диетотерапия при патологии обмена."
     )
     assert build_kb._is_credits(text)
+
+
+# --- Плотный поиск ----------------------------------------------------------
+#
+# Все тесты ниже идут через `_big_kb` по той же причине, что и сторожи
+# молчания: при `total < MIN_CORPUS` частотные пороги выключены, и половина
+# отбора не работает вовсе.
+#
+# Векторы здесь выдуманные и проставляются руками. Настоящая модель сюда не
+# тянется по той же причине, по которой не тянутся настоящие PDF, и по второй:
+# это сеть. Autouse-фикстура `_no_embeddings` в `conftest.py` держит плотный
+# поиск выключенным, и каждый тест включает его себе сам.
+
+
+# Имя модели, которым подписана выдуманная база. Совпадать с настройкой оно
+# обязано: иначе сверка в `_vectors` выключит плотный поиск, и тесты станут
+# зелёными ни о чём
+_MODEL = "проверочная"
+
+
+def _with_vectors(tmp_path, monkeypatch, vectors: dict[int, list[float]], dims: int = 3) -> None:
+    """Дописать в собранную базу векторы — тем же путём, каким их пишет сборщик.
+
+    Не через `write_db`: там вектор считается моделью, а нам нужно назначить
+    его руками, чтобы знать порядок выдачи заранее.
+    """
+    import array
+
+    connection = sqlite3.connect(tmp_path / "kb.db")
+    for chunk_id, raw in vectors.items():
+        ready = embed.normalise(raw)
+        assert ready is not None
+        connection.execute(
+            "INSERT OR REPLACE INTO vectors VALUES (?, ?)",
+            (chunk_id, array.array("f", ready).tobytes()),
+        )
+    connection.execute("INSERT OR REPLACE INTO meta VALUES ('embed_model', ?)", (_MODEL,))
+    connection.execute("INSERT OR REPLACE INTO meta VALUES ('embed_dims', ?)", (str(dims),))
+    connection.commit()
+    connection.close()
+    search.close()
+
+
+def _turn_dense_on(monkeypatch, vector: list[float] | None) -> None:
+    """Включить плотный поиск с заранее известным вектором вопроса."""
+    monkeypatch.setattr(settings, "embed_model", _MODEL)
+    monkeypatch.setattr(settings, "embed_key", "есть")
+
+    async def fake(_text: str) -> list[float] | None:
+        return embed.normalise(vector) if vector else None
+
+    monkeypatch.setattr(search.embed, "vector", fake)
+
+
+@pytest.mark.asyncio
+async def test_without_a_key_the_search_behaves_exactly_as_before(tmp_path, monkeypatch):
+    """Нет ключа — нет плотной выдачи, и поиск такой же, каким был.
+
+    Это контракт проекта про пустой `.env`. Сторож физический — подменяем
+    сам HTTP-клиент, то есть границу сети, а не `embed.vector`: вторая проверка
+    осталась бы зелёной, если бы запрос ушёл в обход модуля.
+
+    Рвать `socket.socket`, как это делает сторож триажа, здесь нельзя: поиск
+    асинхронный, а цикл событий на Windows держит себя на socketpair и
+    умирает вместе с ним. Тот сторож синхронный, и там это законно.
+    """
+    _big_kb(tmp_path, monkeypatch, _about("желтуха", "билирубин"))
+    monkeypatch.setattr(settings, "embed_model", "")
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("поиск полез в сеть без ключа")
+
+    monkeypatch.setattr(search.embed.httpx, "AsyncClient", forbidden)
+    assert await search.search("желтуха билирубин")
+
+
+@pytest.mark.asyncio
+async def test_a_fragment_found_only_by_meaning_reaches_the_answer(tmp_path, monkeypatch):
+    """Фрагмент, не прошедший порог покрытия, доезжает через смысл.
+
+    Живой случай 18.09.2026, ради которого весь заход и затевался: вопрос про
+    ланолин нашёл верный абзац и был отброшен с покрытием 0.40 при пороге 0.5.
+    До модели он не дошёл вовсе — в `data/qa.log` стоит `calls: 0`.
+
+    База здесь устроена так, чтобы воспроизвести именно ЭТУ причину отказа, а
+    не соседнюю. Значимых слов пять: одно незнакомое (мазать) и четыре
+    знакомых. Незнакомых меньше, чем знакомых, — значит ворота вопроса вопрос
+    пропускают, и дело действительно доходит до покрытия. А верный фрагмент
+    содержит только два слова из пяти, то есть ровно 0.40.
+
+    Без этой арифметики тест был бы зелёным по чужой причине: при двух
+    незнакомых словах вопрос гасят ворота счёта, и покрытие не считается
+    вообще никогда.
+    """
+    _big_kb(
+        tmp_path,
+        monkeypatch,
+        _about("сосок", "кормление") + _about("пеленка") + _about("подгузник"),
+    )
+    question = "мазать сосок кормление пеленка подгузник"
+    connection = search._open()
+    assert connection is not None
+    known, unknown, anchors = search._significant(connection, morph.stems(question))
+    assert len(unknown) < len(known), "иначе вопрос гасят ворота счёта, а не покрытие"
+    assert anchors, "иначе выдача пуста оттого, что искать было нечем"
+
+    wanted = connection.execute(
+        "SELECT id FROM chunks WHERE text LIKE '%сосок%' ORDER BY id LIMIT 1"
+    ).fetchone()[0]
+
+    # Сначала — что лексика этот вопрос действительно теряет, и теряет по
+    # покрытию: верный фрагмент среди кандидатов есть, но не проходит порог
+    monkeypatch.setattr(settings, "embed_model", "")
+    assert await search.search(question) == []
+
+    _with_vectors(tmp_path, monkeypatch, {wanted: [1.0, 0.0, 0.0]})
+    _turn_dense_on(monkeypatch, [1.0, 0.0, 0.0])
+    found = await search.search(question)
+    assert [chunk.id for chunk in found] == [wanted]
+
+
+@pytest.mark.asyncio
+async def test_the_question_gate_still_silences_a_foreign_question(tmp_path, monkeypatch):
+    """Ворота вопроса стоят ДО обеих выдач, и плотная их не отменяет.
+
+    Плотный поиск молчать не умеет — ближайший по смыслу кусок найдётся для
+    чего угодно. Стой он выше ворот, «как поменять масло в машине» получило бы
+    уверенный ответ абзацем из клинических рекомендаций.
+    """
+    _big_kb(tmp_path, monkeypatch, _about("масло"))
+    assert _is_anchored("масло"), "иначе тест зелёный по чужой причине"
+    _with_vectors(tmp_path, monkeypatch, {1: [1.0, 0.0, 0.0], 2: [0.9, 0.1, 0.0]})
+    _turn_dense_on(monkeypatch, [1.0, 0.0, 0.0])
+    assert await search.search("как поменять масло в машине") == []
+
+
+def test_a_base_embedded_by_another_model_turns_dense_off(tmp_path, monkeypatch):
+    """Векторы чужой модели лежат в другом пространстве.
+
+    Косинус между ними считается без всякой ошибки и даёт осмысленно
+    выглядящий мусор. Это опаснее чужой схемы: та роняет запрос, а эта тихо
+    меняет ответы. Значит — выключаемся, а не «как-нибудь ищем».
+    """
+    _big_kb(tmp_path, monkeypatch, _about("желтуха", "билирубин"))
+    _with_vectors(tmp_path, monkeypatch, {1: [1.0, 0.0, 0.0]})
+    monkeypatch.setattr(settings, "embed_model", "совсем другая")
+    monkeypatch.setattr(settings, "embed_key", "есть")
+    connection = search._open()
+    assert connection is not None
+    assert search._dense(connection, [1.0, 0.0, 0.0]) == []
+
+
+def test_a_vector_of_another_length_is_refused(tmp_path, monkeypatch):
+    """Длина вектора вопроса обязана совпасть с длиной в базе.
+
+    Та же беда, что с чужой моделью, но приезжает другим путём: имя модели
+    оставили, а размерность сменили. Умножение упало бы исключением внутри
+    потока — то есть апдейт потерялся бы навсегда.
+    """
+    _big_kb(tmp_path, monkeypatch, _about("желтуха", "билирубин"))
+    _with_vectors(tmp_path, monkeypatch, {1: [1.0, 0.0, 0.0]})
+    _turn_dense_on(monkeypatch, None)
+    connection = search._open()
+    assert connection is not None
+    assert search._dense(connection, [1.0, 0.0]) == []
+
+
+@pytest.mark.asyncio
+async def test_both_lists_are_fused_not_appended(tmp_path, monkeypatch):
+    """Это слияние мест, а не приклеенный хвост.
+
+    Приклеенный хвост выглядел бы так же на глаз: обе выдачи в ответе есть.
+    Разница видна только на фрагменте, который назвали обе, — при слиянии он
+    обязан обойти тех, кого назвала одна.
+    """
+    _big_kb(tmp_path, monkeypatch, _about("желтуха", "билирубин"))
+    connection = search._open()
+    assert connection is not None
+    rows = [
+        row[0]
+        for row in connection.execute(
+            "SELECT id FROM chunks WHERE text LIKE '%желтуха%' ORDER BY id"
+        )
+    ]
+    assert len(rows) >= 2, "иначе сливать нечего и тест ни о чём"
+    both = rows[1]
+
+    # Вектор есть только у `both`, то есть плотная выдача состоит из него
+    # одного. Лексика ставит первым `lexical_first`. Названный обеими обязан
+    # обойти названного одной — при склейке списков он остался бы вторым.
+    #
+    # Симметричная расстановка (обе выдачи называют обоих, в обратном порядке)
+    # для этого не годится: RRF складывает одни и те же места крест-накрест,
+    # счета выходят равными, и порядок решает разрыв ничьей, а не слияние
+    _with_vectors(tmp_path, monkeypatch, {both: [1.0, 0.0, 0.0]})
+    _turn_dense_on(monkeypatch, [1.0, 0.0, 0.0])
+    found = [chunk.id for chunk in await search.search("желтуха билирубин", k=5)]
+    assert found[0] == both, f"слияние не сработало: {found}"
+
+
+def test_a_similarity_floor_cuts_the_dense_list(tmp_path, monkeypatch):
+    """Пол по косинусу — единственное, чем плотную выдачу можно приглушить.
+
+    Значение подбирается замером и лежит в `docs/TASKS.md`; здесь проверяется
+    только то, что ручка вообще соединена с механизмом.
+    """
+    _big_kb(tmp_path, monkeypatch, _about("желтуха", "билирубин"))
+    _with_vectors(tmp_path, monkeypatch, {1: [1.0, 0.0, 0.0], 2: [0.0, 1.0, 0.0]})
+    _turn_dense_on(monkeypatch, None)
+    connection = search._open()
+    assert connection is not None
+    monkeypatch.setattr(settings, "kb_min_similarity", 0.0)
+    assert len(search._dense(connection, [1.0, 0.0, 0.0])) == 2
+    monkeypatch.setattr(settings, "kb_min_similarity", 0.5)
+    assert search._dense(connection, [1.0, 0.0, 0.0]) == [1]
+
+
+def test_vectors_are_stored_normalised():
+    """Нормировка при записи, а не на запросе.
+
+    Иначе косинус в горячем пути требует деления на длину, и первый же
+    вызывающий, который об этом забудет, получит не ошибку, а другой порядок
+    выдачи. Вырожденный вектор при этом не нормируется вовсе: направления у
+    него нет, и в косинусе он давал бы ноль со всем на свете.
+    """
+    ready = embed.normalise([3.0, 4.0])
+    assert ready is not None
+    assert abs(sum(value * value for value in ready) - 1.0) < 1e-6
+    assert embed.normalise([0.0, 0.0]) is None
+
+
+@pytest.mark.asyncio
+async def test_one_unknown_word_against_one_known_is_not_a_foreign_question(
+    tmp_path, monkeypatch
+):
+    """Одно незнакомое слово против одного знакомого — ещё не чужой вопрос.
+
+    Ворота считают слова, а не запрещают незнакомые, и граница проходит по
+    строгому «больше», а не по «не меньше». Разница видна только на коротком
+    вопросе, у которого после отсева вопросительных и служебных слов осталось
+    одно знакомое.
+
+    Так и сломалось 19.09.2026, когда корпус вырос втрое: «новорождённый»
+    перевалил `kb_stopword_df` и выбыл как служебное слово, после чего
+    «почему у новорождённого желтеет кожа» осталось с одним знакомым словом
+    против одного незнакомого — и гасло ДО всякого поиска. Вместе с ним гасло
+    «зачем новорождённому колют витамин K».
+
+    Проверка арифметики стоит здесь не для красоты: без неё тест зеленел бы
+    при любом состоянии ворот, потому что слов в вопросе могло оказаться
+    сколько угодно.
+    """
+    _big_kb(tmp_path, monkeypatch, _about("желтуха", "билирубин"))
+    question = "желтуха покраснела"
+    connection = search._open()
+    assert connection is not None
+    known, unknown, _ = search._significant(connection, morph.stems(question))
+    assert len(known) == 1 and len(unknown) == 1, (
+        f"тест проверяет ровно случай 1:1, а вышло {len(known)}:{len(unknown)}"
+    )
+    assert await search.search(question), "ворота погасили вопрос, который знают"
+
+
+def test_a_heading_of_mojibake_is_not_a_heading():
+    """Подпись к диаграмме, набранная нестандартным шрифтом, — не заголовок.
+
+    PDF отдаёт её байтами cp1251, а читаются они как латиница-1: «килограммы»
+    приезжает как «êèëî ãðàì ì û». Буквы в этой строке есть, длина подходит,
+    кегль крупный — все прежние проверки она проходит. Заголовок печатается
+    человеку над цитатой и уезжает в шапку чанка, то есть портит и вид, и
+    поиск.
+    """
+    assert not build_kb._is_heading(_styled("êèëî ãðàì ì û", bold=True), body=9.0)
+    assert not build_kb._is_heading(_styled("1 ãî ä æèçí è", bold=True), body=9.0)
+    # Настоящие заголовки на обоих алфавитах остаются заголовками
+    assert build_kb._is_heading(_styled("Состояние молочных желез", bold=True), body=9.0)
+    assert build_kb._is_heading(_styled("Sleep-Related Infant Deaths", bold=True), body=9.0)

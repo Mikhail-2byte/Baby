@@ -29,6 +29,8 @@
 from __future__ import annotations
 
 import argparse
+import array
+import asyncio
 import re
 import sqlite3
 import sys
@@ -49,7 +51,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from bot.config import settings  # noqa: E402
-from bot.services import morph  # noqa: E402
+from bot.services import embed, morph  # noqa: E402
 
 MANIFEST = ROOT / "kb" / "sources.yaml"
 RAW = ROOT / "kb" / "raw" / "docs"
@@ -58,7 +60,7 @@ NORMALIZED = ROOT / "kb" / "normalized"
 # Версия схемы `kb.db`. Читается `services/kb.py` на открытии: база, собранная
 # прошлой версией скрипта, должна честно считаться отсутствующей, а не
 # отвечать на запросы по несуществующим колонкам
-SCHEMA_VERSION = "1"
+SCHEMA_VERSION = "2"
 
 # Границы чанка в знаках. Верхняя — чтобы фрагмент влезал и в сообщение, и в
 # окно будущей модели эмбеддингов; нижняя — чтобы «Приложение Б» из двух строк
@@ -224,6 +226,13 @@ _SERVICE = re.compile(
     re.IGNORECASE,
 )
 
+# Заголовок, в котором нет ни одного слова ни на одном из алфавитов, которыми
+# набран индекс. Так выглядит подпись к диаграмме, набранная нестандартным
+# шрифтом: PDF отдаёт её байтами cp1251, а читаются они как латиница-1, и
+# «килограммы» приезжает как «êèëî ãðàì ì û». Заголовок печатается человеку над
+# цитатой и уезжает в шапку чанка, то есть портит и вид, и поиск
+_REAL_WORD = re.compile(r"[А-Яа-яЁё]{3,}|[A-Za-z]{3,}")
+
 # Признаки записи из списка литературы. Ловим по тексту, а не по разделу:
 # заголовок «Список литературы» в PDF нередко теряется вовсе, а сама запись
 # узнаётся всегда — у неё есть либо двойной слэш, либо «et al.», либо том со
@@ -358,6 +367,8 @@ def _is_heading(line: _Line, body: float) -> bool:
     # Заголовок из трёх букв не бывает, а вот обрывок подписи к таблице («%»,
     # «мл/кг») — сплошь и рядом, и он уезжает шапкой в каждый чанк раздела
     if sum(character.isalpha() for character in line.text) < 3:
+        return False
+    if not _REAL_WORD.search(line.text):
         return False
     # Запись списка литературы и строка состава авторов начинаются с номера и
     # заглавной буквы, то есть проходят под `_NUMBERED`. Отсюда та самая
@@ -662,10 +673,44 @@ CREATE VIRTUAL TABLE chunks_fts USING fts5(
 -- Сколько фрагментов содержат основу. По этой таблице на запросе отбрасываются
 -- служебные слова: «сколько» и «можно» есть почти везде и значат почти ничего
 CREATE TABLE df(stem TEXT PRIMARY KEY, docs INTEGER NOT NULL);
+
+-- Вектор смысла фрагмента: `float32`, уже нормированный. Нормировка стоит при
+-- записи, а не на запросе, ровно затем, чтобы косинус в горячем пути был одним
+-- скалярным произведением. Таблица отдельная, а не колонка в `chunks`: база
+-- собирается и без ключа, и тогда её просто нет — а пустая колонка на каждой
+-- строке выглядела бы как «векторы есть, но битые»
+CREATE TABLE vectors(
+    chunk_id INTEGER PRIMARY KEY REFERENCES chunks(id),
+    vector   BLOB NOT NULL);
 """
 
 
-def write_db(path: Path, prepared: list[tuple[Source, list[Chunk]]]) -> None:
+def embed_all(prepared: list[tuple[Source, list[Chunk]]]) -> list[list[float]] | None:
+    """Векторы всех фрагментов в порядке обхода, или `None`, если не вышло.
+
+    Векторизуется тот же текст, что уходит в `stems`, — с названием документа
+    и путём заголовков. Contextual header prepending помогает смыслу ровно так
+    же, как словам: фрагмент «не ранее 6 месяцев» без шапки не про прикорм не
+    только по словам, но и по смыслу.
+
+    Порядок обхода здесь и в `write_db` обязан совпадать, и это единственное,
+    на чём шаг может сломаться тихо: перепутанные векторы дадут поиск, который
+    уверенно отвечает чужим фрагментом. Поэтому оба обхода — один и тот же
+    двойной цикл по `prepared`, и списком, а не словарём: словарь по `chunk.id`
+    завести нельзя, идентификаторы раздаёт база при вставке.
+    """
+    if not embed.available():
+        return None
+    texts = [indexed(source, chunk) for source, chunks in prepared for chunk in chunks]
+    print(f"  считаю смысл: {len(texts)} фрагментов моделью {embed.model()}")
+    return asyncio.run(embed.vectors(texts))
+
+
+def write_db(
+    path: Path,
+    prepared: list[tuple[Source, list[Chunk]]],
+    vectors: list[list[float]] | None = None,
+) -> None:
     tmp = path.with_suffix(".part")
     tmp.unlink(missing_ok=True)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -675,6 +720,7 @@ def write_db(path: Path, prepared: list[tuple[Source, list[Chunk]]]) -> None:
         connection.executescript(SCHEMA)
         document_frequency: Counter[str] = Counter()
         total = 0
+        dims = len(vectors[0]) if vectors else 0
         for source, chunks in prepared:
             connection.execute(
                 "INSERT INTO sources VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
@@ -691,7 +737,7 @@ def write_db(path: Path, prepared: list[tuple[Source, list[Chunk]]]) -> None:
             )
             for chunk in chunks:
                 stems = morph.index_text(indexed(source, chunk))
-                connection.execute(
+                cursor = connection.execute(
                     "INSERT INTO chunks(source_id, heading, text, stems, page, chars)"
                     " VALUES (?, ?, ?, ?, ?, ?)",
                     (
@@ -699,6 +745,11 @@ def write_db(path: Path, prepared: list[tuple[Source, list[Chunk]]]) -> None:
                         stems, chunk.page, len(chunk.text),
                     ),
                 )
+                if vectors is not None:
+                    connection.execute(
+                        "INSERT INTO vectors VALUES (?, ?)",
+                        (cursor.lastrowid, array.array("f", vectors[total]).tobytes()),
+                    )
                 document_frequency.update(set(stems.split()))
                 total += 1
 
@@ -715,6 +766,12 @@ def write_db(path: Path, prepared: list[tuple[Source, list[Chunk]]]) -> None:
                 ("sources", str(len(prepared))),
                 ("min_chunk", str(MIN_CHUNK)),
                 ("max_chunk", str(MAX_CHUNK)),
+                # Чем посчитан смысл. Сверяется на запросе: векторы двух
+                # моделей несравнимы, и база, прочитанная не той, что её
+                # считала, даёт не ошибку, а осмысленно выглядящую случайную
+                # выдачу. Пусто = плотного поиска в этой базе нет
+                ("embed_model", embed.model() if vectors is not None else ""),
+                ("embed_dims", str(dims)),
             ],
         )
         connection.commit()
@@ -762,6 +819,52 @@ def build(*, offline: bool, only: str = "") -> list[tuple[Source, list[Chunk]]]:
     return prepared
 
 
+def swap(path: Path) -> int:
+    """Подменить готовую `.part` на боевую базу. Отдельная команда — ради простоя.
+
+    Сборка идёт при работающем боте: она качает, разбирает и считает смысл
+    минутами, а бот всё это время отвечает по старой базе. Подмена файла —
+    единственный шаг, который требует остановленного бота, и занимает он
+    секунду. Вместе это превращает «остановите бота на время сборки» в
+    «остановите на время одной команды».
+
+    Проверяем перед подменой, а не после: битую базу лучше не подсунуть вовсе,
+    чем подсунуть и узнать об этом из тишины в чате.
+    """
+    tmp = path.with_suffix(".part")
+    if not tmp.exists():
+        print(f"Нечего подменять: {tmp} нет. Сначала запустите сборку")
+        return 1
+    try:
+        probe = sqlite3.connect(f"file:{tmp}?mode=ro", uri=True)
+        try:
+            meta = dict(probe.execute("SELECT key, value FROM meta"))
+            chunks = probe.execute("SELECT count(*) FROM chunks").fetchone()[0]
+        finally:
+            probe.close()
+    except sqlite3.Error as error:
+        print(f"{tmp} не читается как база: {error}")
+        return 1
+    if meta.get("schema_version") != SCHEMA_VERSION:
+        print(f"{tmp} собрана схемой {meta.get('schema_version')!r}, а нужна {SCHEMA_VERSION!r}")
+        return 1
+    if not chunks:
+        print(f"{tmp} пуста — подменять нечем")
+        return 1
+
+    try:
+        path.unlink(missing_ok=True)
+        tmp.replace(path)
+    except PermissionError:
+        print(f"Не могу заменить {path}: файл занят. Остановите бота и повторите")
+        return 1
+    print(
+        f"Подменено: {path}, фрагментов {chunks}, "
+        f"смысл — {meta.get('embed_model') or 'не считался'}"
+    )
+    return 0
+
+
 def main() -> int:
     if hasattr(sys.stdout, "reconfigure"):
         # Консоль Windows работает в cp1251 и роняет скрипт на первом символе
@@ -772,7 +875,15 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Собрать базу знаний в data/kb.db")
     parser.add_argument("--offline", action="store_true", help="не скачивать, брать только kb/raw")
     parser.add_argument("--only", default="", help="собрать один источник по id")
+    parser.add_argument(
+        "--swap",
+        action="store_true",
+        help="только подменить готовую data/kb.part на data/kb.db",
+    )
     args = parser.parse_args()
+
+    if args.swap:
+        return swap(settings.kb_path)
 
     print(f"Манифест: {len(SOURCES)} источников")
     prepared = build(offline=args.offline, only=args.only)
@@ -780,8 +891,21 @@ def main() -> int:
         print("Ни одного источника не собралось — база не тронута")
         return 1
 
-    write_db(settings.kb_path, prepared)
+    vectors = embed_all(prepared)
     total = sum(len(chunks) for _, chunks in prepared)
+    if vectors is None:
+        # Вслух и подробно. База без векторов работает — поиск в ней такой,
+        # каким был до 19.09.2026, — но выглядит она точно так же, как полная,
+        # и разницу видно только по качеству ответов через неделю
+        print("  ВНИМАНИЕ: смысл не посчитан — база собирается только со словами.")
+        print("  Замерено 19.09.2026 на этом же корпусе: верный фрагмент выходит")
+        print("  первым в 45 случаях из 100 вместо 71, recall@5 0.66 вместо 0.91.")
+        print(f"  Причина — пустой EMBED_MODEL или ключ. Модель: {embed.model()!r}")
+    elif len(vectors) != total:
+        print(f"  ВНИМАНИЕ: векторов {len(vectors)}, а фрагментов {total} — пишу без них")
+        vectors = None
+
+    write_db(settings.kb_path, prepared, vectors)
     print(f"Готово: {settings.kb_path}, источников {len(prepared)}, фрагментов {total}")
     missing = [s.id for s in SOURCES if not any(s.id == p.id for p, _ in prepared)]
     if missing:

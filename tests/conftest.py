@@ -15,6 +15,7 @@ import pytest
 import pytest_asyncio
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
+from bot.config import settings
 from bot.db import repo
 from bot.db.models import Base
 from bot.services import backup, panel, pending, qa_log, ticker
@@ -68,6 +69,22 @@ def _prod_chats(tmp_path, monkeypatch):
     прочитавший оттуда настоящий, был бы зелёным только на этой машине.
     """
     monkeypatch.setattr(prod_chats, "PATH", tmp_path / "prod-chats.json")
+
+
+@pytest.fixture(autouse=True)
+def _no_embeddings(monkeypatch):
+    """Плотный поиск в тестах выключен: за векторами ходят в сеть.
+
+    `embed.available()` смотрит на `settings.embed_model` и ключ, а ключ
+    приезжает из боевого `.env` на импорте настроек. Без этой фикстуры каждый
+    тест, зовущий `kb.search`, отправлял бы вопрос в OpenRouter настоящим
+    ключом — то есть нарушал бы первую строку докстроки этого файла и стоил бы
+    денег. Поймано ровно этим: прогон после появления плотного поиска.
+
+    Тесты, которым плотная выдача нужна, возвращают её себе сами — подменяя
+    `embed.vector` заглушкой, а не ключ настоящим.
+    """
+    monkeypatch.setattr(settings, "embed_model", "")
 
 
 @pytest.fixture(autouse=True)
