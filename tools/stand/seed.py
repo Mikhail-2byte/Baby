@@ -12,7 +12,8 @@
 
 Чистка идёт в порядке, который не спорит с `PRAGMA foreign_keys=ON`: каскадов
 в схеме нет нигде, и удаление семьи с живыми детьми упёрлось бы в
-`IntegrityError`.
+`IntegrityError`. Сам порядок и его причина живут в `tools/wipe.py` — он общий
+со сбросом боевой базы, и второй копии у него нет намеренно.
 
 **История.** Две недели кормлений, снов и подгузников пишутся прямо через
 `repo`. Это подготовка материала, а не подмена проверяемого: `/week`,
@@ -44,24 +45,7 @@ from bot.db.models import (
     WEIGHT,
 )
 from bot.services import checkin
-
-# Порядок обязателен: сначала то, что ссылается, потом то, на что ссылаются.
-#
-# `reminders` стоит выше `children` не для красоты: у строки календаря есть
-# `child_id`, и снимок боевой базы, где семья подписана на прививки, чистился
-# бы до первого `DELETE FROM children` и падал на нём с `FOREIGN KEY
-# constraint failed`. Год порядок был неверным и молчал — пока в боевых
-# `reminders` не появилось ни одной строки с ребёнком. Сторож —
-# `tests/test_stand_seed.py`.
-WIPE_ORDER = (
-    "alerts",
-    "events",
-    "measurements",
-    "reminders",
-    "children",
-    "members",
-    "families",
-)
+from tools.wipe import wipe
 
 
 def prepare(src: Path, dst: Path) -> dict[str, int]:
@@ -78,14 +62,9 @@ def prepare(src: Path, dst: Path) -> dict[str, int]:
     finally:
         source.close()
 
-    wiped: dict[str, int] = {}
     conn = sqlite3.connect(dst)
     try:
-        conn.execute("PRAGMA foreign_keys = ON")
-        for table in WIPE_ORDER:
-            cursor = conn.execute(f"DELETE FROM {table}")  # noqa: S608 — имена свои
-            wiped[table] = cursor.rowcount
-        conn.commit()
+        wiped = wipe(conn)
         kept = conn.execute("SELECT count(*) FROM who_lms").fetchone()[0]
         wiped["who_lms (оставлено)"] = kept
     finally:

@@ -14,6 +14,16 @@
   отвечающий на «сколько стоит биткоин» абзацем из клинических рекомендаций,
   опаснее молчащего: он выглядит знающим.
 
+Разделов молчания три, и печатаются они тремя числами без среднего по ним: у
+них разная цена промаха. Важнее другое — **скрипт меряет только первый сторож
+молчания, лексический**. Второй, семантический, живёт в `services/qa.py`:
+модель, которой показали найденное, отвечает «во фрагментах ответа нет», и бот
+молчит. В сеть скрипт не ходит и ходить не должен, значит непустая выдача на
+`absent` и `overlapping` НЕ означает, что бот ответил мусором, — означает, что
+ворота передали мусор дальше. Свалив это в общее число, мы обрушили бы
+заглавную цифру и тем самым позвали подкрутить порог: набор своими руками
+спровоцировал бы подгонку, против которой написан.
+
 Числа отсюда идут в летопись `docs/TASKS.md`. По ним же принимается отложенное
 решение про эмбеддинги: плотный поиск стоит двух гигабайт оперативной памяти
 на машине, которая работает круглосуточно, и покупать их вслепую незачем.
@@ -41,6 +51,14 @@ EVAL = ROOT / "kb" / "eval.yaml"
 # Глубина, на которой считаем попадание. Пять — столько же, сколько уходит в
 # ответ (`kb_top_k`): мерить глубже, чем показываем, бессмысленно
 DEPTH = 5
+
+# Разделы молчания и их подписи. Порядок фиксирован: от самого лёгкого случая к
+# самому тяжёлому, и читается он как шкала, а не как список
+SILENCE_SECTIONS = (
+    ("silence", "чужой домен"),
+    ("absent", "нет в корпусе"),
+    ("overlapping", "чужое общими словами"),
+)
 
 
 def _report_missing_sources() -> None:
@@ -78,7 +96,7 @@ class Question:
     contains: tuple[re.Pattern[str], ...]
 
 
-def load(path: Path = EVAL) -> tuple[tuple[Question, ...], tuple[str, ...]]:
+def load(path: Path = EVAL) -> tuple[tuple[Question, ...], dict[str, tuple[str, ...]]]:
     raw: Any = yaml.safe_load(path.read_text(encoding="utf-8"))
     questions = tuple(
         Question(
@@ -88,7 +106,8 @@ def load(path: Path = EVAL) -> tuple[tuple[Question, ...], tuple[str, ...]]:
         )
         for item in raw["questions"]
     )
-    return questions, tuple(raw.get("silence") or ())
+    sections = {key: tuple(raw.get(key) or ()) for key, _ in SILENCE_SECTIONS}
+    return questions, sections
 
 
 def hits(question: Question, found: list[kb.Chunk]) -> list[bool]:
@@ -101,6 +120,27 @@ def hits(question: Question, found: list[kb.Chunk]) -> list[bool]:
             and any(pattern.search(text) for pattern in question.contains)
         )
     return out
+
+
+async def _measure_silence(
+    label: str, texts: tuple[str, ...]
+) -> list[tuple[str, str, kb.Chunk]]:
+    """Замерить один раздел молчания и напечатать его число.
+
+    Возвращает пробои для подробного разбора внизу. Покрытие у них печатается
+    не для красоты: без него не отличить «ворота еле пропустили» от «пропустили
+    уверенно», то есть нельзя судить, стоит ли вообще трогать пороги.
+    """
+    if not texts:
+        return []
+    noisy: list[tuple[str, str, kb.Chunk]] = []
+    for text in texts:
+        found = await kb.search(text, DEPTH)
+        if found:
+            noisy.append((label, text, found[0]))
+    quiet = len(texts) - len(noisy)
+    print(f"  молчание ({label}): {quiet / len(texts):.2f}  ({quiet} из {len(texts)})")
+    return noisy
 
 
 async def run() -> int:
@@ -117,7 +157,7 @@ async def run() -> int:
     if not chosen.exists():
         print(f"Набора нет: {chosen}")
         return 1
-    questions, silence = load(chosen)
+    questions, sections = load(chosen)
     _report_missing_sources()
     at = {1: 0, 3: 0, 5: 0}
     reciprocal = 0.0
@@ -141,16 +181,9 @@ async def run() -> int:
         print(f"  recall@{depth}: {at[depth] / total:.2f}  ({at[depth]} из {total})")
     print(f"  MRR@{DEPTH}:    {reciprocal / total:.2f}")
 
-    quiet = 0
-    noisy: list[tuple[str, kb.Chunk]] = []
-    for text in silence:
-        found = await kb.search(text, DEPTH)
-        if found:
-            noisy.append((text, found[0]))
-        else:
-            quiet += 1
-    if silence:
-        print(f"  молчание:   {quiet / len(silence):.2f}  ({quiet} из {len(silence)})")
+    noisy: list[tuple[str, str, kb.Chunk]] = []
+    for key, label in SILENCE_SECTIONS:
+        noisy += await _measure_silence(label, sections.get(key, ()))
 
     if misses:
         print(f"\nНе нашлось ({len(misses)}):")
@@ -170,10 +203,16 @@ async def run() -> int:
             )
             print(f"      {top.text[:80]}")
     if noisy:
-        print(f"\nОтветил там, где ответа нет ({len(noisy)}):")
-        for text, chunk in noisy:
-            print(f"  - {text}")
-            print(f"      {chunk.source_id}: {chunk.text[:70]}")
+        # Не «ответил»: после разведения исходов в `services/qa.py` на таком
+        # вопросе ответит или промолчит уже модель. Отсюда видно ровно то, что
+        # отсюда видно, — что пропустили ворота
+        print(f"\nУшло в модель, хотя ответа в корпусе нет ({len(noisy)}):")
+        for label, text, chunk in noisy:
+            print(f"  - [{label}] {text}")
+            print(
+                f"      {chunk.source_id} (покрытие {chunk.coverage:.2f},"
+                f" счёт {chunk.score:.4f}): {chunk.text[:70]}"
+            )
     return 0
 
 

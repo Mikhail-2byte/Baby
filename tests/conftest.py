@@ -18,6 +18,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from bot.db import repo
 from bot.db.models import Base
 from bot.services import backup, panel, pending, qa_log, ticker
+from tools import prod_chats
 
 
 @pytest.fixture(autouse=True)
@@ -55,6 +56,18 @@ def _qa_log(tmp_path, monkeypatch):
     qa_log.reset()
     yield
     qa_log.reset()
+
+
+@pytest.fixture(autouse=True)
+def _prod_chats(tmp_path, monkeypatch):
+    """Память о боевых чатах уводится в tmp.
+
+    `prod_chats.PATH` вычисляется на импорте и указывает на боевой
+    `data/prod-chats.json` — тот самый файл, которым вооружён сторож стенда.
+    Тест, записавший туда свой выдуманный чат, ослабил бы защиту молча, а тест,
+    прочитавший оттуда настоящий, был бы зелёным только на этой машине.
+    """
+    monkeypatch.setattr(prod_chats, "PATH", tmp_path / "prod-chats.json")
 
 
 @pytest.fixture(autouse=True)

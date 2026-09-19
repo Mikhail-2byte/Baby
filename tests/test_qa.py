@@ -6,6 +6,7 @@
 признаком до модели не доходит, и что ввод веса числом не сломан.
 """
 
+import json
 import socket
 from dataclasses import replace
 from datetime import datetime
@@ -164,15 +165,22 @@ async def test_spent_quota_shows_the_fragments(found, model, monkeypatch):
     assert calls == []
 
 
+@pytest.mark.parametrize(
+    "reason", [llm.NO_KEY, llm.NO_MODEL, llm.UNAVAILABLE, llm.BAD_JSON]
+)
 @pytest.mark.asyncio
-async def test_without_keys_the_fragments_are_the_answer(found, model):
+async def test_a_failure_nobody_judged_still_shows_the_fragments(found, model, reason):
     """Пустой `.env` — рабочий режим, а не поломка.
 
     Цитата из клинических рекомендаций с названием документа отвечает на
     вопрос сама. Ровно этим бот и отличается от чата с моделью.
+
+    Вторая половина решения о молчании, и без неё оно затянулось бы до немоты:
+    здесь о релевантности не судил никто — ни ключа, ни квоты, ни разбора, —
+    и не показать найденное значит не показать ничего.
     """
     found([_chunk()])
-    model(llm.Answer(reason=llm.NO_KEY))
+    model(llm.Answer(reason=reason))
 
     result = await qa.answer("когда прикладывать к груди")
     assert result.kind == qa.EXTRACT
@@ -180,11 +188,88 @@ async def test_without_keys_the_fragments_are_the_answer(found, model):
 
 
 @pytest.mark.asyncio
-async def test_empty_answer_falls_back_to_the_fragments(found, model):
-    """Модель честно сказала «во фрагментах этого нет» — показываем их."""
+async def test_a_model_that_saw_nothing_makes_the_bot_say_so(found, model):
+    """Единственный судья релевантности сказал «нет» — значит молчим.
+
+    Показать после этого три цитаты под заголовком «вот что нашлось по этому
+    вопросу» значит переспорить собственного сторожа и соврать в заголовке.
+    17.09 бот так и сделал: на вопрос про цвет кожи выдал кесарево сечение,
+    гипогликемию и срыгивания.
+    """
     found([_chunk()])
     model(_ok("   "))
-    assert (await qa.answer("вопрос про грудь")).kind == qa.EXTRACT
+
+    result = await qa.answer("вопрос про грудь")
+    assert result.kind == qa.NOT_FOUND
+    assert result.reason == qa.EMPTY
+    assert result.chunks == ()
+
+
+@pytest.mark.asyncio
+async def test_an_answer_resting_on_nothing_is_not_an_answer(found, model):
+    """Сильная модель отказывает фразой, а не пустой строкой.
+
+    «В предоставленных фрагментах информации нет» — это отказ, и показывать
+    под ним три цитаты значит вернуть ровно ту поломку, ради которой всё и
+    затевалось. Признак структурный: `used` пуст. Ловить формулировку отказа
+    подстрокой нельзя — их бесконечно много, а промах съел бы живой ответ.
+    """
+    found([_chunk()])
+    model(
+        llm.Answer(
+            data={"answer": "В этих документах информации об этом нет.", "used": []},
+            model="test/model",
+            calls=1,
+        )
+    )
+
+    result = await qa.answer("сколько стоит детская коляска")
+    assert result.kind == qa.NOT_FOUND
+    assert result.reason == qa.UNGROUNDED
+    assert result.chunks == ()
+
+
+@pytest.mark.asyncio
+async def test_a_partial_answer_is_still_an_answer(found, model):
+    """«Сказано купать в тёплой воде, числа нет» — это ответ, а не отказ.
+
+    Граница проходит не по тому, полон ли ответ, а по тому, опирается ли он на
+    найденное. Отказ, который сработал бы и здесь, сделал бы бота немым на
+    вопросах, где документ говорит по теме, но без нужной цифры, — а их
+    больше всего.
+    """
+    found([_chunk()])
+    model(
+        llm.Answer(
+            data={"answer": "Сказано прикладывать рано, точного часа нет.", "used": [1]},
+            model="test/model",
+            calls=1,
+        )
+    )
+
+    assert (await qa.answer("когда прикладывать к груди")).kind == qa.ANSWERED
+
+
+@pytest.mark.parametrize("used", [{"used": "все"}, {"used": 0}, {}])
+@pytest.mark.asyncio
+async def test_a_sloppy_used_does_not_silence_a_real_answer(found, model, used):
+    """Пустой список — утверждение модели, битый `used` — её неряшливость.
+
+    `cited` разбирает мусор в `used` нарочно терпимо; превратить небрежность в
+    молчание значило бы потерять настоящий ответ из-за формы, а не сути.
+    Самый опасный случай — последний: поля нет вовсе, и проверка «пусто ли
+    оно» без сверки с типом сочла бы отсутствие отказом.
+    """
+    found([_chunk()])
+    model(
+        llm.Answer(
+            data={"answer": "Прикладывают в первые 30 минут.", **used},
+            model="test/model",
+            calls=1,
+        )
+    )
+
+    assert (await qa.answer("когда прикладывать к груди")).kind == qa.ANSWERED
 
 
 @pytest.mark.asyncio
@@ -194,6 +279,108 @@ async def test_a_good_answer_is_passed_through(found, model):
     result = await qa.answer("когда прикладывать к груди")
     assert result.kind == qa.ANSWERED
     assert result.answer == "Прикладывают в первые 30 минут."
+
+
+# --- Лог говорит то, что увидел человек -------------------------------------
+
+
+def _log_lines(event: str = "qa") -> list[dict]:
+    """Строки `qa.log` за тест. Путь уведён в tmp autouse-фикстурой `_qa_log`."""
+    if not qa_log.PATH.exists():
+        return []
+    written = qa_log.PATH.read_text(encoding="utf-8").splitlines()
+    records = [json.loads(line) for line in written if line.strip()]
+    return [record for record in records if record.get("event") == event]
+
+
+@pytest.mark.parametrize(
+    ("answer", "outcome"),
+    [
+        ("Прикладывают в первые 30 минут.", qa.ANSWERED),
+        ("", qa.NOT_FOUND),
+        ("Прикладывают в первые 2 часа.", qa.EXTRACT),
+    ],
+)
+@pytest.mark.asyncio
+async def test_the_log_says_what_the_person_saw(found, model, answer, outcome):
+    """`qa.log` — единственное полевое свидетельство качества Q&A.
+
+    17.09 два боевых вопроса помечены в нём `answered`, а семья увидела
+    `extract`: запись стояла выше проверок и исход предсказывала, вместо того
+    чтобы его записать. То есть свидетельство врало ровно про тот случай, ради
+    которого его читают.
+    """
+    found([_chunk()])
+    model(_ok(answer))
+
+    await qa.answer("когда прикладывать к груди")
+    assert _log_lines()[-1]["outcome"] == outcome
+
+
+@pytest.mark.asyncio
+async def test_one_question_writes_one_verdict(found, model):
+    """Две строки с разными исходами на один вопрос делают лог нечитаемым.
+
+    Грепать его — весь смысл. `qa_numbers` рядом стоять может: это отдельное
+    событие, а не второй вердикт.
+    """
+    found([_chunk()])
+    model(_ok("Прикладывают в первые 2 часа."))
+
+    await qa.answer("когда прикладывать к груди")
+    assert len(_log_lines()) == 1
+    assert len(_log_lines("qa_numbers")) == 1
+
+
+@pytest.mark.asyncio
+async def test_the_model_facts_survive_the_move(found, model):
+    """Перенос записи вниз не должен обнулить диагностику отказов.
+
+    Модель, число запросов и время известны только сразу после `llm.ask`, а
+    нужны как раз тогда, когда ответ не сложился.
+    """
+    found([_chunk()])
+    model(_ok(""))
+
+    await qa.answer("вопрос про грудь")
+    line = _log_lines()[-1]
+    assert line["model"] == "test/model"
+    assert line["calls"] == 1
+    assert "seconds" in line
+
+
+@pytest.mark.asyncio
+async def test_a_silenced_answer_still_names_its_sources_in_the_log(found, model):
+    """Человеку мусор не показали — а какой именно, знать надо.
+
+    Какие фрагменты ворота пропустили в модель и с каким покрытием —
+    единственное, по чему судят о самих воротах.
+    """
+    found([_chunk()])
+    model(_ok(""))
+
+    await qa.answer("вопрос про грудь")
+    line = _log_lines()[-1]
+    assert line["sources"] == ["kr_newborn_2025"]
+    assert line["coverage"] == 1.0
+
+
+@pytest.mark.asyncio
+async def test_the_quota_line_is_written_before_the_model_and_costs_nothing(
+    found, model, monkeypatch
+):
+    """У квотной строки нет `reply`, и при сборке общей записи её легче всего
+    либо потерять, либо посчитать в квоту второй раз."""
+    found([_chunk()])
+    calls = model(_ok("что-то"))
+    monkeypatch.setattr(qa.qa_log, "quota_spent", lambda: True)
+
+    await qa.answer("когда прикладывать к груди")
+    line = _log_lines()[-1]
+    assert line["outcome"] == qa.EXTRACT
+    assert line["reason"] == llm.QUOTA
+    assert line["calls"] == 0
+    assert calls == []
 
 
 # --- Сторож чисел -----------------------------------------------------------
@@ -605,3 +792,27 @@ async def test_the_refusal_path_makes_no_network_calls(found, model, monkeypatch
     found([])
     model(_ok("не должно быть вызвано"))
     assert (await qa.answer("что угодно")).kind == qa.NO_KB
+
+
+@pytest.mark.asyncio
+async def test_a_rejected_fragment_never_reaches_the_chat(found, model):
+    """То же решение, но глазами семьи: между ним и чатом лежит рендерер.
+
+    Предыдущий тест пришпиливает вердикт, этот — то, что уехало в чат. Поломка
+    17.09 была видна человеку именно на рендерере: `Result` уже нёс отказ, а
+    `texts.qa_extract` печатал три цитаты и заголовок, обещавший, что они «по
+    этому вопросу».
+    """
+    found([_chunk()])
+    model(_ok(""))
+    session_bot = RecordingSession()
+    bot = Bot(token="42:TEST", session=session_bot)
+    message = Message(
+        message_id=1, date=NOW, chat=CHAT, from_user=AUTHOR, text="вопрос про грудь"
+    ).as_(bot)
+
+    await qa_handler.answer_and_reply(message, "вопрос про грудь")
+
+    assert session_bot.sent == [texts.QA_NOT_FOUND]
+    assert all(texts.QA_FOUND_ONLY not in sent for sent in session_bot.sent)
+    assert all(_chunk().text not in sent for sent in session_bot.sent)

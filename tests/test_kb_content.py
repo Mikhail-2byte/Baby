@@ -100,8 +100,9 @@ def test_empty_manifest_stops_the_build(tmp_path, monkeypatch):
 
 def test_evaluation_set_is_big_enough():
     """Тридцать — не ритуал. На десяти вопросах одна случайность — это 10%."""
-    questions, silence = eval_kb.load()
-    assert len(questions) + len(silence) >= MIN_QUESTIONS
+    questions, sections = eval_kb.load()
+    silent = sum(len(texts) for texts in sections.values())
+    assert len(questions) + silent >= MIN_QUESTIONS
 
 
 def test_every_question_names_an_existing_source():
@@ -141,8 +142,33 @@ def test_expectations_are_valid_regular_expressions():
 
 def test_silence_questions_are_off_topic():
     """Раздел молчания — половина качества, и он не должен быть пустым."""
-    _, silence = eval_kb.load()
-    assert len(silence) >= 3
+    _, sections = eval_kb.load()
+    assert len(sections["silence"]) >= 3
+
+
+def test_every_silence_section_is_filled():
+    """Пустой раздел печатает 1.00 и не значит ничего.
+
+    Числа три, и каждое своё: `silence` — чужой домен, `absent` — вопрос к
+    этому боту, ответа на который в корпусе нет, `overlapping` — чужая тема
+    словами корпуса. Пропавший раздел выглядел бы как идеально пройденный.
+    """
+    _, sections = eval_kb.load()
+    for key, _label in eval_kb.SILENCE_SECTIONS:
+        assert sections[key], key
+
+
+def test_a_question_is_not_asked_and_silenced_at_once():
+    """Противоречия внутри набора не удовлетворит никакой код.
+
+    А искать причину будут в поиске: вопрос, от которого ждут и ответа, и
+    молчания, проваливает одну из двух метрик всегда и без объяснения.
+    """
+    questions, sections = eval_kb.load()
+    asked = {question.text.strip().lower() for question in questions}
+    for key, _label in eval_kb.SILENCE_SECTIONS:
+        for text in sections[key]:
+            assert text.strip().lower() not in asked, text
 
 
 def test_every_source_is_asked_about():

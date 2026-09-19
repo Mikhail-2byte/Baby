@@ -526,7 +526,31 @@ async def run(stand: Stand) -> None:
         await stand.tap(AskCB().pack())
         await stand.settle(1.5)
         await stand.say("сколько раз в день менять подгузник")
-        r.note("Без ключей LLM ждём режим цитат: источник и ссылка")
+        r.note("С ключами ждём ответ модели и цитату под ним; без них — режим цитат")
+
+    async with stand.step("36а", "вопрос не по базе: отказ модели молчит, а не цитирует") as r:
+        await stand.tap(AskCB().pack())
+        await stand.settle(1.5)
+        await stand.say("что делать если ребёнок родился чёрным в белой семье")
+        await stand.settle(3.0)
+        r.expect("Не нашёл об этом в источниках")
+        r.expect_absent("Вот что нашлось")
+        r.expect_absent("кесарева")
+        r.note(
+            "Боевая поломка 17.09: модель вернула пустой ответ, а бот показал три"
+            " цитаты — про кесарево сечение, гипогликемию и срыгивания"
+        )
+
+    async with stand.step("36б", "частичный ответ остаётся ответом, а не отказом") as r:
+        await stand.tap(AskCB().pack())
+        await stand.settle(1.5)
+        await stand.say("в какой температуре купать новорождённого")
+        await stand.settle(3.0)
+        r.expect_absent("Вот что нашлось")
+        r.note(
+            "Числа в базе нет, но фрагменты по теме есть. Ждём ответ модели с"
+            " оговоркой про отсутствие цифры — молчание здесь было бы перегибом"
+        )
 
     async with stand.step("37", "❓ Вопрос → тревожный признак перехватывает alarm") as r:
         await stand.tap(AskCB().pack())

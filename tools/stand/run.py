@@ -31,6 +31,8 @@ import sys  # noqa: E402
 from pathlib import Path  # noqa: E402
 from typing import Any  # noqa: E402
 
+from tools import prod_chats  # noqa: E402 — только после DB_PATH
+
 LIVE = Path("data/live")
 STATE = LIVE / "stand.json"
 PROD_DB = Path("data/baby.db")
@@ -130,19 +132,13 @@ def is_production_chat(chat_id: int) -> str | None:
     завёл бы тестового ребёнка там, где через несколько дней будет настоящий,
     и вычищать пришлось бы руками из-под работающего бота. Сверка идёт по
     боевой базе, а не по названию: название можно поменять, chat_id — нет.
-    """
-    if not PROD_DB.exists():
-        return None
-    import sqlite3
 
-    conn = sqlite3.connect(f"file:{PROD_DB}?mode=ro", uri=True)
-    try:
-        row = conn.execute(
-            "SELECT title FROM families WHERE chat_id = ?", (chat_id,)
-        ).fetchone()
-    finally:
-        conn.close()
-    return row[0] if row else None
+    С появлением `tools/reset.py` одной боевой базы стало мало: сброс удаляет
+    строку `families`, то есть разоружает сторож ровно в тот час, когда группа
+    беззащитнее всего — семья ещё не написала, и очередь Telegram возвращает
+    один чат, боевой. Вторая память — `tools/prod_chats.py`.
+    """
+    return prod_chats.is_production(chat_id, PROD_DB)
 
 
 async def _act(
