@@ -9,11 +9,10 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.types import BotCommand, BotCommandScopeAllGroupChats
 
-from bot import texts
+from bot import middlewares, texts
 from bot.config import settings
 from bot.db.session import engine
 from bot.handlers import routers
-from bot.middlewares import FamilyMiddleware, drop_wizard_state
 from bot.services import kb, lock, panel, ticker
 
 # Файл пишем сами, а не редиректом shell, и это не удобство. При `>> bot.log`
@@ -149,11 +148,10 @@ async def main() -> None:
 
     bot = make_bot()
     dp = Dispatcher()
-    dp.update.outer_middleware(FamilyMiddleware())
-    # Outer, а не inner: он должен отработать до фильтров, потому что решение
-    # «команда пришла посреди мастера» обязано быть одинаковым для всех
-    # роутеров, а не зависеть от того, чей фильтр сойдётся первым
-    dp.message.outer_middleware(drop_wizard_state)
+    # Порядок и обоснование — в `middlewares.install`. Одно место на всех,
+    # потому что диспетчер собирают двое: этот файл и стенд, и вторая копия
+    # списка разошлась бы с первой молча
+    middlewares.install(dp)
     for router in routers:
         dp.include_router(router)
 

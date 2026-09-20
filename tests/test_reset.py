@@ -79,6 +79,13 @@ def _fill(path: Path) -> None:
             "INSERT INTO alerts (id, child_id, flag_id, raised_on) VALUES "
             f"(1, 1, 'few_wet_diapers', '{date.today()}')"
         )
+        # Нажатия ссылаются и на семью, и на участника. Структурный сторож
+        # новую таблицу переживёт, а этот — нет: без чистки `usage` сброс
+        # падает на `DELETE FROM members` с FOREIGN KEY constraint failed
+        conn.execute(
+            "INSERT INTO usage (id, at, family_id, member_id, kind, action, "
+            f"handled, ms) VALUES (1, '{now}', 1, 1, 'button', 'pnl:refresh', 1, 12)"
+        )
         conn.execute(
             "INSERT INTO who_lms (sex, indicator, age_days, l, m, s) "
             "VALUES ('f', 'weight', 0, 0.3809, 3.2322, 0.14171)"

@@ -36,6 +36,7 @@ None` стоит первой, и там это правильно; здесь �
 """
 
 import logging
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from io import BytesIO
@@ -51,7 +52,7 @@ from bot.db.models import TIMED_KINDS, WEIGHT, Child, Family, Member
 from bot.filters import IN_GROUP, IN_GROUP_CB
 from bot.handlers import alarm, measure, qa
 from bot.keyboards import VoiceCB
-from bot.services import dictation, llm, numerals, panel
+from bot.services import dictation, llm, numerals, panel, qa_log
 from bot.services import timeutil as tu
 from bot.services import voice as stt
 
@@ -146,7 +147,25 @@ async def dictate(
 
     # Файл уходит как есть: Whisper-совместимый эндпоинт принимает ogg/opus,
     # поэтому конвертации (и ffmpeg) в проекте нет
+    started = time.monotonic()
     raw = await stt.transcribe(buffer.getvalue())
+
+    # Расшифровка — единственное обращение к платному провайдеру, которое до
+    # сих пор не считалось нигде: голосовых в семейном чате идут десятки в
+    # день, и во что они обходятся, было не видно ниоткуда.
+    #
+    # `calls=0` здесь обязателен и не описка. Счётчик `qa_log.calls_today()`
+    # сторожит суточную квоту OpenRouter, а у расшифровки свой ключ и свой
+    # потолок. Приписав эти вызовы к `calls`, мы выключали бы «❓ Вопрос»
+    # семье тем быстрее, чем больше она говорит вслух
+    qa_log.write(
+        event="stt",
+        chat=message.chat.id,
+        ok=raw is not None,
+        secs=media.duration or 0,
+        seconds=round(time.monotonic() - started, 1),
+        calls=0,
+    )
     if raw is None:
         await message.reply(texts.VOICE_FAILED, reply_markup=keyboards.home())
         return
@@ -178,6 +197,7 @@ async def dictate(
         tz=family.tz,
         child_name=child.name,
         age=texts.age_phrase(child, now),
+        chat=message.chat.id,
     )
 
     if result.kind == dictation.QUESTION:

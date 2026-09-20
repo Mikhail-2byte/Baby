@@ -21,15 +21,17 @@
 """
 
 import logging
+from contextlib import suppress
 
 from aiogram import F, Router
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import BaseFilter
 from aiogram.types import CallbackQuery, Message
 
 from bot import keyboards, texts
 from bot.db.models import Family
 from bot.filters import IN_GROUP, IN_GROUP_CB
-from bot.services import pending, qa
+from bot.services import pending, qa, qa_log
 
 log = logging.getLogger(__name__)
 
@@ -88,7 +90,7 @@ async def answer_and_reply(message: Message, question: str) -> None:
     # Печатает бот заметно дольше, чем отвечает на тап: цепочка моделей ждёт до
     # полутора минут. Без «печатает…» человек решит, что тап не сработал
     await message.bot.send_chat_action(message.chat.id, "typing")
-    result = await qa.answer(question)
+    result = await qa.answer(question, chat=message.chat.id)
 
     if result.kind == qa.NO_KB:
         text = texts.QA_NO_KB
@@ -98,7 +100,20 @@ async def answer_and_reply(message: Message, question: str) -> None:
         text = texts.qa_answer(result.answer, result.chunks)
     else:
         text = texts.qa_extract(result.chunks)
-    await message.reply(text, reply_markup=keyboards.home())
+
+    # Единственное сообщение проекта, которое носит inline-разметку вместо
+    # `keyboards.home()`, и размен назван вслух. Одно сообщение обе разметки не
+    # носит, а без 👍/👎 верность ответа не измеряется ничем: `outcome` в
+    # `qa.log` говорит, что бот **сделал**, а не был ли он прав.
+    #
+    # Носителя клавиатуры это не отнимает ни у кого: до ответа человек
+    # обязательно получил либо «Напишите вопрос» (`start_question` выше), либо
+    # эхо расшифровки (`handlers/voice.py`), и оба несут `home()`.
+    #
+    # Пустой `qid` означает, что перед нами заглушка, а не боевой путь: кнопка
+    # `qav:up:` склеилась бы не с чем. Тогда ведём себя как прежде
+    markup = keyboards.qa_verdict(result.qid) if result.qid else keyboards.home()
+    await message.reply(text, reply_markup=markup)
 
 
 @router.message(IN_GROUP, F.text, AwaitsQuestion())
@@ -106,3 +121,40 @@ async def reply(message: Message, family: Family) -> None:
     """Вопрос пришёл."""
     pending.take(family.chat_id, message.from_user.id)
     await answer_and_reply(message, (message.text or "").strip())
+
+
+@router.callback_query(IN_GROUP_CB, keyboards.QaCB.filter())
+async def verdict(call: CallbackQuery, callback_data: keyboards.QaCB) -> None:
+    """Человек сказал, помог ответ или нет.
+
+    Единственный источник правды о верности во всём проекте. Всё остальное,
+    что мы знаем про Q&A, — это поведение бота: ответил, показал фрагменты,
+    промолчал. Прав ли он был, не выводится из этого никак, а модель-судья в
+    контуре была бы судьёй самой себе.
+
+    **Кнопки гасятся сразу.** Без этого на один `qid` ляжет сколько угодно
+    строк: передумавший человек, второй родитель, случайный тап по вчерашнему
+    ответу. Сняв разметку, мы делаем «один вопрос — один вердикт» свойством
+    экрана, а не правилом, которое отчёту пришлось бы применять задним числом.
+
+    Строку в `usage` пишет `UsageMiddleware` сама, и `qid` она достаёт из
+    `callback_data` — хендлеру передавать его некуда. Здесь пишется вторая
+    половина, в `qa.log`: там лежит текст вопроса, и склейка идёт по `qid`.
+
+    Вердикт под ответом, чей вопрос уже выпал из ротации `qa.log`, принимается
+    молча: спорить с человеком, который нажал кнопку, не о чем, а склеивать
+    такую строку отчёт и так умеет — он печатает «вердиктов без вопроса: N».
+    """
+    qa_log.write(
+        event="qa_verdict",
+        chat=call.message.chat.id if isinstance(call.message, Message) else None,
+        qid=callback_data.qid,
+        verdict=callback_data.action,
+        calls=0,
+    )
+    await call.answer(texts.QA_THANKS if callback_data.qid else texts.QA_VERDICT_STALE)
+    if isinstance(call.message, Message):
+        with suppress(TelegramBadRequest):
+            # Сообщение могло уехать за горизонт правки или уже лишиться
+            # кнопок вторым родителем — ни то, ни другое не повод ругаться
+            await call.message.edit_reply_markup(reply_markup=None)

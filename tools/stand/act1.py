@@ -14,9 +14,12 @@
 
 from __future__ import annotations
 
+import json
 from datetime import timedelta
+from pathlib import Path
 
 from bot import keyboards
+from bot.config import settings
 from bot.db.models import (
     DIAPER_DIRTY,
     DIAPER_WET,
@@ -29,6 +32,7 @@ from bot.keyboards import (
     AskCB,
     EditCB,
     MeasureCB,
+    QaCB,
     RecordCB,
     RemindCB,
     SexCB,
@@ -53,6 +57,31 @@ def _last_event_id(stand: Stand) -> int:
 def _last_measurement_id(stand: Stand) -> int:
     row = stand.one("SELECT max(id) FROM measurements")
     return int(row[0]) if row and row[0] else 0
+
+
+def _qa_log() -> list[dict]:
+    """Строки `qa.log` стенда. По образцу `act4._qa_log_calls`.
+
+    Стенд читает журнал сам, потому что `qid` взять больше неоткуда: в чате он
+    не печатается, а в `callback_data` кнопки его видит только Telegram.
+    """
+    path = Path(settings.db_path).parent / "qa.log"
+    if not path.exists():
+        return []
+    records = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        try:
+            records.append(json.loads(line))
+        except ValueError:
+            continue
+    return records
+
+
+def _last_qid() -> str:
+    for record in reversed(_qa_log()):
+        if record.get("event") == "qa" and record.get("qid"):
+            return str(record["qid"])
+    return ""
 
 
 async def run(stand: Stand) -> None:
@@ -716,7 +745,33 @@ async def run(stand: Stand) -> None:
         await stand.tap(AskCB().pack())
         await stand.settle(1.5)
         await stand.say("сколько раз в день менять подгузник")
+        await stand.settle(3.0)
+        r.expect_button("👍 Помогло", "👎 Не то")
+        r.expect_keyboard(False)
         r.note("С ключами ждём ответ модели и цитату под ним; без них — режим цитат")
+        r.note(
+            "Под ответом кнопки вердикта, и потому постоянной клавиатуры на нём"
+            " нет: одно сообщение обе разметки не носит. Носителем был предыдущий"
+            " ответ — «Напишите вопрос» из шага выше"
+        )
+
+    async with stand.step("36в", "вердикт: 👎 записывается и гасит кнопки") as r:
+        qid = _last_qid()
+        if not qid:
+            r.note("В qa.log нет строки с qid — вердикт проверить нечем")
+        else:
+            await stand.tap(QaCB(action="down", qid=qid).pack())
+            await stand.settle(1.5)
+            r.expect("Спасибо")
+            after = [line for line in _qa_log() if line.get("event") == "qa_verdict"]
+            if not any(line.get("qid") == qid for line in after):
+                stand.protocol.fail("шаг 36в", "вердикт не доехал до qa.log")
+            r.show(
+                "нажатия вердикта",
+                "SELECT kind, action, detail, handled FROM usage "
+                "WHERE action LIKE 'qav%' ORDER BY id DESC LIMIT 3",
+            )
+        r.note("Вторая половина склейки — строка usage с тем же qid в detail")
 
     async with stand.step("36а", "вопрос не по базе: отказ модели молчит, а не цитирует") as r:
         await stand.tap(AskCB().pack())

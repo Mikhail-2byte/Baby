@@ -112,12 +112,20 @@ def test_a_family_subscribed_to_the_calendar_is_wiped(tmp_path: Path) -> None:
             "active, preset, created_by, created_at) VALUES "
             f"(1, 1, 1, 'АКДС', '{now}', 1, 'vaccine', 1, '{now}')"
         )
+        # Нажатия боевой семьи. В снимок для стенда им нельзя не потому, что
+        # они секретны, а потому, что ссылаются на удаляемых: без чистки
+        # `usage` подготовка падает на `DELETE FROM members`
+        conn.execute(
+            "INSERT INTO usage (id, at, family_id, member_id, kind, action, "
+            f"handled, ms) VALUES (1, '{now}', 1, 1, 'button', 'pnl:refresh', 1, 12)"
+        )
         conn.commit()
     finally:
         conn.close()
 
     wiped = seed.prepare(src, tmp_path / "live" / "baby.db")
 
+    assert wiped["usage"] == 1
     assert wiped["reminders"] == 1
     assert wiped["children"] == 1
     assert wiped["families"] == 1

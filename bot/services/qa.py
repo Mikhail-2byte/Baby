@@ -43,7 +43,8 @@
 
 import logging
 import re
-from dataclasses import dataclass
+import secrets
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from bot.services import kb, llm, qa_log
@@ -112,6 +113,11 @@ class Result:
     answer: str  # пусто, если `kind` не `ANSWERED`
     chunks: tuple[kb.Chunk, ...]
     reason: str = ""  # техническая причина, для лога
+    # Метка этого вопроса в `qa.log`. Нужна кнопкам 👍/👎: склеить вердикт с
+    # вопросом по `message_id` нельзя — ответ и его оценка приходят разными
+    # апдейтами. Последним полем и со значением по умолчанию намеренно:
+    # `Result(NOT_FOUND, "", ())` из тестов и заглушек остаётся рабочей
+    qid: str = ""
 
 
 _NUMBER = re.compile(r"\d+(?:[.,]\d+)?")
@@ -173,7 +179,23 @@ def build_user(question: str, chunks: tuple[kb.Chunk, ...]) -> str:
     return "\n".join(parts)
 
 
-async def answer(question: str) -> Result:
+def new_qid() -> str:
+    """Метка вопроса: восемь знаков, первый — цифра.
+
+    Цифра впереди не для красоты. Имя действия в таблице `usage` собирается из
+    токенов `callback_data`, пока они похожи на имя (строчная латиница), и
+    чистый hex вида `a3f1c8ad` под это правило подходит — примерно раз на
+    две-три тысячи вопросов отчёт получил бы мусорное «действие» со счётчиком
+    единица. Цифра впереди делает такое невозможным по построению, а не по
+    счастливому стечению.
+
+    Двоеточия в алфавите нет: на нём `CallbackData.pack()` бросает
+    `ValueError`, то есть кнопка вердикта не собралась бы вовсе.
+    """
+    return secrets.choice("0123456789") + secrets.token_hex(4)[1:]
+
+
+async def answer(question: str, *, chat: int | None = None) -> Result:
     """Ответ на вопрос. Исключений наружу не выпускает.
 
     Обещание держится здесь, а не надеждой на вызываемых. `llm.ask` свой
@@ -181,21 +203,39 @@ async def answer(question: str) -> Result:
     мог оказаться подменённым или битым: `sqlite3.DatabaseError` оттуда прошёл
     бы насквозь до хендлера, а упавший хендлер — это потерянный навсегда
     апдейт. Битая база — это «базы нет», так и отвечаем.
+
+    `qid` рождается здесь и **штампуется на всех путях**, включая этот
+    `except`: у молчания тоже должен быть вердикт — «и правильно, что
+    промолчал» есть ровно то число, ради которого заведён семантический сторож
+    молчания.
+
+    `chat` — с умолчанием, и это названная дыра. Боевой вызов один
+    (`handlers/qa.py`), а вызовов из тестов два десятка, и требовать аргумент
+    значило бы переписать их все ради строки в логе. Сторожит боевой путь
+    поведенческий тест через диспетчер, а не внимательность.
     """
+    qid = new_qid()
     try:
-        return await _answer(question)
+        return replace(await _answer(question, qid=qid, chat=chat), qid=qid)
     except Exception:
         log.exception("Не удалось ответить на вопрос")
-        return Result(NO_KB, "", (), BROKEN)
+        return Result(NO_KB, "", (), BROKEN, qid)
 
 
-async def _answer(question: str) -> Result:
+async def _answer(question: str, *, qid: str, chat: int | None) -> Result:
     if not kb.available():
         return Result(NO_KB, "", ())
 
     chunks = tuple(await kb.search(question))
     if not chunks:
-        qa_log.write(event="qa", question=question, outcome=NOT_FOUND, calls=0)
+        qa_log.write(
+            event="qa",
+            chat=chat,
+            qid=qid,
+            question=question,
+            outcome=NOT_FOUND,
+            calls=0,
+        )
         return Result(NOT_FOUND, "", ())
 
     # Своя строка в логе, а не общая: `reply` здесь не существует, и приписать
@@ -203,13 +243,23 @@ async def _answer(question: str) -> Result:
     # посчитать вовсе
     if qa_log.quota_spent():
         log.warning("Суточная квота обращений к модели исчерпана")
-        qa_log.write(event="qa", question=question, outcome=EXTRACT, reason=llm.QUOTA, calls=0)
+        qa_log.write(
+            event="qa",
+            chat=chat,
+            qid=qid,
+            question=question,
+            outcome=EXTRACT,
+            reason=llm.QUOTA,
+            calls=0,
+        )
         return _extract(chunks, llm.QUOTA)
 
     reply = await llm.ask(SYSTEM, build_user(question, chunks), models=llm.answer_chain())
     result = decide(question, chunks, reply)
     qa_log.write(
         event="qa",
+        chat=chat,
+        qid=qid,
         question=question,
         outcome=result.kind,
         reason=result.reason,

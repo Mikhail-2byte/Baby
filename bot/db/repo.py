@@ -24,6 +24,7 @@ from bot.db.models import (
     Measurement,
     Member,
     Reminder,
+    Usage,
 )
 
 # --- Семья и участники ----------------------------------------------------
@@ -844,4 +845,46 @@ async def raise_alert(
     session: AsyncSession, child_id: int, flag_id: str, day: date
 ) -> None:
     session.add(Alert(child_id=child_id, flag_id=flag_id, raised_on=day))
+    await session.commit()
+
+
+# --- Учёт использования ---------------------------------------------------
+
+
+async def add_usage(
+    session: AsyncSession,
+    *,
+    at: datetime,
+    family_id: int | None,
+    member_id: int | None,
+    kind: str,
+    action: str,
+    detail: str,
+    handled: bool,
+    ms: int,
+) -> None:
+    """Записать, что кто-то что-то нажал.
+
+    Аргументы плоские, без объектов ORM, и это существенно: зовут эту функцию
+    из `UsageMiddleware`, а та пишет в **свою** сессию, не в ту, которую
+    держит `FamilyMiddleware`. Приняв `Family`, мы притащили бы объект чужой
+    сессии — и первое же обращение к непрогруженному атрибуту дало бы
+    `MissingGreenlet` посреди побочной записи.
+
+    `detail` приходит строкой, а пустая едет в базу как `NULL`: отличать
+    «вердикт без вопроса» от «действие, у которого подробности не бывает»
+    отчёту придётся, и пустая строка эту разницу стёрла бы.
+    """
+    session.add(
+        Usage(
+            at=at,
+            family_id=family_id,
+            member_id=member_id,
+            kind=kind,
+            action=action[:64],
+            detail=detail[:32] or None,
+            handled=handled,
+            ms=ms,
+        )
+    )
     await session.commit()

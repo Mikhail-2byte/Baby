@@ -1127,7 +1127,7 @@ class _Stand:
     def answers_questions(self) -> None:
         from bot.services import qa as qa_service
 
-        async def answer(question):
+        async def answer(question, *, chat=None):
             self.asked.append(question)
             return qa_service.Result(qa_service.NOT_FOUND, "", ())
 

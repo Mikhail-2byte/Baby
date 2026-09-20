@@ -654,8 +654,12 @@ def wired(session, family, child, mother, monkeypatch):
 
     asked: list[str] = []
 
-    async def answer(question: str) -> qa.Result:
+    async def answer(question: str, *, chat: int | None = None) -> qa.Result:
         asked.append(question)
+        # Заглушка повторяет боевую подпись, включая `chat`: без него
+        # хендлер упал бы на `TypeError`, а апдейт в бою терялся бы навсегда.
+        # `qid` пустой намеренно — так проверяется откат разметки на
+        # `keyboards.home()` там, где склеивать вердикт не с чем
         return qa.Result(qa.NOT_FOUND, "", ())
 
     monkeypatch.setattr(qa_handler.qa, "answer", answer)

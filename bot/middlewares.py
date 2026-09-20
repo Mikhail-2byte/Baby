@@ -10,19 +10,23 @@
 """
 
 import logging
+import time
 from collections.abc import Awaitable, Callable
 from typing import Any
 
-from aiogram import BaseMiddleware, Bot
+from aiogram import BaseMiddleware, Bot, Dispatcher
+from aiogram.dispatcher.event.bases import UNHANDLED
 from aiogram.fsm.context import FSMContext
 from aiogram.types import Chat, Message, TelegramObject, Update, User
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot import keyboards, texts
 from bot.db import repo
-from bot.db.models import Family
+from bot.db.models import Family, Member
 from bot.db.session import Session
 from bot.services import sending
+from bot.services import timeutil as tu
+from bot.services import usage as usage_names
 
 log = logging.getLogger(__name__)
 
@@ -291,3 +295,128 @@ class FamilyMiddleware(BaseMiddleware):
                     "Семья переехала: %s → %s", message.migrate_from_chat_id, chat.id
                 )
         return False
+
+
+class UsageMiddleware(BaseMiddleware):
+    """Одна строка в `usage` на апдейт: кто, когда, что нажал и сработало ли.
+
+    Отдельный класс, а не ветка в `FamilyMiddleware`: та уже делает три вещи —
+    заводит семью, подставляет ребёнка и догоняет приветствие.
+
+    **Регистрируется следом за `FamilyMiddleware` и потому работает внутри
+    неё.** `wrap_middlewares` наматывает список через `reversed`, значит первый
+    зарегистрированный оказывается снаружи.
+
+    Довод здесь не в том, что иначе не видно `family`: `data` — один и тот же
+    словарь, и подставленное в него видно с обеих сторон. Проверено мутацией —
+    перестановка регистрации местами тест на автора не красит.
+
+    Довод в `handled`. Снаружи `await handler(...)` — это вызов
+    `FamilyMiddleware`, а та на ветке переезда чата в супергруппу возвращает
+    `None`, не позвав ни одного роутера. `None is not UNHANDLED`, то есть
+    служебный апдейт о переезде записался бы обработанным нажатием. Изнутри мы
+    зовём прямо `dp.update.trigger`, и его результат — сентинел в чистом виде.
+    Заодно `ms` меряет хендлер, а не сетевой `bot.me()` соседней middleware.
+
+    **`handled` значит «апдейт забрал какой-то роутер», а не «человек получил
+    ответ».** Хендлер, молча вышедший по `child is None`, тоже `handled`.
+    Ценность колонки в обратном значении: кнопка, под которой нет ни одного
+    сошедшегося фильтра, в чате молчит, а в коде выглядит целой — увидеть её
+    больше нечем.
+
+    **Пишем в свою сессию, а не в `data["session"]`.** Довод не в чистоте.
+    Упавший на записи хендлер оставляет сессию ждущей отката, и без
+    `rollback()` наша строка не записалась бы ровно там, где она ценнее всего.
+    А `rollback()` экспайрит все объекты сессии — и `FamilyMiddleware`, которая
+    сразу после нас читает `family.greeted_at`, получила бы `MissingGreenlet`
+    на пустом месте. То есть строка аналитики отняла бы у семьи приветствие
+    вместе с постоянной клавиатурой. Поэтому из `data` берутся только
+    `family.id` и `member.id` — обычные числа, загруженные к этому моменту
+    (`expire_on_commit=False`), — а пишутся они через свой `Session()`.
+    Прецедент на «своя сессия вместо чужой» в проекте есть: так устроен тикер.
+
+    **Две явные ветки, а не `try/finally`.** `await` в `finally` во время
+    раскрутки исключения, упав сам, подменил бы исключение хендлера — молча и
+    с чужим traceback. Поэтому исключение перехватывается, строка пишется,
+    и дальше голый `raise`.
+
+    **Сбой самой записи не стоит человеку ответа** — пункт 3 контракта ошибок
+    проекта. Всё тело `_note` глотает исключения целиком, как `qa_log.write`.
+
+    Чего эта middleware не видит, названо вслух: тикер идёт мимо диспетчера, и
+    ни одно отправленное ботом напоминание, карточка опроса или дайджест сюда
+    не попадают. Видны только нажатия на кнопки под ними.
+    """
+
+    async def __call__(
+        self,
+        handler: Callable[[TelegramObject, dict[str, Any]], Awaitable[Any]],
+        event: TelegramObject,
+        data: dict[str, Any],
+    ) -> Any:
+        started = time.monotonic()
+        try:
+            result = await handler(event, data)
+        except Exception:
+            await self._note(event, data, handled=False, started=started)
+            raise
+        await self._note(
+            event, data, handled=result is not UNHANDLED, started=started
+        )
+        return result
+
+    @staticmethod
+    async def _note(
+        event: TelegramObject,
+        data: dict[str, Any],
+        *,
+        handled: bool,
+        started: float,
+    ) -> None:
+        """Записать строку. Исключений наружу не выпускает."""
+        try:
+            if not isinstance(event, Update):
+                return
+            kind, action, detail = usage_names.describe(event)
+
+            family: Family | None = data.get("family")
+            member: Member | None = data.get("member")
+            async with Session() as session:
+                await repo.add_usage(
+                    session,
+                    at=tu.now_utc(),
+                    family_id=family.id if family is not None else None,
+                    member_id=member.id if member is not None else None,
+                    kind=kind,
+                    action=action,
+                    detail=detail,
+                    handled=handled,
+                    ms=int((time.monotonic() - started) * 1000),
+                )
+        except Exception:
+            log.exception("Не удалось записать использование")
+
+
+def install(dp: Dispatcher) -> None:
+    """Навесить middleware проекта на диспетчер.
+
+    Одно место на всех, и это не украшение. Диспетчер собирают двое —
+    `bot/__main__.py` и стенд (`tools/stand/harness.py`), — и докстрока стенда
+    обещает, что он собирается «ровно так же». Пока middleware было две,
+    обещание держалось на внимательности: две одинаковые строки в двух файлах.
+    Третья разошлась бы с первой копией молча, и симптомом была бы живая
+    проверка с зелёным протоколом, не проверяющая ровно то, ради чего написана.
+
+    Порядок здесь значим и потому записан один раз:
+
+    * `FamilyMiddleware` первой — она кладёт в `data` семью и участника;
+    * `UsageMiddleware` следом, то есть **внутри** неё: снаружи её `handled`
+      считал бы обработанным всё, что `FamilyMiddleware` забрала себе, не
+      позвав ни одного роутера. Подробности — в её докстроке;
+    * `drop_wizard_state` на `dp.message` — outer, потому что решение «команда
+      пришла посреди мастера» обязано быть одинаковым для всех роутеров, а не
+      зависеть от того, чей фильтр сойдётся первым.
+    """
+    dp.update.outer_middleware(FamilyMiddleware())
+    dp.update.outer_middleware(UsageMiddleware())
+    dp.message.outer_middleware(drop_wizard_state)

@@ -2,8 +2,8 @@
 
 Собирается ровно так же, как `bot/__main__.py`, и отличается в двух местах:
 апдейты приходят из `feed_update`, а не из long polling, и `answerCallbackQuery`
-перехвачен (см. `session.py`). Всё остальное боевое — та же `FamilyMiddleware`,
-тот же `drop_wizard_state`, тот же список роутеров целиком и тот же тикер.
+перехвачен (см. `session.py`). Всё остальное боевое — те же middleware через
+ту же `middlewares.install`, тот же список роутеров целиком и тот же тикер.
 
 Список роутеров берётся как `handlers.routers`, а не собирается здесь своей
 тройкой. Это прямое следствие инварианта проекта: тест, составляющий свой
@@ -44,10 +44,9 @@ from aiogram.types import (
     Voice,
 )
 
-from bot import handlers
+from bot import handlers, middlewares
 from bot.config import settings
 from bot.db.session import engine
-from bot.middlewares import FamilyMiddleware, drop_wizard_state
 from bot.services import kb, lock, panel, ticker
 from tools.stand.session import Outgoing, StandSession
 
@@ -128,8 +127,10 @@ class Stand:
             default=DefaultBotProperties(parse_mode="HTML"),
         )
         self.dp = Dispatcher()
-        self.dp.update.outer_middleware(FamilyMiddleware())
-        self.dp.message.outer_middleware(drop_wizard_state)
+        # Та же `install`, что зовёт `bot/__main__.py`. Своя пара строк здесь
+        # уже была и держалась на внимательности; со третьей middleware стенд
+        # начал бы проверять не то, что работает в бою
+        middlewares.install(self.dp)
         for router in handlers.routers:
             self.dp.include_router(router)
 

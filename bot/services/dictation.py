@@ -369,17 +369,32 @@ def _text(value: object, limit: int) -> str | None:
 
 
 async def interpret(
-    text: str, *, now_local: datetime, tz: str, child_name: str, age: str
+    text: str,
+    *,
+    now_local: datetime,
+    tz: str,
+    child_name: str,
+    age: str,
+    chat: int | None = None,
 ) -> Result:
     """Расшифровка → разбор. Исключений наружу не выпускает.
 
     Обещание держится здесь, а не надеждой на вызываемых: `llm.ask` свой
     контракт соблюдает, но `normalize` работает с чем угодно, что придёт от
     модели, а упавший хендлер — это потерянный навсегда апдейт.
+
+    `chat` едет только в `qa.log` и больше никуда: модуль остаётся чистым —
+    ни aiogram, ни БД, ни таймзон. Без него по журналу не видно, какая семья
+    тратит общую суточную квоту, а семей с 19.09.2026 больше одной.
     """
     try:
         return await _interpret(
-            text, now_local=now_local, tz=tz, child_name=child_name, age=age
+            text,
+            now_local=now_local,
+            tz=tz,
+            child_name=child_name,
+            age=age,
+            chat=chat,
         )
     except Exception:
         log.exception("Не удалось разобрать расшифровку")
@@ -387,7 +402,13 @@ async def interpret(
 
 
 async def _interpret(
-    text: str, *, now_local: datetime, tz: str, child_name: str, age: str
+    text: str,
+    *,
+    now_local: datetime,
+    tz: str,
+    child_name: str,
+    age: str,
+    chat: int | None,
 ) -> Result:
     # `model_chain` первым, `answer_chain` запасным — именно в этом порядке.
     # `llm.answer_chain` падает на `model_chain`, но не наоборот, и `.env`,
@@ -404,7 +425,14 @@ async def _interpret(
         # сами и говорим об этом вслух, заодно не тратя на заведомый отказ всю
         # цепочку с её повторами
         log.warning("Суточная квота обращений к модели исчерпана")
-        qa_log.write(event="voice", text=text, outcome=FAILED, reason=llm.QUOTA, calls=0)
+        qa_log.write(
+            event="voice",
+            chat=chat,
+            text=text,
+            outcome=FAILED,
+            reason=llm.QUOTA,
+            calls=0,
+        )
         return Result(FAILED, (), llm.QUOTA)
 
     system = build_system(now_local, tz, child_name, age)
@@ -413,6 +441,7 @@ async def _interpret(
     if not reply.ok:
         qa_log.write(
             event="voice",
+            chat=chat,
             text=text,
             outcome=FAILED,
             model=reply.model,
@@ -426,6 +455,7 @@ async def _interpret(
     intent, records = normalize(reply.data, now_local)
     qa_log.write(
         event="voice",
+        chat=chat,
         text=text,
         outcome=intent,
         kinds=[one.kind for one in records],
