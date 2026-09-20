@@ -52,9 +52,10 @@ NOW = datetime(2026, 9, 13, 12, 0)
 # --- чистая функция разбора ------------------------------------------------
 
 
-@pytest.mark.parametrize(
-    ("data", "action"),
-    [
+# Все префиксы проекта и то, во что превращается их `callback_data`. Список
+# один, читателей двое: табличный тест и сверка полноты ниже. Второй список
+# был бы не дублем, а расхождением с отложенным сроком
+CASES = [
         ("trk:start:feed_breast:L", "trk:start:feed_breast"),
         ("trk:add:diaper_wet:", "trk:add:diaper_wet"),
         ("undo:event:412", "undo:event"),
@@ -69,8 +70,13 @@ NOW = datetime(2026, 9, 13, 12, 0)
         ("msr:weight", "msr:weight"),
         ("vc:save", "vc:save"),
         ("sex:f", "sex:f"),
-    ],
-)
+        ("ask", "ask"),
+        ("edit:born", "edit:born"),
+        ("new:baby", "new:baby"),
+    ]
+
+
+@pytest.mark.parametrize(("data", "action"), CASES)
 def test_a_row_id_never_becomes_an_action(data: str, action: str) -> None:
     """Номер строки в имени действия — это и мусор, и утечка.
 
@@ -78,10 +84,35 @@ def test_a_row_id_never_becomes_an_action(data: str, action: str) -> None:
     со счётчиком единица, и топ нажатий перестал бы что-либо означать. Утечка —
     потому что 57 в `rec:shift:e:57` это номер записи в дневнике ребёнка.
 
-    Параметры перечисляют все четырнадцать префиксов проекта: правило одно на
-    всех, и проверять его на одном классе значило бы проверять пример.
+    Параметры перечисляют все префиксы проекта: правило одно на всех, и
+    проверять его на одном классе значило бы проверять пример. Что список
+    полон, сверяет соседний тест, а не счёт в этой докстроке — число в тексте
+    устаревает молча, и первая же новая кнопка сделала бы его неправдой.
     """
     assert usage.button_action(data)[0] == action
+
+
+def test_every_button_prefix_has_a_case() -> None:
+    """Новая кнопка обязана попасть в таблицу примеров выше.
+
+    Без этой сверки набор примеров стареет молча: класс добавили, правило на
+    нём не проверили, и разбор его `callback_data` выяснится в отчёте — по
+    мусорному действию с номером строки внутри.
+
+    Реестр берётся перебором подклассов `CallbackData` в `bot.keyboards`, а не
+    списком здесь: второй список и есть то, что стареет.
+    """
+    from aiogram.filters.callback_data import CallbackData
+
+    known = {
+        str(value.__prefix__)
+        for name in dir(keyboards)
+        if isinstance(value := getattr(keyboards, name), type)
+        and issubclass(value, CallbackData)
+        and value is not CallbackData
+    }
+    covered = {data.split(":")[0] for data, _ in CASES}
+    assert known <= covered, f"без примера остались префиксы: {sorted(known - covered)}"
 
 
 def test_the_verdict_keeps_its_question_and_nobody_else_does() -> None:

@@ -94,7 +94,11 @@ def describe(update: Update) -> tuple[str, str, str]:
     if message is not None:
         if message.voice is not None or message.audio is not None:
             return VOICE, VOICE, ""
-        text = (message.text or "").strip()
+        # Подпись к фото — такая же реплика человека, как текст: `alarm`
+        # висит на `F.text | F.caption` и её разбирает. В корзину `other`
+        # она попадала бы вместе со служебными сообщениями, то есть раздел
+        # «ничего не сделали» врал бы про свой состав
+        text = (message.text or message.caption or "").strip()
         if text.startswith("/"):
             return COMMAND, _command(text), ""
         if text in keyboards.HOME_LABELS:
