@@ -14,40 +14,28 @@ _reaches_the_table`. Остальные про механику, а он про 
 Прогон идёт через настоящий диспетчер с **боевыми** middleware — той самой
 `middlewares.install`, которую зовут `bot/__main__.py` и стенд. Свой порядок
 из двух строк доказывал бы, что механизм работает при правильной сборке, и
-молчал бы о том, какова сборка на самом деле.
+молчал бы о том, какова сборка на самом деле. Сама сборка (`wired`) переехала
+в `conftest.py`, когда у неё появился второй читатель.
 """
 
 from __future__ import annotations
 
-from datetime import datetime
 from typing import Any
 
 import pytest
-import pytest_asyncio
-from aiogram import Bot, Dispatcher
-from aiogram.client.session.base import BaseSession
-from aiogram.methods import GetMe, TelegramMethod
 from aiogram.types import (
     CallbackQuery,
-    Chat,
     Message,
     Update,
-    User,
     Voice,
 )
 from sqlalchemy import select
 
-from bot import handlers, keyboards, middlewares
+from bot import keyboards
 from bot.db.models import Usage
 from bot.handlers import qa as qa_handler
 from bot.services import qa, qa_log, usage
-
-CHAT = Chat(id=-1001, type="supergroup", title="Малышка")
-PRIVATE = Chat(id=555, type="private")
-AUTHOR = User(id=222, is_bot=False, first_name="Аня")
-ME = User(id=42, is_bot=True, first_name="Бот", username="BabyBot")
-NOW = datetime(2026, 9, 13, 12, 0)
-
+from tests.conftest import AUTHOR, CHAT, ME, NOW, PRIVATE
 
 # --- чистая функция разбора ------------------------------------------------
 
@@ -151,32 +139,6 @@ def test_a_command_leaves_its_arguments_outside() -> None:
 # --- прогон через настоящие middleware -------------------------------------
 
 
-class RecordingSession(BaseSession):
-    """Сеть не трогаем."""
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.sent: list[str] = []
-        self.markups: list[Any] = []
-
-    async def close(self) -> None:
-        return None
-
-    async def make_request(
-        self, bot: Any, method: TelegramMethod[Any], timeout: int | None = None
-    ) -> Any:
-        if isinstance(method, GetMe):
-            return ME
-        payload = method.model_dump(exclude_none=True)
-        if "text" in payload:
-            self.sent.append(payload["text"])
-            self.markups.append(getattr(method, "reply_markup", None))
-        return Message(message_id=999, date=NOW, chat=CHAT, from_user=AUTHOR, text="")
-
-    async def stream_content(self, *args: Any, **kwargs: Any) -> Any:  # pragma: no cover
-        raise NotImplementedError
-
-
 def _message_update(update_id: int, **fields: Any) -> Update:
     message = Message(message_id=update_id, date=NOW, chat=CHAT, from_user=AUTHOR, **fields)
     return Update(update_id=update_id, message=message)
@@ -188,47 +150,6 @@ def _tap_update(update_id: int, data: str) -> Update:
         id=str(update_id), from_user=AUTHOR, chat_instance="ci", message=message, data=data
     )
     return Update(update_id=update_id, callback_query=call)
-
-
-@pytest_asyncio.fixture
-async def wired(session_maker, session, family, child, mother, monkeypatch):
-    """Диспетчер, собранный боевой `middlewares.install`.
-
-    Подменяется ровно одна вещь — фабрика сессий: и `FamilyMiddleware`, и
-    `UsageMiddleware` открывают свою, а боевая смотрит в `data/baby.db`. Всё
-    остальное настоящее, включая порядок middleware, ради которого тест и
-    существует: `UsageMiddleware` обязана оказаться **внутри**
-    `FamilyMiddleware`, иначе `family` и `member` к ней не приедут.
-
-    Отметка приветствия ставится и **коммитится**: `FamilyMiddleware` читает
-    семью своей сессией, и непрокоммиченное присваивание она не увидит — пойдёт
-    здороваться и спросит у Telegram про права, то есть уткнётся в заглушку.
-    """
-    family.greeted_at = NOW
-    await session.commit()
-    monkeypatch.setattr(middlewares, "Session", session_maker)
-
-    talk = RecordingSession()
-    bot = Bot(token="42:TEST", session=talk)
-    dp = Dispatcher()
-    middlewares.install(dp)
-
-    order = tuple(handlers.routers)
-    for router in order:
-        dp.include_router(router)
-
-    async def refresh(*args: Any, **kwargs: Any) -> None:
-        return None
-
-    # `panel.schedule` зовут без `await` — она синхронная и заводит задачу
-    # дебаунса. Асинхронная замена дала бы «coroutine was never awaited»
-    monkeypatch.setattr("bot.services.panel.refresh", refresh)
-    monkeypatch.setattr("bot.services.panel.schedule", lambda *a, **k: None)
-
-    yield dp, bot, talk
-
-    for router in order:
-        router._parent_router = None
 
 
 async def _rows(session_maker) -> list[Usage]:

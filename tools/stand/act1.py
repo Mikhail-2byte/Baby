@@ -771,45 +771,6 @@ async def run(stand: Stand) -> None:
             " оговоркой про отсутствие цифры — молчание здесь было бы перегибом"
         )
 
-    async with stand.step("36в", "приглашение к вопросу — носитель клавиатуры") as r:
-        await stand.tap(AskCB().pack())
-        await stand.settle(1.5)
-        r.expect("Напишите вопрос")
-        r.expect_keyboard()
-        r.note(
-            "Шаг отделён от следующего нарочно: `expect_keyboard` судит шаг"
-            " целиком, и приглашение с ответом в одном шаге проверяли бы"
-            " «хоть где-то», то есть не проверяли бы ничего"
-        )
-
-    async with stand.step("36г", "под ответом кнопки вердикта, а клавиатуры нет") as r:
-        await stand.say("чем обрабатывать пупочную ранку")
-        await stand.settle(3.0)
-        r.expect_button("👍 Помогло", "👎 Не то")
-        r.expect_keyboard(False)
-        r.note(
-            "Одно сообщение обе разметки не носит. Носителем был предыдущий"
-            " шаг — размен назван вслух в CLAUDE.md"
-        )
-
-    async with stand.step("36д", "вердикт: 👎 записывается и гасит кнопки") as r:
-        qid = _last_qid()
-        if not qid:
-            r.note("В qa.log нет строки с qid — вердикт проверить нечем")
-        else:
-            await stand.tap(QaCB(action="down", qid=qid).pack())
-            await stand.settle(1.5)
-            r.expect("Спасибо")
-            after = [line for line in _qa_log() if line.get("event") == "qa_verdict"]
-            if not any(line.get("qid") == qid for line in after):
-                stand.protocol.fail("шаг 36д", "вердикт не доехал до qa.log")
-            r.show(
-                "нажатия вердикта",
-                "SELECT kind, action, detail, handled FROM usage "
-                "WHERE action LIKE 'qav%' ORDER BY id DESC LIMIT 3",
-            )
-        r.note("Вторая половина склейки — строка usage с тем же qid в detail")
-
     async with stand.step("37", "❓ Вопрос → тревожный признак перехватывает alarm") as r:
         await stand.tap(AskCB().pack())
         await stand.settle(1.5)
@@ -850,6 +811,66 @@ async def run(stand: Stand) -> None:
         r.note(f"панель стала #{after}")
         if before is not None and after is not None and after == before:
             stand.protocol.fail("шаг 39", "панель не перевыпущена, хотя уехала")
+
+    # Шаги вердикта стоят здесь, а не в разделе вопросов, и это не вкусовщина.
+    # Шаг 39 — единственный в акте, который считает сообщения: он шлёт
+    # шестнадцать штук и ждёт перевыпуска панели. Три лишних сообщения выше по
+    # ленте сдвигают порог, панель перевыпускается раньше, и шаг 39 падает
+    # ложно — проверено прогоном 20.09. Ниже по ленте счёт уже не важен никому
+    async with stand.step("39а", "приглашение к вопросу — носитель клавиатуры") as r:
+        await stand.tap(AskCB().pack())
+        await stand.settle(1.5)
+        r.expect("Напишите вопрос")
+        r.expect_keyboard()
+        r.note(
+            "Шаг отделён от следующего нарочно: `expect_keyboard` судит шаг"
+            " целиком, и приглашение с ответом в одном шаге проверяли бы"
+            " «хоть где-то», то есть не проверяли бы ничего"
+        )
+
+    async with stand.step("39б", "под ответом кнопки вердикта, а клавиатуры нет") as r:
+        await stand.say("чем обрабатывать пупочную ранку")
+        await stand.settle(3.0)
+        r.expect_button("👍 Помогло", "👎 Не то")
+        r.expect_keyboard(False)
+        r.note(
+            "Одно сообщение обе разметки не носит. Носителем был предыдущий"
+            " шаг — размен назван вслух в CLAUDE.md"
+        )
+
+    async with stand.step("39в", "вердикт: 👎 записан и гасит кнопки под ответом") as r:
+        qid = _last_qid()
+        # `on="last"` обязателен: по умолчанию `tap` цепляет нажатие к панели,
+        # и первый прогон 20.09 это показал — вердикт погасил кнопки у панели,
+        # а не у ответа, и протокол был зелёным. В бою `call.message` — это
+        # само сообщение с кнопкой, здесь его надо назвать руками
+        answer_id = stand.session.last_message_id
+        if not qid:
+            r.note("В qa.log нет строки с qid — вердикт проверить нечем")
+        else:
+            await stand.tap(QaCB(action="down", qid=qid).pack(), on="last")
+            await stand.settle(1.5)
+            r.expect("Спасибо")
+            after = [line for line in _qa_log() if line.get("event") == "qa_verdict"]
+            if not any(line.get("qid") == qid for line in after):
+                stand.protocol.fail("шаг 39в", "вердикт не доехал до qa.log")
+            # `stand.session.records`, а не `r.seen`: второй наполняется
+            # дренажем на закрытии шага и во время тела пуст. Первый прогон
+            # 20.09 на этом и споткнулся — проверка «погасили не под ответом»
+            # упала там, где правка ушла ровно куда надо
+            if not any(
+                one.kind == "edit" and one.extra.get("target") == answer_id
+                for one in stand.session.records
+            ):
+                stand.protocol.fail(
+                    "шаг 39в", f"кнопки погашены не под ответом #{answer_id}"
+                )
+            r.show(
+                "нажатия вердикта",
+                "SELECT kind, action, detail, handled FROM usage "
+                "WHERE action LIKE 'qav%' ORDER BY id DESC LIMIT 3",
+            )
+        r.note("Вторая половина склейки — строка usage с тем же qid в detail")
 
     await stand.mark("Дальше выгрузка — откройте файлы")
 

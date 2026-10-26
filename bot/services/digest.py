@@ -93,10 +93,15 @@ async def send_for(
         session, child, family.tz, now=now, ending_yesterday=True
     )
     if total.feeds == 0 and not total.sleep_time:
-        status = await sending.deliver(bot, family, texts.DIGEST_NO_DATA)
+        status = await sending.deliver(
+            bot, family, texts.DIGEST_NO_DATA, session=session
+        )
     else:
         status = await sending.deliver(
-            bot, family, texts.DIGEST_HEAD + texts.week_summary(child, total, days)
+            bot,
+            family,
+            texts.DIGEST_HEAD + texts.week_summary(child, total, days),
+            session=session,
         )
 
     if status == sending.RETRY:

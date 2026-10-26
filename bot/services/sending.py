@@ -9,20 +9,34 @@
 нет и в плане её нет, поэтому `delete_batch` убран. `delete_one` вернулся:
 нажатие кнопки постоянной клавиатуры Telegram кладёт в чат обычным сообщением
 от человека, и его надо убрать сразу.
+
+С 21.09.2026 модуль знает про `repo`, и это расхождение с копией названо
+вслух: переезд группы в супергруппу Telegram сообщает **ошибкой отправки**, и
+кроме как здесь узнать о нём неоткуда. Служебное сообщение о переезде —
+первая дорога, и она теряется вместе с очередью Telegram, когда ПК уходит в
+сон: `bot/__main__.py` зовёт `delete_webhook(drop_pending_updates=True)`. У
+фичи, доезжающей одним необязательным путём, нет ни одного пути.
 """
 
 import logging
 
 from aiogram import Bot
 from aiogram.enums import ChatMemberStatus
-from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
+from aiogram.exceptions import (
+    TelegramBadRequest,
+    TelegramForbiddenError,
+    TelegramMigrateToChat,
+    TelegramRetryAfter,
+)
 from aiogram.types import (
     ForceReply,
     InlineKeyboardMarkup,
     ReplyKeyboardMarkup,
     ReplyKeyboardRemove,
 )
+from sqlalchemy.ext.asyncio import AsyncSession
 
+from bot.db import repo
 from bot.db.models import Family
 
 log = logging.getLogger(__name__)
@@ -43,6 +57,7 @@ FORBIDDEN = "forbidden"  # бота выгнали — ретраить бесс
 BROKEN = "broken"  # наш текст не принимают: повтор даст ту же ошибку
 RETRY = "retry"  # сеть или флуд-контроль — попробуем на следующем тике
 NOT_FOUND = "not_found"  # сообщения больше нет — править нечего, нужно новое
+MOVED = "moved"  # группа стала супергруппой, а переехать не вышло — см. `send`
 
 
 async def send(
@@ -52,6 +67,7 @@ async def send(
     *,
     silent: bool = False,
     reply_markup: Markup = None,
+    session: AsyncSession | None = None,
 ) -> tuple[str, int | None]:
     """Отправить сообщение в чат семьи. Исключений наружу не выпускает.
 
@@ -59,6 +75,16 @@ async def send(
 
     `reply_markup` нужен фоновым сообщениям с кнопками: раньше клавиатуру
     принимал только `edit`.
+
+    **`session` — это вторая дорога переезда в супергруппу.** С ней ошибка
+    `TelegramMigrateToChat` не «сбой отправки», а сообщение Telegram о новом
+    `chat_id`: семья переезжает, и отправка повторяется один раз, уже в живой
+    чат. Без сессии чинить переезд некому — возвращаем `MOVED`, и вызывающий
+    обязан считать его терминальным: повтор в мёртвый чат даст ту же ошибку
+    каждую минуту, ровно как это делал дайджест 21.09.2026.
+
+    Правило записано здесь, а не у пяти вызывающих: копий было бы пять, и
+    разошлись бы они молча.
     """
     try:
         message = await bot.send_message(
@@ -80,16 +106,39 @@ async def send(
     except TelegramRetryAfter as exc:
         log.warning("Флуд-контроль в чате %s, ждём %s с", family.chat_id, exc.retry_after)
         return RETRY, None
+    except TelegramMigrateToChat as exc:
+        if not await _move(session, family, exc.migrate_to_chat_id):
+            return MOVED, None
+        # Второй переезд подряд невозможен, поэтому повтор идёт без сессии:
+        # зациклиться здесь не на чем
+        return await send(bot, family, text, silent=silent, reply_markup=reply_markup)
     except Exception:
         log.exception("Не удалось отправить в чат %s", family.chat_id)
         return RETRY, None
 
 
+async def _move(
+    session: AsyncSession | None, family: Family, new_chat_id: int
+) -> bool:
+    """Перевезти семью на новый `chat_id`. `False` — перевозить было некому."""
+    log.warning("Чат %s стал супергруппой %s", family.chat_id, new_chat_id)
+    if session is None:
+        return False
+    return await repo.migrate_family_chat_id(session, family.chat_id, new_chat_id)
+
+
 async def deliver(
-    bot: Bot, family: Family, text: str, *, reply_markup: Markup = None
+    bot: Bot,
+    family: Family,
+    text: str,
+    *,
+    reply_markup: Markup = None,
+    session: AsyncSession | None = None,
 ) -> str:
     """То же, что `send`, но без `message_id` — тикеру и дайджесту он не нужен."""
-    status, _ = await send(bot, family, text, reply_markup=reply_markup)
+    status, _ = await send(
+        bot, family, text, reply_markup=reply_markup, session=session
+    )
     return status
 
 
@@ -145,6 +194,7 @@ async def edit(
     message_id: int,
     text: str,
     reply_markup: EditMarkup = None,
+    session: AsyncSession | None = None,
 ) -> str:
     """Перерисовать сообщение в чате семьи. Исключений наружу не выпускает.
 
@@ -153,6 +203,11 @@ async def edit(
     Здесь наоборот — видимых ошибок быть не должно, а вместо исключения
     возвращается статус, по которому панель решает, править дальше или
     выпускать новую.
+
+    Переехавшая группа даёт `NOT_FOUND`, а не `MOVED`: правили мы сообщение
+    старого чата, и в новом его нет — значит нужна новая панель, а это уже
+    написанная ветка. `MOVED` остаётся на случай, когда перевезти семью не
+    удалось; тогда панели в этом чате не будет вовсе, и это правда.
     """
     try:
         await bot.edit_message_text(
@@ -179,6 +234,10 @@ async def edit(
     except TelegramRetryAfter as exc:
         log.warning("Флуд-контроль в чате %s, ждём %s с", family.chat_id, exc.retry_after)
         return RETRY
+    except TelegramMigrateToChat as exc:
+        if not await _move(session, family, exc.migrate_to_chat_id):
+            return MOVED
+        return NOT_FOUND
     except Exception:
         log.exception("Не удалось отредактировать в чате %s", family.chat_id)
         return RETRY

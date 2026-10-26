@@ -299,6 +299,7 @@ async def send_for(
             nothing=CARD.nothing_label,
             mute=CARD.mute_label,
         ),
+        session=session,
     )
     if status == sending.RETRY:
         return

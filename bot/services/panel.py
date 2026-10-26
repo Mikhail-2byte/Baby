@@ -172,15 +172,19 @@ async def _redraw(
 
     stale = force_new or _outdated(family, now, last_message_id)
     if family.panel_message_id is not None and not stale:
-        status = await sending.edit(bot, family, family.panel_message_id, text, markup)
+        status = await sending.edit(
+            bot, family, family.panel_message_id, text, markup, session=session
+        )
         if status in (sending.OK, sending.RETRY, sending.BROKEN):
             # Единственный внешний признак, что дебаунс сработал: на серию
             # тапов подряд в логе обязана быть одна строка, а не по строке
             # на каждый
             log.info("Панель #%s: правка, %s", family.panel_message_id, status)
             return
-        # Осталось NOT_FOUND (панель удалили руками) и FORBIDDEN (выгнали) —
-        # оба разбирает `_publish`
+        # Осталось NOT_FOUND (панель удалили руками), FORBIDDEN (выгнали) и
+        # MOVED (группа стала супергруппой, а переехать не вышло) — все трое
+        # разбирает `_publish`. Переехавшая группа даёт именно NOT_FOUND:
+        # правили сообщение старого чата, в новом его нет
 
     await _publish(bot, session, family, text, markup, now)
 
@@ -209,16 +213,18 @@ async def _publish(
 ) -> None:
     previous = family.panel_message_id
     status, message_id = await sending.send(
-        bot, family, text, silent=True, reply_markup=markup
+        bot, family, text, silent=True, reply_markup=markup, session=session
     )
     if status != sending.OK or message_id is None:
         if status == sending.FORBIDDEN and previous is not None:
             # Бота выгнали: старый id стал мусором. Вернут в чат — заведём новую
             await repo.set_panel(session, family, None, None)
-        elif status == sending.BROKEN and previous is not None:
+        elif status in (sending.BROKEN, sending.MOVED) and previous is not None:
             # Текст не принимают — повтор даст ровно ту же ошибку. Помечаем день
             # отработанным, иначе тикер, видя вчерашний `panel_day`, будет слать
-            # заведомо битое каждую минуту до полуночи
+            # заведомо битое каждую минуту до полуночи. `MOVED` сюда же: чат
+            # уехал, а перевезти семью не вышло — до вмешательства человека
+            # писать в него бессмысленно
             await repo.set_panel(
                 session, family, previous, tu.local_today(family.tz, now)
             )

@@ -204,6 +204,7 @@ async def close_stale_timers(
                 hours=settings.open_timer_max_hours,
             ),
             reply_markup=keyboards.record_fix(event.id, field="e"),
+            session=session,
         )
         log.info("Таймер #%s закрыт автоматически", event.id)
 
@@ -283,14 +284,16 @@ async def _handle(
     now: datetime,
 ) -> None:
     """Отправить сообщение и решить судьбу напоминаний, которые оно закрывает."""
-    result = await sending.deliver(bot, family, text)
+    result = await sending.deliver(bot, family, text, session=session)
     if result == sending.RETRY:
         return
     for reminder in covered:
         if result == sending.FORBIDDEN:
             await repo.deactivate_reminder(session, reminder)
-        elif result == sending.BROKEN:
-            # Повтор даст ту же ошибку — закрываем, чтобы не долбить каждый тик
+        elif result in (sending.BROKEN, sending.MOVED):
+            # Повтор даст ту же ошибку — закрываем, чтобы не долбить каждый тик.
+            # `MOVED` — это чат, уехавший в супергруппу, которого не вышло
+            # перевезти: писать в него до вмешательства человека бессмысленно
             await repo.mark_reminder_sent(session, reminder, now)
         else:
             await _settle(session, reminder, family.tz, now)
@@ -357,7 +360,9 @@ async def _watch_child(
     for watch in await _collect_watches(session, child, now, age):
         if await repo.alert_raised(session, child.id, watch.id, today):
             continue
-        status = await sending.deliver(bot, family, texts.watch_alert(watch))
+        status = await sending.deliver(
+            bot, family, texts.watch_alert(watch), session=session
+        )
         if status == sending.RETRY:
             # Сеть подвела — отметку не ставим, попробуем на следующем тике
             continue

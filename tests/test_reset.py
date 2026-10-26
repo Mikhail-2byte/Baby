@@ -19,7 +19,7 @@ from pathlib import Path
 from sqlalchemy import create_engine
 
 from bot.db.models import Base
-from tools import prod_chats, reset
+from tools import forget, prod_chats, reset, wipe
 from tools.wipe import WIPE_ORDER
 
 CHAT_ID = -100500
@@ -42,52 +42,58 @@ def _build(path: Path) -> None:
         conn.close()
 
 
-def _fill(path: Path) -> None:
-    """Семья со всем, что на неё ссылается, включая строку календаря."""
+def _fill(path: Path, family_id: int = 1, chat_id: int = CHAT_ID) -> None:
+    """Семья со всем, что на неё ссылается, включая строку календаря.
+
+    Номер семьи — параметр ради `tools/forget.py`: тому нужна вторая семья
+    в той же базе, и заполнять её вторым, почти таким же куском значило бы
+    проверять чистку одной семьи на данных, устроенных иначе.
+    """
     now = datetime.now(UTC).replace(tzinfo=None).isoformat(" ")
+    fid = family_id
     conn = sqlite3.connect(path)
     try:
         conn.execute(
             "INSERT INTO families (id, chat_id, title, tz, digest_dow, digest_time, "
-            f"created_at, checkin_hours, panel_message_id) VALUES (1, {CHAT_ID}, "
+            f"created_at, checkin_hours, panel_message_id) VALUES ({fid}, {chat_id}, "
             f"'Дочь', 'Asia/Yekaterinburg', 0, '10:00', '{now}', 0, 1501)"
         )
         conn.execute(
             "INSERT INTO members (id, family_id, tg_user_id, display_name, "
-            f"joined_at) VALUES (1, 1, 42, 'Мама', '{now}')"
+            f"joined_at) VALUES ({fid}, {fid}, 42, 'Мама', '{now}')"
         )
         conn.execute(
             "INSERT INTO children (id, family_id, name, sex, born_at, archived, "
-            f"created_at) VALUES (1, 1, 'Вера', 'f', '{now}', 0, '{now}')"
+            f"created_at) VALUES ({fid}, {fid}, 'Вера', 'f', '{now}', 0, '{now}')"
         )
         # Та самая строка: напоминание календаря знает ребёнка, и из-за неё
         # порядок «дети раньше напоминаний» падает с FOREIGN KEY constraint
         conn.execute(
             "INSERT INTO reminders (id, family_id, child_id, text, fire_at, "
             "active, preset, created_by, created_at) VALUES "
-            f"(1, 1, 1, 'АКДС', '{now}', 1, 'vaccine', 1, '{now}')"
+            f"({fid}, {fid}, {fid}, 'АКДС', '{now}', 1, 'vaccine', {fid}, '{now}')"
         )
         conn.execute(
             "INSERT INTO events (id, child_id, author_id, kind, started_at, "
-            f"estimated, created_at) VALUES (1, 1, 1, 'sleep', '{now}', 0, '{now}')"
+            f"estimated, created_at) VALUES ({fid}, {fid}, {fid}, 'sleep', '{now}', 0, '{now}')"
         )
         conn.execute(
             "INSERT INTO measurements (id, child_id, author_id, kind, taken_at, "
-            f"value, created_at) VALUES (1, 1, 1, 'weight', '{now}', 3356.0, '{now}')"
+            f"value, created_at) VALUES ({fid}, {fid}, {fid}, 'weight', '{now}', 3356.0, '{now}')"
         )
         conn.execute(
             "INSERT INTO alerts (id, child_id, flag_id, raised_on) VALUES "
-            f"(1, 1, 'few_wet_diapers', '{date.today()}')"
+            f"({fid}, {fid}, 'few_wet_diapers', '{date.today()}')"
         )
         # Нажатия ссылаются и на семью, и на участника. Структурный сторож
         # новую таблицу переживёт, а этот — нет: без чистки `usage` сброс
         # падает на `DELETE FROM members` с FOREIGN KEY constraint failed
         conn.execute(
             "INSERT INTO usage (id, at, family_id, member_id, kind, action, "
-            f"handled, ms) VALUES (1, '{now}', 1, 1, 'button', 'pnl:refresh', 1, 12)"
+            f"handled, ms) VALUES ({fid}, '{now}', {fid}, {fid}, 'button', 'pnl:refresh', 1, 12)"
         )
         conn.execute(
-            "INSERT INTO who_lms (sex, indicator, age_days, l, m, s) "
+            "INSERT OR IGNORE INTO who_lms (sex, indicator, age_days, l, m, s) "
             "VALUES ('f', 'weight', 0, 0.3809, 3.2322, 0.14171)"
         )
         conn.commit()
@@ -247,3 +253,86 @@ def test_a_family_without_a_title_is_still_remembered(tmp_path: Path) -> None:
     reset.reset(db)
 
     assert prod_chats.is_production(CHAT_ID, db) is not None
+
+
+# --- забыть одну семью -----------------------------------------------------
+
+
+def test_the_scope_covers_every_table_of_the_order() -> None:
+    """У каждой таблицы порядка есть условие, и лишних условий нет.
+
+    Половину этого сторожит сам `wipe._check` на импорте — забытая таблица
+    означала бы семью, вычищенную наполовину. Тест нужен ради второй половины
+    и ради того, что проверкой множеств не ловится вовсе: условие обязано
+    **работать**, то есть находить строки той семьи, а не соседней.
+    """
+    assert set(wipe.SCOPE) == set(WIPE_ORDER)
+
+
+def test_forget_takes_one_family_and_leaves_the_neighbour(tmp_path: Path) -> None:
+    """Забываем чужой чат — свой остаётся целым до последней строки.
+
+    Инструмент завёлся, когда бота отдали второй семье: пробная группа, чат,
+    из которого ушли, семья, попросившая себя удалить. До него на это был один
+    ответ — сброс всей базы, то есть вместе с дневником своего ребёнка.
+
+    `foreign_key_check` здесь не формальность: каскадов в схеме нет нигде, и
+    строка `usage` соседа, потерявшая семью, — это ровно та поломка, на которой
+    падает подготовка стенда.
+    """
+    db = tmp_path / "baby.db"
+    _build(db)
+    _fill(db)
+    _fill(db, family_id=2, chat_id=-777)
+
+    wiped = forget.forget(db, -777)
+
+    assert wiped["families"] == 1
+    assert wiped["children"] == 1
+    assert wiped["usage"] == 1, "нажатия чужой семьи остались бы висячим ключом"
+
+    conn = sqlite3.connect(db)
+    try:
+        for table in WIPE_ORDER:
+            left = conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0]  # noqa: S608
+            assert left == 1, f"у соседа не осталось строк: {table}"
+        assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+        assert conn.execute("SELECT count(*) FROM who_lms").fetchone()[0] == 1
+    finally:
+        conn.close()
+
+
+def test_forgetting_an_unknown_chat_changes_nothing(tmp_path: Path) -> None:
+    """Опечатка в `chat_id` не должна ничего стоить."""
+    db = tmp_path / "baby.db"
+    _build(db)
+    _fill(db)
+
+    assert forget.forget(db, -123) == {}
+
+    conn = sqlite3.connect(db)
+    try:
+        assert conn.execute("SELECT count(*) FROM families").fetchone()[0] == 1
+    finally:
+        conn.close()
+
+
+def test_the_stand_guard_survives_forgetting(tmp_path: Path) -> None:
+    """Забытый чат остаётся боевым для стенда.
+
+    Та же поломка, что у сброса, и ровно поэтому тест такой же: строка
+    `families` — единственное, по чему стенд узнаёт боевую группу. Забыв её
+    молча, мы разоружаем сторож, написанный против прогона стенда по живому
+    семейному чату.
+    """
+    db = tmp_path / "baby.db"
+    _build(db)
+    _fill(db)
+    _fill(db, family_id=2, chat_id=-777)
+
+    forget.forget(db, -777)
+
+    assert prod_chats.is_production(-777, db) == "Дочь", (
+        "забытый чат перестал узнаваться, и стенд зальёт в него тестового ребёнка"
+    )
+    assert prod_chats.is_production(CHAT_ID, db) == "Дочь", "живой чат забыт заодно"

@@ -4,22 +4,43 @@
 между тестами и делает их зелёными или красными в зависимости от порядка
 файлов. Это не паранойя: `panel._tasks` и `pending._asks` — обычные словари
 уровня модуля, и один тест видит остатки другого.
+
+Внизу файла — `wired`: диспетчер, собранный боевой `middlewares.install`.
+Он жил в `test_usage.py`, пока читатель был один; со вторым (`test_supergroup
+.py`) копия сборки означала бы тест, проверяющий порядок middleware,
+придуманный в нём же, а не тот, с которым живёт бот.
 """
 
 import asyncio
 from contextlib import suppress
 from datetime import datetime, timedelta
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 import pytest_asyncio
+from aiogram import Bot, Dispatcher
+from aiogram.client.session.base import BaseSession
+from aiogram.methods import GetMe, TelegramMethod
+from aiogram.types import Chat, Message, User
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
+from bot import handlers, middlewares
 from bot.config import settings
 from bot.db import repo
 from bot.db.models import Base
 from bot.services import backup, panel, pending, qa_log, ticker
 from tools import prod_chats
+
+# Чат, люди и «сейчас» для прогонов через настоящий диспетчер. Здесь, а не
+# в тестовом файле: как только таких файлов стало два, вторая копия этих
+# констант начала бы расходиться с первой молча — а сходиться они обязаны,
+# `wired` собирает семью именно на этот `chat_id`
+CHAT = Chat(id=-1001, type="supergroup", title="Малышка")
+PRIVATE = Chat(id=555, type="private")
+AUTHOR = User(id=222, is_bot=False, first_name="Аня")
+ME = User(id=42, is_bot=True, first_name="Бот", username="BabyBot")
+NOW = datetime(2026, 9, 13, 12, 0)
 
 
 @pytest.fixture(autouse=True)
@@ -232,3 +253,70 @@ class FakeBot:
 @pytest.fixture
 def bot():
     return FakeBot()
+
+
+class RecordingSession(BaseSession):
+    """Сеть не трогаем."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.sent: list[str] = []
+        self.markups: list[Any] = []
+
+    async def close(self) -> None:
+        return None
+
+    async def make_request(
+        self, bot: Any, method: TelegramMethod[Any], timeout: int | None = None
+    ) -> Any:
+        if isinstance(method, GetMe):
+            return ME
+        payload = method.model_dump(exclude_none=True)
+        if "text" in payload:
+            self.sent.append(payload["text"])
+            self.markups.append(getattr(method, "reply_markup", None))
+        return Message(message_id=999, date=NOW, chat=CHAT, from_user=AUTHOR, text="")
+
+    async def stream_content(self, *args: Any, **kwargs: Any) -> Any:  # pragma: no cover
+        raise NotImplementedError
+
+
+@pytest_asyncio.fixture
+async def wired(session_maker, session, family, child, mother, monkeypatch):
+    """Диспетчер, собранный боевой `middlewares.install`.
+
+    Подменяется ровно одна вещь — фабрика сессий: и `FamilyMiddleware`, и
+    `UsageMiddleware` открывают свою, а боевая смотрит в `data/baby.db`. Всё
+    остальное настоящее, включая порядок middleware, ради которого тест и
+    существует: `UsageMiddleware` обязана оказаться **внутри**
+    `FamilyMiddleware`, иначе `family` и `member` к ней не приедут.
+
+    Отметка приветствия ставится и **коммитится**: `FamilyMiddleware` читает
+    семью своей сессией, и непрокоммиченное присваивание она не увидит — пойдёт
+    здороваться и спросит у Telegram про права, то есть уткнётся в заглушку.
+    """
+    family.greeted_at = NOW
+    await session.commit()
+    monkeypatch.setattr(middlewares, "Session", session_maker)
+
+    talk = RecordingSession()
+    bot = Bot(token="42:TEST", session=talk)
+    dp = Dispatcher()
+    middlewares.install(dp)
+
+    order = tuple(handlers.routers)
+    for router in order:
+        dp.include_router(router)
+
+    async def refresh(*args: Any, **kwargs: Any) -> None:
+        return None
+
+    # `panel.schedule` зовут без `await` — она синхронная и заводит задачу
+    # дебаунса. Асинхронная замена дала бы «coroutine was never awaited»
+    monkeypatch.setattr("bot.services.panel.refresh", refresh)
+    monkeypatch.setattr("bot.services.panel.schedule", lambda *a, **k: None)
+
+    yield dp, bot, talk
+
+    for router in order:
+        router._parent_router = None

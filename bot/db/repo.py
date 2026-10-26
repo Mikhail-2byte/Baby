@@ -9,9 +9,10 @@
 потерять запись о кормлении.
 """
 
+import logging
 from datetime import date, datetime, timedelta
 
-from sqlalchemy import and_, func, or_, select
+from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.config import settings
@@ -26,6 +27,8 @@ from bot.db.models import (
     Reminder,
     Usage,
 )
+
+log = logging.getLogger(__name__)
 
 # --- Семья и участники ----------------------------------------------------
 
@@ -94,15 +97,109 @@ async def migrate_family_chat_id(
     Панель обнуляется: `message_id` принадлежат конкретному чату, и в новом
     чате старый id указывает в пустоту. Это боевой баг Family_planer, здесь он
     учтён заранее.
+
+    **Двойник — это чат, а не семья.** Апдейты aiogram обрабатывает
+    одновременно, и `my_chat_member` из новой супергруппы обгоняет служебное
+    сообщение о переезде: `FamilyMiddleware` успевает завести семью на новый
+    `chat_id`, поздороваться и выпустить панель. До 21.09.2026 на этом месте
+    вылетал `IntegrityError: UNIQUE constraint failed: families.chat_id` —
+    апдейт терялся, семья оставалась под мёртвым `chat_id`, а в живом чате
+    сидел пустой двойник и просил завести карточку заново. Ровно так бот и
+    потерял вторую семью.
     """
     family = await session.scalar(select(Family).where(Family.chat_id == old_chat_id))
     if family is None:
         return False
+    twin = await session.scalar(select(Family).where(Family.chat_id == new_chat_id))
+    if twin is not None and twin.id == family.id:
+        return False
+    if twin is None:
+        family.panel_message_id = None
+        family.panel_day = None
+    elif not await _fold_twin(session, family, twin):
+        return False
     family.chat_id = new_chat_id
-    family.panel_message_id = None
-    family.panel_day = None
     await session.commit()
     return True
+
+
+async def _fold_twin(session: AsyncSession, family: Family, twin: Family) -> bool:
+    """Сложить двойника в переезжающую семью. `False` — двойник не пуст.
+
+    Что описывает **чат**, берётся у двойника: в новом чате он уже поздоровался
+    и уже выпустил панель, и обнулять её здесь значило бы оставить в чате
+    живую кнопку, которую бот больше не правит.
+
+    Участники и нажатия переезжают, а не удаляются: каскадов в схеме нет нигде
+    (`tools/wipe.py`), и оставленная строка `usage` уронила бы удаление
+    двойника висячим ключом.
+
+    Двойник с ребёнком или напоминаниями не складывается вовсе. Это уже не
+    гонка, а две семьи с данными на один чат — разводить их автоматикой нельзя,
+    и человек узнаёт об этом из лога, а не из пропавшего дневника.
+    """
+    child = await session.scalar(select(Child.id).where(Child.family_id == twin.id))
+    reminder = await session.scalar(
+        select(Reminder.id).where(Reminder.family_id == twin.id)
+    )
+    if child is not None or reminder is not None:
+        log.error(
+            "Чат %s занят семьёй #%s с данными — семья #%s не переехала",
+            twin.chat_id,
+            twin.id,
+            family.id,
+        )
+        return False
+
+    family.panel_message_id = twin.panel_message_id
+    family.panel_day = twin.panel_day
+    if twin.title:
+        family.title = twin.title
+    if twin.last_digest_on is not None and (
+        family.last_digest_on is None or twin.last_digest_on > family.last_digest_on
+    ):
+        family.last_digest_on = twin.last_digest_on
+    if family.greeted_at is None:
+        family.greeted_at = twin.greeted_at
+
+    await _fold_members(session, family, twin)
+    await session.execute(
+        update(Usage).where(Usage.family_id == twin.id).values(family_id=family.id)
+    )
+    await session.delete(twin)
+    # Сброс до правки `chat_id`, и это не украшение: в одном flush
+    # SQLAlchemy делает UPDATE раньше DELETE, то есть семья поехала бы на
+    # чат, который двойник ещё занимает, — `UNIQUE constraint failed`
+    await session.flush()
+    log.info("Двойник #%s сложен в семью #%s", twin.id, family.id)
+    return True
+
+
+async def _fold_members(session: AsyncSession, family: Family, twin: Family) -> None:
+    """Участники двойника — те же люди. Знакомого узнаём по `tg_user_id`.
+
+    Порядок внутри цикла существен: нажатия перецепляются ДО удаления строки
+    участника. `session.execute` сбрасывает накопленное в базу, и удалённый
+    раньше участник ушёл бы в базу с живой ссылкой из `usage`.
+    """
+    ours = {
+        member.tg_user_id: member
+        for member in await session.scalars(
+            select(Member).where(Member.family_id == family.id)
+        )
+    }
+    theirs = list(
+        await session.scalars(select(Member).where(Member.family_id == twin.id))
+    )
+    for member in theirs:
+        known = ours.get(member.tg_user_id)
+        if known is None:
+            member.family_id = family.id
+            continue
+        await session.execute(
+            update(Usage).where(Usage.member_id == member.id).values(member_id=known.id)
+        )
+        await session.delete(member)
 
 
 async def set_panel(

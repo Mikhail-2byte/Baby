@@ -47,7 +47,7 @@ CONFIRM = "СБРОСИТЬ"
 ACCEPTED = (CONFIRM, "RESET")
 
 
-def confirmed(raw: str) -> bool:
+def confirmed(raw: str, accepted: tuple[str, ...] = ACCEPTED) -> bool:
     """Сошлось ли подтверждение.
 
     Отдельной функцией ради одного символа: PowerShell 5.1 подмешивает в пайп
@@ -55,8 +55,12 @@ def confirmed(raw: str) -> bool:
     считает, поэтому правильно набранное слово не сходилось, а человек видел
     «Отменено, база не тронута» и не понимал, чем не угодил. Отказ безопасен,
     но повторять его будут ровно в тот вечер, когда спешат.
+
+    `accepted` — ради `tools/forget.py`: слово там своё, а знание про BOM
+    обязано быть одно на проект. Вторая копия этой строки разошлась бы
+    молча и ровно в ту сторону, где отказ выглядит как поломка.
     """
-    return raw.strip().strip("\ufeff").strip().upper() in ACCEPTED
+    return raw.strip().strip("\ufeff").strip().upper() in accepted
 
 # `alembic_version` в отчёте показывается своим значением, а не счётчиком строк
 COUNTED = (*WIPE_ORDER, "who_lms")

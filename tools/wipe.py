@@ -56,12 +56,65 @@ WIPE_ORDER = (
 KEPT = ("who_lms", "alembic_version")
 
 
+# Как добраться до одной семьи в каждой таблице. Порядок по-прежнему один —
+# `WIPE_ORDER`, — здесь только условие: вторым списком таблиц он разошёлся бы с
+# первым молча. У событий, измерений и тревог своего `family_id` нет вовсе: они
+# висят на ребёнке, и это единственная причина, по которой условия разные.
+SCOPE = {
+    "usage": "family_id = ?",
+    "alerts": "child_id IN (SELECT id FROM children WHERE family_id = ?)",
+    "events": "child_id IN (SELECT id FROM children WHERE family_id = ?)",
+    "measurements": "child_id IN (SELECT id FROM children WHERE family_id = ?)",
+    "reminders": "family_id = ?",
+    "children": "family_id = ?",
+    "members": "family_id = ?",
+    "families": "id = ?",
+}
+
+
+def _check() -> None:
+    """Условие обязано быть у каждой таблицы порядка, и лишних быть не должно.
+
+    На импорте, а не в тесте: забытая таблица означает семью, вычищенную
+    наполовину, и узнать об этом мы бы могли только по висячему ключу через
+    месяц. Тест на это тоже есть — он сторожит от обратного, от условия к
+    несуществующей таблице.
+    """
+    if set(SCOPE) != set(WIPE_ORDER):
+        raise RuntimeError(
+            f"SCOPE и WIPE_ORDER разошлись: {set(SCOPE) ^ set(WIPE_ORDER)}"
+        )
+
+
+_check()
+
+
 def wipe(conn: sqlite3.Connection) -> dict[str, int]:
     """Удалить все семейные данные. Коммитит сам, соединение не закрывает."""
     conn.execute("PRAGMA foreign_keys = ON")
     wiped: dict[str, int] = {}
     for table in WIPE_ORDER:
         cursor = conn.execute(f"DELETE FROM {table}")  # noqa: S608 — имена свои
+        wiped[table] = cursor.rowcount
+    conn.commit()
+    return wiped
+
+
+def wipe_family(conn: sqlite3.Connection, family_id: int) -> dict[str, int]:
+    """Удалить одну семью со всем, что на ней висит. Коммитит сам.
+
+    Тот же порядок, что у полной чистки, и это главное: каскадов в схеме нет
+    нигде, а `PRAGMA foreign_keys=ON` стоит на каждом соединении. Пойдя в
+    обратном порядке, мы бы упёрлись в `FOREIGN KEY constraint failed` на
+    первой же таблице, на которую кто-то ссылается.
+    """
+    conn.execute("PRAGMA foreign_keys = ON")
+    wiped: dict[str, int] = {}
+    for table in WIPE_ORDER:
+        cursor = conn.execute(
+            f"DELETE FROM {table} WHERE {SCOPE[table]}",  # noqa: S608 — условия свои
+            (family_id,),
+        )
         wiped[table] = cursor.rowcount
     conn.commit()
     return wiped
