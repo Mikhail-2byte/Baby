@@ -19,17 +19,18 @@ heartbeat: `getUpdates` встаёт, процесс жив, бот молчит
 import asyncio
 import io
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 
 from matplotlib.axes import Axes
 from matplotlib.backends.backend_agg import FigureCanvasAgg
 from matplotlib.figure import Figure
+from matplotlib.lines import Line2D
 from matplotlib.patches import Patch
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.db import repo
-from bot.db.models import FEED_KINDS, SLEEP, WEIGHT, Child, Family
+from bot.db.models import FEED_KINDS, SLEEP, TIMED_KINDS, WEIGHT, Child, Family
 from bot.services import growth
 from bot.services import timeutil as tu
 
@@ -254,12 +255,25 @@ async def weight_png(
 
 
 @dataclass
+class RhythmSpan:
+    """Период в часах от полуночи; неточное окончание помечается штриховкой."""
+
+    start: float
+    end: float
+    uncertain: bool = False
+
+
+@dataclass
 class DayRhythm:
-    """Один день: отрезки сна и моменты кормлений, в часах от полуночи."""
+    """Сутки: периоды сна и кормления; точки без известной длительности."""
 
     day: date
-    sleeps: list[tuple[float, float]]
-    feeds: list[float]
+    sleeps: list[RhythmSpan]
+    feeds: list[RhythmSpan]
+    feed_points: list[float] = field(default_factory=list)
+
+    def has_data(self) -> bool:
+        return bool(self.sleeps or self.feeds or self.feed_points)
 
 
 async def collect_rhythm(
@@ -274,18 +288,26 @@ async def collect_rhythm(
         start, end = tu.day_bounds(target, tz)
         events = await repo.events_between(session, child.id, start, end)
 
-        sleeps: list[tuple[float, float]] = []
-        feeds: list[float] = []
+        sleeps: list[RhythmSpan] = []
+        feeds: list[RhythmSpan] = []
+        feed_points: list[float] = []
         for event in events:
-            if event.kind == SLEEP:
+            if event.kind == SLEEP or (event.kind in FEED_KINDS and event.kind in TIMED_KINDS):
                 began = max(event.started_at, start)
-                over = min(event.ended_at or now, end)
+                over = min(event.ended_at or now, end, now)
                 if over > began:
-                    sleeps.append((_hours(began, start), _hours(over, start)))
+                    spans = sleeps if event.kind == SLEEP else feeds
+                    spans.append(RhythmSpan(
+                        _hours(began, start), _hours(over, start),
+                        uncertain=event.estimated or event.ended_at is None,
+                    ))
             elif event.kind in FEED_KINDS and start <= event.started_at < end:
-                feeds.append(_hours(event.started_at, start))
+                if event.started_at <= now:
+                    feed_points.append(_hours(event.started_at, start))
 
-        result.append(DayRhythm(day=target, sleeps=sleeps, feeds=feeds))
+        result.append(DayRhythm(
+            day=target, sleeps=sleeps, feeds=feeds, feed_points=feed_points,
+        ))
     return result
 
 
@@ -294,20 +316,14 @@ def _hours(moment: datetime, start: datetime) -> float:
 
 
 def draw_rhythm(child_name: str, rhythm: list[DayRhythm]) -> bytes:
-    """Сутки по горизонтали, дни по вертикали — видно, куда съезжает режим.
-
-    Форма выбрана под вопрос, который родители задают на самом деле: не
-    «сколько она спала», а «когда». Сумма часов этого не показывает вовсе,
-    а здесь ночные отрезки выстраиваются в столбик, и сдвиг режима виден сразу.
-
-    Серий две, поэтому легенда обязательна: различать их только по цвету
-    нельзя.
-    """
-    height = max(2.6, 0.52 * len(rhythm) + 1.6)
-    figure = Figure(figsize=(FIGSIZE[0], height), dpi=DPI, facecolor=SURFACE)
+    """Полная шкала суток; кормления и сон на отдельных дорожках каждой даты."""
+    height = max(3.4, 0.72 * len(rhythm) + 1.9)
+    figure = Figure(figsize=(12.0, height), dpi=DPI, facecolor=SURFACE)
     axes = figure.add_subplot(111)
     _style(axes)
     axes.grid(True, axis="x", color=GRID, linewidth=0.8)
+    axes.set_xticks(range(25), minor=True)
+    axes.grid(True, which="minor", axis="x", color=GRID, linewidth=0.35)
     axes.grid(False, axis="y")
 
     # Ночь фоном. Это не третья серия, а разметка оси — как затенённые выходные
@@ -316,43 +332,63 @@ def draw_rhythm(child_name: str, rhythm: list[DayRhythm]) -> bytes:
     axes.axvspan(22, 24, color=NIGHT, linewidth=0, zorder=0)
 
     for row, entry in enumerate(rhythm):
-        axes.broken_barh(
-            [(begin, over - begin) for begin, over in entry.sleeps],
-            (row - 0.22, 0.44),
-            facecolors=SERIES_SLEEP, edgecolors=SURFACE, linewidth=1.0, zorder=3,
-        )
-        for moment in entry.feeds:
-            # Кормление — момент, а не отрезок: короткий штрих честнее полоски
-            axes.vlines(
-                moment, row - 0.36, row + 0.36,
-                color=SERIES_FEED, linewidth=2.0, zorder=4,
+        feed_y, sleep_y = row - 0.18, row + 0.18
+        for y, spans, color, label in (
+            (feed_y, entry.feeds, SERIES_FEED, "кормление"),
+            (sleep_y, entry.sleeps, SERIES_SLEEP, "сон"),
+        ):
+            axes.broken_barh([(0, 24)], (y - 0.13, 0.26),
+                             facecolors="#e9e8e3", linewidth=0, zorder=1)
+            for span in spans:
+                axes.broken_barh(
+                    [(span.start, span.end - span.start)], (y - 0.13, 0.26),
+                    facecolors=color, edgecolors=INK if span.uncertain else color,
+                    linewidth=0.5, hatch="////" if span.uncertain else None, zorder=3,
+                )
+            axes.text(
+                -0.012, y, label, transform=axes.get_yaxis_transform(),
+                ha="right", va="center", color=INK_MUTED, fontsize=8, family=FONT_FAMILY,
             )
+        axes.plot(entry.feed_points, [feed_y] * len(entry.feed_points),
+                  linestyle="none", marker="D", markersize=4, color=SERIES_FEED, zorder=4)
 
     axes.set_yticks(range(len(rhythm)))
     axes.set_yticklabels(
-        [f"{tu.WEEKDAYS_SHORT[e.day.weekday()]} {tu.day_stamp(e.day)}" for e in rhythm],
-        fontsize=9, color=INK_MUTED, family=FONT_FAMILY,
+        [f"{e.day:%d.%m.%Y}" for e in rhythm],
+        fontsize=9, color=INK, family=FONT_FAMILY,
     )
+    axes.tick_params(axis="y", pad=70)
     axes.set_ylim(-0.7, len(rhythm) - 0.3)
     axes.invert_yaxis()  # сегодня внизу, как в ленте чата
 
     axes.set_xlim(0, 24)
-    axes.set_xticks(range(0, 25, 3))
-    axes.set_xticklabels([f"{h:02d}" for h in range(0, 25, 3)], fontsize=9, family=FONT_FAMILY)
+    axes.set_xticks(range(0, 25, 2))
+    axes.set_xticklabels([f"{h:02d}:00" for h in range(0, 25, 2)],
+                        fontsize=9, family=FONT_FAMILY)
+    axes.tick_params(axis="x", labeltop=True, top=False)
 
     axes.set_title(
-        f"Ритм суток · {child_name}", color=INK, fontsize=13, fontweight="bold",
-        loc="left", pad=12, family=FONT_FAMILY,
+        f"Кормления и сон · {child_name}", color=INK, fontsize=14, fontweight="bold",
+        loc="left", pad=30, family=FONT_FAMILY,
     )
     axes.legend(
         handles=[
-            Patch(facecolor=SERIES_SLEEP, label="сон"),
             Patch(facecolor=SERIES_FEED, label="кормление"),
+            Patch(facecolor=SERIES_SLEEP, label="сон"),
+            Line2D([], [], color=SERIES_FEED, marker="D", linestyle="none",
+                   markersize=4, label="без длительности"),
+            Patch(facecolor="white", edgecolor=INK, hatch="////",
+                  label="окончание неточное / таймер идёт"),
         ],
-        loc="lower right", bbox_to_anchor=(1.0, 1.0), ncol=2,
+        loc="upper left", bbox_to_anchor=(0.0, -0.10), ncol=4,
         frameon=False, fontsize=9, labelcolor=INK_MUTED,
     )
-    figure.tight_layout()
+    figure.text(
+        0.23, 0.025, "Местное время семьи. Пустые участки: записей нет. "
+        "Текущие сутки показаны не полностью.",
+        fontsize=8, color=INK_MUTED, family=FONT_FAMILY,
+    )
+    figure.subplots_adjust(left=0.23, right=0.97, top=0.85, bottom=0.17)
     return _render(figure)
 
 
@@ -360,6 +396,6 @@ async def rhythm_png(
     session: AsyncSession, child: Child, family: Family, now: datetime, days: int = 7
 ) -> bytes | None:
     rhythm = await collect_rhythm(session, child, family.tz, now, days)
-    if not any(entry.sleeps or entry.feeds for entry in rhythm):
+    if not any(entry.has_data() for entry in rhythm):
         return None
     return await asyncio.to_thread(draw_rhythm, child.name, rhythm)

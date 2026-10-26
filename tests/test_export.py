@@ -152,6 +152,13 @@ async def test_pdf_has_three_pages(session, child, mother, family, now):
 
 
 @pytest.mark.asyncio
+async def test_pdf_includes_rhythm_with_only_bottle_records(session, child, mother, family, now):
+    await repo.add_event(session, child.id, mother.id, FEED_BOTTLE, started_at=now)
+    payload = await export._pdf(session, child, family, now)
+    assert _pages(payload) == 2, "обложка и шкала с точкой кормления без длительности"
+
+
+@pytest.mark.asyncio
 async def test_pdf_survives_without_any_charts(session, child, family, now):
     """Нет ни взвешиваний, ни событий — остаётся одна обложка, и это нормально."""
     payload = await export._pdf(session, child, family, now)

@@ -197,7 +197,7 @@ async def _pdf(
                         charts.draw_weight(child.name, points, bands, evaluated)
                     )
                 )
-            if any(entry.sleeps or entry.feeds for entry in rhythm_data):
+            if any(entry.has_data() for entry in rhythm_data):
                 pdf.savefig(
                     _figure_from_png(charts.draw_rhythm(child.name, rhythm_data))
                 )

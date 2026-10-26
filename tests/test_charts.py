@@ -12,7 +12,7 @@ import pytest
 import pytest_asyncio
 
 from bot.db import repo
-from bot.db.models import FEED_BREAST, SLEEP, WEIGHT, WhoLms
+from bot.db.models import FEED_BOTTLE, FEED_BREAST, SLEEP, WEIGHT, WhoLms
 from bot.services import charts, digest
 from bot.services import timeutil as tu
 
@@ -145,8 +145,86 @@ async def test_rhythm_splits_night_sleep_between_days(
     first = by_day[tu.to_local(evening, tz).date()]
     second = by_day[tu.to_local(morning, tz).date()]
 
-    assert first.sleeps == [(23.0, 24.0)]
-    assert second.sleeps == [(0.0, 5.0)]
+    assert first.sleeps == [charts.RhythmSpan(23.0, 24.0)]
+    assert second.sleeps == [charts.RhythmSpan(0.0, 5.0)]
+
+
+@pytest.mark.asyncio
+async def test_rhythm_shows_feeding_duration_across_midnight(session, child, mother, family, now):
+    evening = tu.to_utc(tu.to_local(now, family.tz).replace(hour=23, minute=50), family.tz)
+    morning = evening + timedelta(minutes=30)
+    await repo.add_event(
+        session, child.id, mother.id, FEED_BREAST, started_at=evening, ended_at=morning,
+    )
+
+    rhythm = await charts.collect_rhythm(session, child, family.tz, morning)
+    assert rhythm[-2].feeds[0].start == pytest.approx(23 + 50 / 60)
+    assert rhythm[-2].feeds[0].end == 24
+    assert rhythm[-1].feeds[0].start == 0
+    assert rhythm[-1].feeds[0].end == pytest.approx(20 / 60)
+    assert not rhythm[-1].feed_points
+
+
+@pytest.mark.parametrize("kind", [FEED_BREAST, SLEEP])
+@pytest.mark.asyncio
+async def test_rhythm_marks_open_timer_and_stops_at_now(
+    session, child, mother, family, now, kind
+):
+    await repo.start_event(
+        session, child.id, mother.id, kind, started_at=now - timedelta(minutes=20),
+    )
+    rhythm = await charts.collect_rhythm(session, child, family.tz, now)
+    spans = rhythm[-1].feeds if kind == FEED_BREAST else rhythm[-1].sleeps
+    start, _ = tu.day_bounds(rhythm[-1].day, family.tz)
+    assert spans[-1].uncertain
+    assert spans[-1].end == pytest.approx((now - start).total_seconds() / 3600)
+    assert spans[-1].end - spans[-1].start == pytest.approx(20 / 60)
+
+
+@pytest.mark.asyncio
+async def test_rhythm_keeps_bottle_as_point_without_inventing_duration(
+    session, child, mother, family, now
+):
+    await repo.add_event(
+        session, child.id, mother.id, FEED_BOTTLE, started_at=now - timedelta(minutes=30),
+    )
+    rhythm = await charts.collect_rhythm(session, child, family.tz, now)
+    assert rhythm[-1].feeds == []
+    assert len(rhythm[-1].feed_points) == 1
+    assert rhythm[-1].has_data()
+    assert (await charts.rhythm_png(session, child, family, now)).startswith(PNG_MAGIC)
+
+
+@pytest.mark.asyncio
+async def test_rhythm_preserves_estimated_feeding_flag(session, child, mother, family, now):
+    row = await repo.start_event(
+        session, child.id, mother.id, FEED_BREAST, started_at=now - timedelta(hours=1),
+    )
+    await repo.close_event(session, row, now - timedelta(minutes=30), estimated=True)
+    rhythm = await charts.collect_rhythm(session, child, family.tz, now)
+    assert rhythm[-1].feeds[-1].uncertain
+
+
+def test_rhythm_draws_actual_feeding_width_on_its_own_lane(monkeypatch):
+    from datetime import date
+
+    from matplotlib.colors import to_rgba
+
+    figures = []
+    monkeypatch.setattr(charts, "_render", lambda figure: figures.append(figure) or b"png")
+    day = charts.DayRhythm(
+        date(2026, 10, 25), [charts.RhythmSpan(6, 7)], [charts.RhythmSpan(6.25, 6.75)]
+    )
+    charts.draw_rhythm("Пример", [day])
+    axes = figures[0].axes[0]
+    feeding = [collection for collection in axes.collections
+               if tuple(collection.get_facecolors()[0]) == to_rgba(charts.SERIES_FEED)]
+    assert len(feeding) == 1
+    vertices = feeding[0].get_paths()[0].vertices
+    assert vertices[:, 0].min() == 6.25
+    assert vertices[:, 0].max() == 6.75
+    assert vertices[:, 1].max() < 0, "Кормление должно быть выше дорожки сна"
+    assert axes.get_xlim() == (0, 24)
 
 
 @pytest.mark.asyncio
