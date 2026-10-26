@@ -10,9 +10,12 @@
 """
 
 import logging
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from datetime import date, datetime, timedelta
 
-from sqlalchemy import and_, func, or_, select, update
+from sqlalchemy import and_, delete, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.config import settings
@@ -24,11 +27,40 @@ from bot.db.models import (
     Family,
     Measurement,
     Member,
+    ProcessedMessage,
+    RecordRevision,
     Reminder,
     Usage,
 )
+from bot.services import revisions
 
 log = logging.getLogger(__name__)
+
+_deferred: ContextVar[bool] = ContextVar("deferred_commit", default=False)
+
+
+async def _commit(session: AsyncSession) -> None:
+    if _deferred.get():
+        await session.flush()
+    else:
+        await session.commit()
+
+
+@asynccontextmanager
+async def atomic(session: AsyncSession) -> AsyncIterator[None]:
+    """Пакет записей: внутренние repo-вызовы flush, один commit снаружи."""
+    nested = _deferred.get()
+    token = _deferred.set(True)
+    try:
+        yield
+        if not nested:
+            await session.commit()
+    except Exception:
+        await session.rollback()
+        raise
+    finally:
+        _deferred.reset(token)
+
 
 # --- Семья и участники ----------------------------------------------------
 
@@ -42,12 +74,12 @@ async def get_or_create_family(
         # видеть в логах и в выгрузке
         if title and found.title != title:
             found.title = title
-            await session.commit()
+            await _commit(session)
         return found
 
     family = Family(chat_id=chat_id, title=title, tz=settings.tz_default)
     session.add(family)
-    await session.commit()
+    await _commit(session)
     return family
 
 
@@ -78,14 +110,14 @@ async def get_or_create_member(
     if found is not None:
         if found.display_name != display_name:
             found.display_name = display_name
-            await session.commit()
+            await _commit(session)
         return found
 
     member = Member(
         family_id=family_id, tg_user_id=tg_user_id, display_name=display_name
     )
     session.add(member)
-    await session.commit()
+    await _commit(session)
     return member
 
 
@@ -118,8 +150,14 @@ async def migrate_family_chat_id(
         family.panel_day = None
     elif not await _fold_twin(session, family, twin):
         return False
+    await session.execute(delete(ProcessedMessage).where(ProcessedMessage.chat_id == old_chat_id))
+    await session.execute(
+        update(Event).where(
+            Event.child_id.in_(select(Child.id).where(Child.family_id == family.id))
+        ).values(card_message_id=None)
+    )
     family.chat_id = new_chat_id
-    await session.commit()
+    await _commit(session)
     return True
 
 
@@ -199,6 +237,10 @@ async def _fold_members(session: AsyncSession, family: Family, twin: Family) -> 
         await session.execute(
             update(Usage).where(Usage.member_id == member.id).values(member_id=known.id)
         )
+        for column in (RecordRevision.actor_id, RecordRevision.undo_actor_id):
+            await session.execute(
+                update(RecordRevision).where(column == member.id).values({column: known.id})
+            )
         await session.delete(member)
 
 
@@ -213,7 +255,7 @@ async def set_panel(
     """
     family.panel_message_id = message_id
     family.panel_day = day
-    await session.commit()
+    await _commit(session)
 
 
 async def mark_greeted(session: AsyncSession, family: Family, moment: datetime) -> None:
@@ -224,7 +266,7 @@ async def mark_greeted(session: AsyncSession, family: Family, moment: datetime) 
     отметку задним числом существующим семьям.
     """
     family.greeted_at = moment
-    await session.commit()
+    await _commit(session)
 
 
 async def set_checkin(
@@ -239,13 +281,13 @@ async def set_checkin(
     """
     family.checkin_hours = hours
     family.checkin_last_at = now if hours > 0 else None
-    await session.commit()
+    await _commit(session)
 
 
 async def mark_checkin(session: AsyncSession, family: Family, now: datetime) -> None:
     """Вопрос задан — засечь время. Двойник отметки дайджеста."""
     family.checkin_last_at = now
-    await session.commit()
+    await _commit(session)
 
 
 async def all_families(session: AsyncSession) -> list[Family]:
@@ -289,7 +331,7 @@ async def create_child(
         gestation_weeks=gestation_weeks,
     )
     session.add(child)
-    await session.commit()
+    await _commit(session)
     return child
 
 
@@ -316,7 +358,7 @@ async def update_child(
         child.born_at = born_at
     if birth_weight_g is not None:
         child.birth_weight_g = birth_weight_g
-    await session.commit()
+    await _commit(session)
     return child
 
 
@@ -347,11 +389,13 @@ async def update_measurement(
     value: float | None = None,
 ) -> Measurement:
     """Поправить измерение. `None`, как и у `update_child`, — «не трогать»."""
+    before = revisions.snapshot(measurement)
     if taken_at is not None:
         measurement.taken_at = taken_at
     if value is not None:
         measurement.value = value
-    await session.commit()
+    revisions.stage(session, measurement, before)
+    await _commit(session)
     return measurement
 
 
@@ -444,7 +488,7 @@ async def start_event(
         source_message_id=source_message_id,
     )
     session.add(event)
-    await session.commit()
+    await _commit(session)
     return event
 
 
@@ -455,9 +499,13 @@ async def close_event(
     *,
     estimated: bool = False,
 ) -> Event:
+    if ended_at <= event.started_at:
+        raise ValueError("Окончание должно быть позже начала")
+    before = revisions.snapshot(event)
     event.ended_at = ended_at
     event.estimated = estimated
-    await session.commit()
+    revisions.stage(session, event, before)
+    await _commit(session)
     return event
 
 
@@ -477,9 +525,11 @@ async def reopen_event(session: AsyncSession, event: Event) -> Event:
     `child_id`, а тащить его сюда ради одной проверки значило бы дать функции
     знание о том, чего она не решает.
     """
+    before = revisions.snapshot(event)
     event.ended_at = None
     event.estimated = False
-    await session.commit()
+    revisions.stage(session, event, before)
+    await _commit(session)
     return event
 
 
@@ -499,6 +549,8 @@ async def add_event(
     source_message_id: int | None = None,
 ) -> Event:
     """Готовое событие целиком — подгузник, бутылочка, температура."""
+    if ended_at is not None and ended_at <= started_at:
+        raise ValueError("Окончание должно быть позже начала")
     event = Event(
         child_id=child_id,
         author_id=author_id,
@@ -513,13 +565,13 @@ async def add_event(
         source_message_id=source_message_id,
     )
     session.add(event)
-    await session.commit()
+    await _commit(session)
     return event
 
 
 async def delete_event(session: AsyncSession, event: Event) -> None:
     await session.delete(event)
-    await session.commit()
+    await _commit(session)
 
 
 # --- Правка событий -------------------------------------------------------
@@ -555,10 +607,14 @@ async def set_event_time(
     Политика эта про смысл операции, а не про строку в таблице, и живёт там
     же, где инвариант «ровно один открытый таймер», — у вызывающего.
     """
+    if ended_at is not None and ended_at <= started_at:
+        raise ValueError("Окончание должно быть позже начала")
+    before = revisions.snapshot(event)
     event.started_at = started_at
     event.ended_at = ended_at
     event.estimated = estimated
-    await session.commit()
+    revisions.stage(session, event, before)
+    await _commit(session)
     return event
 
 
@@ -580,10 +636,12 @@ async def set_event_kind(
     `subtype` и `note` не трогаются: это слова человека из голосового разбора,
     и стереть их молча было бы потерей, а не уборкой.
     """
+    before = revisions.snapshot(event)
     event.kind = kind
     event.side = side
     event.value_num = value_num
-    await session.commit()
+    revisions.stage(session, event, before)
+    await _commit(session)
     return event
 
 
@@ -597,8 +655,10 @@ async def set_event_value(
     менялось в обход `repo`, и потому единственное, которого не видел ни один
     сторож этого файла.
     """
+    before = revisions.snapshot(event)
     event.value_num = value_num
-    await session.commit()
+    revisions.stage(session, event, before)
+    await _commit(session)
     return event
 
 
@@ -741,7 +801,7 @@ async def add_measurement(
         note=note,
     )
     session.add(measurement)
-    await session.commit()
+    await _commit(session)
     return measurement
 
 
@@ -781,7 +841,7 @@ async def last_measurement(
 
 async def delete_measurement(session: AsyncSession, measurement: Measurement) -> None:
     await session.delete(measurement)
-    await session.commit()
+    await _commit(session)
 
 
 async def get_measurement(
@@ -835,7 +895,7 @@ async def create_reminder(
         preset=preset,
     )
     session.add(reminder)
-    await session.commit()
+    await _commit(session)
     return reminder
 
 
@@ -883,12 +943,12 @@ async def mark_reminder_sent(
 ) -> None:
     reminder.sent_at = now
     reminder.active = False
-    await session.commit()
+    await _commit(session)
 
 
 async def deactivate_reminder(session: AsyncSession, reminder: Reminder) -> None:
     reminder.active = False
-    await session.commit()
+    await _commit(session)
 
 
 async def deactivate_preset(session: AsyncSession, family_id: int, preset: str) -> int:
@@ -909,7 +969,7 @@ async def deactivate_preset(session: AsyncSession, family_id: int, preset: str) 
     for reminder in reminders:
         reminder.active = False
         count += 1
-    await session.commit()
+    await _commit(session)
     return count
 
 
@@ -918,7 +978,7 @@ async def reschedule_reminder(
 ) -> None:
     reminder.fire_at = following
     reminder.sent_at = None
-    await session.commit()
+    await _commit(session)
 
 
 # --- Тревоги по данным ----------------------------------------------------
@@ -942,7 +1002,7 @@ async def raise_alert(
     session: AsyncSession, child_id: int, flag_id: str, day: date
 ) -> None:
     session.add(Alert(child_id=child_id, flag_id=flag_id, raised_on=day))
-    await session.commit()
+    await _commit(session)
 
 
 # --- Учёт использования ---------------------------------------------------
@@ -984,4 +1044,4 @@ async def add_usage(
             ms=ms,
         )
     )
-    await session.commit()
+    await _commit(session)

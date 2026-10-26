@@ -244,8 +244,9 @@ def _vectors(connection: sqlite3.Connection) -> tuple[Any, list[int]]:
         _dense_off = True
         return None, []
     _matrix_ids = [row[0] for row in rows]
-    _matrix = numpy.frombuffer(b"".join(row[1] for row in rows), dtype=numpy.float32)
-    _matrix = _matrix.reshape(len(rows), -1)
+    _matrix = numpy.frombuffer(
+        b"".join(row[1] for row in rows), dtype=numpy.float32
+    ).reshape(len(rows), -1)
     return _matrix, _matrix_ids
 
 

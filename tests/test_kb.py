@@ -7,6 +7,7 @@ PDF сюда не тянутся. Проверяется при этом бое�
 
 
 import sqlite3
+import sys
 
 import pytest
 
@@ -610,6 +611,7 @@ async def test_search_runs_off_the_event_loop(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows file-lock semantics")
 async def test_an_open_base_cannot_be_replaced(tmp_path, monkeypatch):
     """Обещание README проверяется фактом, а не рассуждением.
 
@@ -648,6 +650,7 @@ async def test_close_releases_the_file(tmp_path, monkeypatch):
     fresh.replace(path)  # не должно поднять PermissionError
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows file-lock semantics")
 def test_build_says_what_to_do_when_the_file_is_busy(tmp_path, monkeypatch):
     """Сборка при работающем боте обязана объяснить, а не сыпать трассировкой.
 

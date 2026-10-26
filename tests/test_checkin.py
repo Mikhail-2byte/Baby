@@ -329,7 +329,7 @@ async def test_the_card_comes_with_buttons(session, family, child, bot):
     assert checkin.CARD.nothing_label in labels
     assert checkin.CARD.mute_label in labels
     for kind in checkin.CARD.kinds:
-        assert kind.title in labels
+        assert (kind.title in labels) == (kind.kind in {"feed_breast", "sleep"})
 
 
 @pytest.mark.asyncio
@@ -660,6 +660,45 @@ async def test_still_going_opens_a_timer_and_closes_the_previous_one(
     assert running is not None
     assert running.kind == SLEEP
     assert 59 < _minutes_ago(running.started_at) < 61
+
+
+@pytest.mark.asyncio
+async def test_backdated_checkin_does_not_close_a_newer_timer(wired, session, child, mother):
+    dp, bot, talk = wired
+    old = await repo.start_event(
+        session, child.id, mother.id, FEED_BREAST,
+        started_at=tu.now_utc() - timedelta(minutes=10),
+    )
+
+    await _tap(dp, bot, "run", kind=SLEEP, back=60, update_id=5901)
+
+    await session.refresh(old)
+    assert old.ended_at is None
+    assert len(await _events(session, child)) == 1
+    assert any("раньше текущего" in text for text in talk.sent)
+
+
+@pytest.mark.asyncio
+async def test_checkin_timer_failure_keeps_the_previous_timer_open(
+    wired, session, child, mother, monkeypatch
+):
+    dp, bot, _ = wired
+    old = await repo.start_event(
+        session, child.id, mother.id, FEED_BREAST,
+        started_at=tu.now_utc() - timedelta(hours=5),
+    )
+
+    async def fail_start(*args, **kwargs):
+        raise RuntimeError("cannot create timer")
+
+    monkeypatch.setattr(repo, "start_event", fail_start)
+    with pytest.raises(RuntimeError, match="cannot create timer"):
+        await _tap(dp, bot, "run", kind=SLEEP, back=60, update_id=5902)
+
+    await session.refresh(old)
+    await session.refresh(child)
+    assert old.ended_at is None
+    assert len(await _events(session, child)) == 1
 
 
 @pytest.mark.asyncio

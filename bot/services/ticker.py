@@ -18,6 +18,7 @@ from datetime import datetime, timedelta
 
 from aiogram import Bot
 from dateutil.rrule import rrulestr
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot import keyboards, texts
@@ -27,14 +28,17 @@ from bot.db.models import (
     DIAPER_KINDS,
     DIAPER_MIXED,
     DIAPER_WET,
+    FEED_BREAST,
     FEED_KINDS,
+    SLEEP,
     WEIGHT,
     Child,
+    Event,
     Family,
     Reminder,
 )
 from bot.db.session import Session
-from bot.services import backup, checkin, digest, growth, panel, redflags, sending
+from bot.services import backup, checkin, digest, growth, panel, redflags, sending, tracker_guard
 from bot.services import timeutil as tu
 
 log = logging.getLogger(__name__)
@@ -173,40 +177,38 @@ async def tick_once(
 async def close_stale_timers(
     bot: Bot, session: AsyncSession, now: datetime | None = None
 ) -> None:
-    """Закрыть таймеры, висящие дольше разумного, и сказать об этом.
+    """Один мягкий вопрос по выбранному семьёй порогу. Никакого автозакрытия.
 
-    Сказать обязательно. Молча закрытый таймер выглядит как честно измеренный
-    четырёхчасовой сон, а это не то, что стоит показывать педиатру. Пометка
-    `estimated` доезжает и до выгрузки.
+    Имя функции сохранено для совместимости; прежний четырёхчасовой cutoff
+    больше не превращается в выдуманную длительность.
     """
     moment = now or tu.now_utc()
-    stale = await repo.stale_open_events(session, moment)
-    if not stale:
-        return
-
-    for event in stale:
-        cutoff = event.started_at + timedelta(hours=settings.open_timer_max_hours)
-        await repo.close_event(session, event, cutoff, estimated=True)
-
-        family = await _family_of(session, event.child_id)
-        if family is None:
-            continue
-        # Кнопка на ту же запись, а не ссылка на сводку. «Забыла выключить» —
-        # это ровно тот промах, о котором бот сообщает сам, и правило «у
-        # каждого промаха есть кнопка, и она лечит ровно этот промах» здесь
-        # исполняется буквально. До неё текст звал в `/today`, где отдельных
-        # записей не видно вовсе, и обработчика у обещания не было ни одного
-        await sending.deliver(
-            bot,
-            family,
-            texts.AUTO_CLOSED.format(
-                name=texts.KIND_NAMES.get(event.kind, event.kind),
-                hours=settings.open_timer_max_hours,
-            ),
-            reply_markup=keyboards.record_fix(event.id, field="e"),
-            session=session,
-        )
-        log.info("Таймер #%s закрыт автоматически", event.id)
+    opened = list(await session.scalars(select(Event).where(
+        Event.kind.in_({FEED_BREAST, SLEEP}), Event.ended_at.is_(None),
+        Event.nudged_at.is_(None),
+    )))
+    for event in opened:
+        async with tracker_guard.for_child(event.child_id):
+            await session.refresh(event)
+            if event.ended_at is not None or event.nudged_at is not None:
+                continue
+            family = await _family_of(session, event.child_id)
+            if family is None:
+                continue
+            minutes = family.feed_nudge_minutes if event.kind == FEED_BREAST else (
+                family.sleep_nudge_minutes
+            )
+            if minutes <= 0 or moment - event.started_at < timedelta(minutes=minutes):
+                continue
+            name = "Кормление" if event.kind == FEED_BREAST else "Сон"
+            status, _ = await sending.send(
+                bot, family, f"{name}: таймер ещё идёт? Если уже закончили, "
+                "укажите фактическое время. Сам таймер не завершаю.",
+                reply_markup=keyboards.running(event.kind, row_id=event.id), session=session,
+            )
+            if status in {sending.OK, sending.FORBIDDEN, sending.BROKEN}:
+                event.nudged_at = moment
+                await session.commit()
 
 
 async def _family_of(session: AsyncSession, child_id: int) -> Family | None:
@@ -411,7 +413,9 @@ async def _collect_watches(
     # Считаем подгузники ЛЮБЫЕ, а мокрые — отдельно: если за сутки записаны
     # три грязных и ни одного мокрого, это не забывчивость, а сам признак
     logged = await repo.count_events_since(session, child.id, wet_from, DIAPER_KINDS)
-    found.append(redflags.check_wet_diapers(wet, age, has_records=logged > 0))
+    family = await session.get(Family, child.family_id)
+    if family is not None and family.diapers_tracked:
+        found.append(redflags.check_wet_diapers(wet, age, has_records=logged > 0))
 
     last_feed = await repo.last_event(session, child.id, FEED_KINDS)
     if last_feed is not None:

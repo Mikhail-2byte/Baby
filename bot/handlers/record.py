@@ -56,7 +56,7 @@ from bot.db.models import (
 )
 from bot.filters import IN_GROUP_CB
 from bot.keyboards import RecordCB
-from bot.services import panel, pending, records
+from bot.services import panel, pending, records, revisions, tracker_guard
 from bot.services import timeutil as tu
 
 log = logging.getLogger(__name__)
@@ -77,9 +77,7 @@ def _last_id(call: CallbackQuery) -> int | None:
     return call.message.message_id if isinstance(call.message, Message) else None
 
 
-async def _say(
-    call: CallbackQuery, text: str, markup: InlineKeyboardMarkup | None = None
-) -> None:
+async def _say(call: CallbackQuery, text: str, markup: InlineKeyboardMarkup | None = None) -> None:
     """Ответить в чат отдельным сообщением. Двойник `track._say`.
 
     Подтверждение правки обязано остаться в ленте по той же причине, по какой
@@ -90,9 +88,7 @@ async def _say(
         await call.message.answer(text, reply_markup=markup or keyboards.home())
 
 
-async def _edit(
-    call: CallbackQuery, text: str, markup: InlineKeyboardMarkup | None
-) -> None:
+async def _edit(call: CallbackQuery, text: str, markup: InlineKeyboardMarkup | None) -> None:
     """Перерисовать сам экран. Ошибку правки глушим на DEBUG.
 
     Тот же случай, что на экране `/remind` и у карточки опроса: «message is not
@@ -134,7 +130,15 @@ async def tap(
         await call.answer()
         return
 
-    await handler(call, callback_data, session, bot, family, member, child, tu.now_utc())
+    try:
+        with revisions.actor(member.id):
+            async with tracker_guard.for_child(child.id):
+                await handler(
+                    call, callback_data, session, bot, family, member, child, tu.now_utc()
+                )
+    except Exception:
+        panel.schedule(bot, family.id, _last_id(call))
+        raise
 
 
 # --- Список ---------------------------------------------------------------
@@ -220,9 +224,7 @@ def _what(row: Row) -> str:
 # --- Карточка -------------------------------------------------------------
 
 
-async def _fetch(
-    session: AsyncSession, data: RecordCB, child: Child
-) -> Row | None:
+async def _fetch(session: AsyncSession, data: RecordCB, child: Child) -> Row | None:
     """Запись по номеру из кнопки — и только своего ребёнка.
 
     Голый `session.get` по id, пришедшему с клиента, дал бы чужому чату доступ
@@ -246,11 +248,7 @@ def _is_birth_weight(row: Row, child: Child) -> bool:
     это можно было бы только глазами. Правится она в `/baby`, где правятся обе
     половины разом.
     """
-    return (
-        isinstance(row, Measurement)
-        and row.kind == WEIGHT
-        and row.taken_at == child.born_at
-    )
+    return isinstance(row, Measurement) and row.kind == WEIGHT and row.taken_at == child.born_at
 
 
 def _card_markup(row: Row, data: RecordCB, child: Child) -> InlineKeyboardMarkup:
@@ -327,14 +325,12 @@ async def _card(
     if row is None:
         await call.answer(texts.RECORD_GONE, show_alert=True)
         return
-    await call.answer()
-
     if data.field and isinstance(row, Event) and data.field in records.fields_of(row):
-        await _say(
-            call,
-            *_time_screen(row, data, family, child, now, data.field, 0),
-        )
+        from bot.handlers.timing import ask_time
+
+        await ask_time(call, session, family, child, row.id, data.field, "e")
         return
+    await call.answer()
     await _say(call, _card_text(row, family, child, now), _card_markup(row, data, child))
 
 
@@ -369,9 +365,7 @@ def _time_screen(
         steps = _measure_steps(row, mins, child, now)
         becomes = was + timedelta(minutes=mins)
     else:
-        steps = records.steps_for(
-            row, field, mins, born_at=child.born_at, now=now
-        )
+        steps = records.steps_for(row, field, mins, born_at=child.born_at, now=now)
         started, ended = records.preview(row, field, mins)
         becomes = ended if field == records.END and ended is not None else started
 
@@ -389,9 +383,7 @@ def _time_screen(
     )
 
 
-def _measure_steps(
-    row: Measurement, mins: int, child: Child, now: datetime
-) -> tuple[int, ...]:
+def _measure_steps(row: Measurement, mins: int, child: Child, now: datetime) -> tuple[int, ...]:
     """Те же границы, что у события, но точке конца не бывает.
 
     Взвешивание — момент, поэтому `fits` зовётся с пустым `ended_at`: судить
@@ -444,9 +436,7 @@ async def _shift(
         await call.answer(texts.RECORD_GONE, show_alert=True)
         return
     await call.answer()
-    await _edit(
-        call, *_time_screen(row, data, family, child, now, data.field, data.mins)
-    )
+    await _edit(call, *_time_screen(row, data, family, child, now, data.field, data.mins))
 
 
 async def _save(
@@ -579,10 +569,8 @@ async def _setkind(
         was_name += f" ({texts.SIDE_NAMES[row.side]})"
     lost = row.value_num
 
-    side, value_num = records.after_kind_change(data.kind, data.side)
-    await repo.set_event_kind(
-        session, row, kind=data.kind, side=side, value_num=value_num
-    )
+    side, value_num = records.after_kind_change(data.kind, "")
+    await repo.set_event_kind(session, row, kind=data.kind, side=side, value_num=value_num)
 
     dropped = (
         texts.record_value_dropped(data.kind, lost)
@@ -648,9 +636,7 @@ async def _ask(
     await _edit(
         call,
         f"{texts.record_card(row, family.tz, now)}\n\n{texts.RECORD_ASK_DELETE}",
-        keyboards.record_delete(
-            what=data.what, row_id=row.id, day=data.day, page=data.page
-        ),
+        keyboards.record_delete(what=data.what, row_id=row.id, day=data.day, page=data.page),
     )
 
 

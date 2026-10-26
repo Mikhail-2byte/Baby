@@ -21,13 +21,7 @@ from aiogram.types import (
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from bot.db.models import (
-    DIAPER_DIRTY,
-    DIAPER_WET,
-    FEED_BOTTLE,
     FEED_BREAST,
-    LEFT,
-    PUMP,
-    RIGHT,
     SLEEP,
 )
 
@@ -42,6 +36,26 @@ class TrackCB(CallbackData, prefix="trk"):
     action: str
     kind: str
     side: str = ""
+
+
+class HistoryCB(CallbackData, prefix="hist"):
+    action: str
+    row_id: int
+    what: str = "e"
+
+
+class NudgeCB(CallbackData, prefix="ndg"):
+    kind: str
+    minutes: int = -1
+
+
+class TimeCB(CallbackData, prefix="tm"):
+    """Новые кнопки времени; формат старых TrackCB/RecordCB сохранён."""
+
+    action: str
+    row_id: int
+    field: str = "e"
+    what: str = "e"
 
 
 class PanelCB(CallbackData, prefix="pnl"):
@@ -328,89 +342,33 @@ def start_card() -> InlineKeyboardMarkup:
     )
 
 
-def panel(*, running_kind: str | None) -> InlineKeyboardMarkup:
-    """Главная клавиатура. Вид зависит от того, идёт ли таймер.
-
-    Когда таймер идёт, его кнопки уступают место одной большой «Закончить».
-    Это не украшение: перепутать «начали» и «закончили» в полусне легко, а
-    лишний старт поверх идущего таймера портит статистику суток.
-
-    **По две кнопки в ряду, и это замер, а не вкус.** В нижнем ряду стояло
-    четыре, и на телефоне Telegram резал подписи до «Су…» и «во.» — то есть
-    кнопка переставала называть себя ровно там, где на неё жмут не глядя. Три в
-    ряду тоже мало: «🍼 Бутылочка» не помещалась. Две — единственная ширина, при
-    которой не обрезается ни одна подпись, и заодно вдвое более крупная цель
-    для пальца ночью.
-
-    **Трёх кнопок здесь больше нет, и все три ушли не в никуда.** «📊 Сутки» и
-    «❓ Вопрос» переехали на постоянную клавиатуру под полем ввода
-    (`home()`) — там они доступны в один тап всегда, а не только когда панель
-    на экране. «🔄» перерисовывала панель **на месте**, то есть была нужна
-    ровно тогда, когда панель уже видно; её работу забрала кнопка «📋 Панель»,
-    которая приводит панель вниз чата.
-
-    Обработчики `StatsCB`, `AskCB` и `PanelCB` при этом остаются: кнопки живут
-    в истории чата неограниченно долго, и тап по вчерашней панели обязан
-    работать — см. докстроку модуля.
-
-    **«🍼 Бутылочка» переехала в нижний ряд и стала доступна всегда.** Это не
-    побочный эффект раскладки, а исправление: бутылочка — мгновенное событие,
-    как подгузник, и с идущим таймером не конфликтует (`_add` его не трогает
-    вовсе). Пока она стояла в ряду кормлений, её прятало любое включённое
-    сцеживание.
-    """
-    builder = InlineKeyboardBuilder()
-
+def panel(*, running_kind: str | None, running_id: int | None = None) -> InlineKeyboardMarkup:
+    """Только повседневные действия; старые callback-классы не меняем."""
     if running_kind is not None:
-        builder.row(
-            InlineKeyboardButton(
-                text="⏹ Закончить",
-                callback_data=TrackCB(action="stop", kind=running_kind).pack(),
-            )
-        )
-    else:
-        builder.row(
-            InlineKeyboardButton(
-                text="🤱 Левая",
-                callback_data=TrackCB(action="start", kind=FEED_BREAST, side=LEFT).pack(),
-            ),
-            InlineKeyboardButton(
-                text="🤱 Правая",
-                callback_data=TrackCB(action="start", kind=FEED_BREAST, side=RIGHT).pack(),
-            ),
-        )
-        builder.row(
-            InlineKeyboardButton(
-                text="😴 Сон",
-                callback_data=TrackCB(action="start", kind=SLEEP).pack(),
-            ),
-            InlineKeyboardButton(
-                text="🥛 Сцеживание",
-                callback_data=TrackCB(action="start", kind=PUMP).pack(),
-            ),
-        )
+        return running(running_kind, row_id=running_id)
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="🤱 Кормление", callback_data=TrackCB(
+                action="start", kind=FEED_BREAST).pack()),
+        ],
+        [
+            InlineKeyboardButton(text="😴 Сон", callback_data=TrackCB(
+                action="start", kind=SLEEP).pack()),
+            InlineKeyboardButton(text="⋯ Ещё", callback_data=PanelCB(action="more").pack()),
+        ],
+    ])
 
-    # Мгновенные события: с таймером не конфликтуют, поэтому доступны всегда
-    builder.row(
-        InlineKeyboardButton(
-            text="💧 Мокрый",
-            callback_data=TrackCB(action="add", kind=DIAPER_WET).pack(),
-        ),
-        InlineKeyboardButton(
-            text="💩 Стул",
-            callback_data=TrackCB(action="add", kind=DIAPER_DIRTY).pack(),
-        ),
-    )
-    builder.row(
-        InlineKeyboardButton(
-            text="🍼 Бутылочка",
-            callback_data=TrackCB(action="add", kind=FEED_BOTTLE).pack(),
-        ),
-        InlineKeyboardButton(
-            text="⚖️ Вес", callback_data=MeasureCB(kind="weight").pack()
-        ),
-    )
-    return builder.as_markup()
+
+def more() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⚖️ Вес", callback_data=MeasureCB(kind="weight").pack()),
+         InlineKeyboardButton(text="📖 История", callback_data=RecordCB(action="list").pack())],
+        [InlineKeyboardButton(text="🕐 Напоминания о таймере", callback_data=NudgeCB(
+            kind="menu").pack())],
+        [InlineKeyboardButton(text="⚙️ Напоминания", callback_data=RemindCB(action="back").pack())],
+        [InlineKeyboardButton(
+            text="🔕 Отключить опросы", callback_data=PanelCB(action="quiet").pack())],
+    ])
 
 
 def _fix_button(what: str, row_id: int) -> InlineKeyboardButton:
@@ -421,85 +379,28 @@ def _fix_button(what: str, row_id: int) -> InlineKeyboardButton:
     заметил промах в ту же секунду, и ему искать сводку незачем.
     """
     return InlineKeyboardButton(
-        text="✏️ Поправить",
+        text="✏️ Изменить",
         callback_data=RecordCB(action="card", what=what, row_id=row_id).pack(),
     )
 
 
 def running(kind: str, *, row_id: int | None = None) -> InlineKeyboardMarkup:
-    """«Закончить» под сообщением о начатом таймере, рядом с отменой.
-
-    Заведено по жалобе из чата: «начинаешь действие, а кнопка завершения
-    где-то сверху в панели, это даже не читается». Так и было — подтверждение
-    «Сцеживание — начали в 23:40» предлагало только «Отменить», а «⏹ Закончить»
-    оставалось в панели выше, отделённое от него служебной строкой о
-    закреплении. То есть в момент, когда таймер запущен и палец ещё над
-    последним сообщением, до кнопки остановки надо было прокручивать чат.
-
-    Панель кнопку не теряет: она остаётся главным экраном. Но подтверждение
-    начала — это единственное сообщение, про которое точно известно, что
-    человек на него смотрит **сейчас**, и именно оно обязано уметь закончить.
-
-    `row_id` необязателен: у карточки голосового отменять нечего — она правится
-    на месте, и записи под ней не одна.
-
-    «Поправить» идёт вторым рядом, а не третьей кнопкой в первом: ряд из трёх
-    Telegram на телефоне режет, и это уже замерено на панели. Нужна она здесь
-    ровно за тем, за чем заведена правка вообще, — «начали в 23:40» бывает
-    неправдой, когда кнопку нажали через полчаса после начала.
-    """
-    row = [
-        InlineKeyboardButton(
-            text="⏹ Закончить",
-            callback_data=TrackCB(action="stop", kind=kind).pack(),
-        )
-    ]
+    """Окончание всегда привязано к записи, а не к любому текущему таймеру."""
     if row_id is None:
-        return InlineKeyboardMarkup(inline_keyboard=[row])
-
-    row.append(
-        InlineKeyboardButton(
-            text="↩️ Отменить",
-            callback_data=UndoCB(what="event", row_id=row_id).pack(),
-        )
-    )
-    return InlineKeyboardMarkup(
-        inline_keyboard=[row, [_fix_button("e", row_id)]]
-    )
+        return InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(
+                text="📋 Открыть панель", callback_data=PanelCB(action="show").pack())
+        ]])
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⏹ Закончить сейчас", callback_data=TimeCB(
+            action="stop", row_id=row_id).pack())],
+        [InlineKeyboardButton(text="🕐 Указать время окончания", callback_data=TimeCB(
+            action="ask", row_id=row_id, field="e").pack())],
+    ])
 
 
 def stopped(row_id: int) -> InlineKeyboardMarkup:
-    """Что делать, если «Закончить» нажали случайно.
-
-    Две кнопки, потому что промахи бывают разные и лечатся по-разному.
-    «Не заканчивать» возвращает таймеру ход: сон продолжается, запись цела.
-    «Удалить запись» — прежнее поведение кнопки отмены, но названное своим
-    именем: до этой правки под ответом об окончании стояло «↩️ Отменить», и
-    человек, промахнувшийся по окончанию, жал её в надежде вернуть таймер — а
-    терял весь сон.
-
-    Отсюда и порядок: сперва то, что чинит промах, потом то, что стирает.
-
-    Третий случай — «закончили, но не тогда»: таймер шёл, пока его не
-    выключили, и настоящий конец был часом раньше. Возврат хода тут не лечит
-    ничего, удаление стирает весь сон, а «✏️ Поправить» ведёт прямо на сдвиг
-    времени. Ряд свой, потому что ряд из трёх Telegram режет.
-    """
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="↩️ Не заканчивать",
-                    callback_data=UndoCB(what="reopen", row_id=row_id).pack(),
-                ),
-                InlineKeyboardButton(
-                    text="🗑 Удалить запись",
-                    callback_data=UndoCB(what="event", row_id=row_id).pack(),
-                ),
-            ],
-            [_fix_button("e", row_id)],
-        ]
-    )
+    return InlineKeyboardMarkup(inline_keyboard=[[_fix_button("e", row_id)]])
 
 
 def undo(what: str, row_id: int) -> InlineKeyboardMarkup:
@@ -960,13 +861,11 @@ def record_card(
     times = [
         InlineKeyboardButton(
             text=titles[field],
-            callback_data=RecordCB(
-                action="time",
+            callback_data=TimeCB(
+                action="ask",
                 what=what,
                 row_id=row_id,
                 field=field,
-                day=day,
-                page=page,
             ).pack(),
         )
         for field in fields
@@ -997,7 +896,18 @@ def record_card(
     if second:
         builder.row(*second)
 
+    builder.row(InlineKeyboardButton(
+        text="↩️ Отменить правку", callback_data=HistoryCB(
+            action="undo", row_id=row_id, what=what).pack()),
+        InlineKeyboardButton(text="🕘 История правок", callback_data=HistoryCB(
+            action="list", row_id=row_id, what=what).pack()),
+    )
     last = []
+    if what == "e" and "e" in fields:
+        builder.row(InlineKeyboardButton(
+            text="↩️ Продолжить таймер",
+            callback_data=UndoCB(what="reopen", row_id=row_id).pack(),
+        ))
     if delete:
         last.append(
             InlineKeyboardButton(

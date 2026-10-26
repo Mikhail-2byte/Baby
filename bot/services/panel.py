@@ -112,7 +112,7 @@ async def refresh(
 async def refresh_stale(
     bot: Bot, session: AsyncSession, now: datetime | None = None
 ) -> None:
-    """Перевыпустить панели, оставшиеся за вчерашний день. Зовёт тикер.
+    """Обновить панели, оставшиеся за вчерашний день, без перевыпуска.
 
     В обычный тик не делает ни одного обращения к Telegram — только читает
     семьи. Отправка случается ровно один раз за локальные сутки.
@@ -156,7 +156,10 @@ async def _build(
 
     text = await stats.panel_text(session, family, child, now)
     running = await repo.any_open_event(session, child.id)
-    return text, keyboards.panel(running_kind=running.kind if running else None)
+    return text, keyboards.panel(
+        running_kind=running.kind if running else None,
+        running_id=running.id if running else None,
+    )
 
 
 async def _redraw(
@@ -180,6 +183,10 @@ async def _redraw(
             # тапов подряд в логе обязана быть одна строка, а не по строке
             # на каждый
             log.info("Панель #%s: правка, %s", family.panel_message_id, status)
+            if status == sending.OK:
+                await repo.set_panel(
+                    session, family, family.panel_message_id, tu.local_today(family.tz, now)
+                )
             return
         # Осталось NOT_FOUND (панель удалили руками), FORBIDDEN (выгнали) и
         # MOVED (группа стала супергруппой, а переехать не вышло) — все трое
@@ -190,14 +197,13 @@ async def _redraw(
 
 
 def _outdated(family: Family, now: datetime, last_message_id: int | None) -> bool:
-    """Панель невидима: уехала вверх по истории или осталась за вчера.
+    """Панель невидима: уехала вверх по истории.
 
     `last_message_id` — оценка снизу: тап по inline-кнопке сообщений в чат не
     добавляет, а `call.message` может быть старым. Недооценка лишь откладывает
     перевыпуск до следующей правки, переоценки не бывает.
     """
-    if family.panel_day != tu.local_today(family.tz, now):
-        return True
+    # Новый день: редактируем закреп, а не создаём служебный шум.
     if last_message_id is None or family.panel_message_id is None:
         return False
     return last_message_id - family.panel_message_id > settings.panel_max_messages

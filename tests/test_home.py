@@ -779,8 +779,9 @@ async def test_starting_a_timer_offers_to_finish_it_right_there(wired):
         for row in markup.inline_keyboard
         for button in row
     ]
-    assert "⏹ Закончить" in labels, labels
-    assert "↩️ Отменить" in labels, labels
+    assert "⏹ Закончить сейчас" in labels, labels
+    assert "🕐 Указать время окончания" in labels, labels
+    assert "↩️ Отменить" not in labels, labels
 
 
 # --- Случайный тап ----------------------------------------------------------
@@ -801,14 +802,14 @@ async def test_a_misfired_finish_can_be_taken_back(wired, session, child):
     """
     from bot.db import repo
     from bot.db.models import SLEEP
-    from bot.keyboards import TrackCB, UndoCB
+    from bot.keyboards import TimeCB, TrackCB, UndoCB
 
     dp, bot, talk, opened = wired
     await _tap(dp, bot, TrackCB(action="start", kind=SLEEP).pack())
     started = await repo.any_open_event(session, child.id)
     assert started is not None
 
-    await _tap(dp, bot, TrackCB(action="stop", kind=SLEEP).pack())
+    await _tap(dp, bot, TimeCB(action="stop", row_id=started.id).pack())
     assert await repo.any_open_event(session, child.id) is None
 
     await _tap(dp, bot, UndoCB(what="reopen", row_id=started.id).pack())
@@ -828,12 +829,12 @@ async def test_reopening_never_cuts_off_another_timer(wired, session, child):
     """
     from bot.db import repo
     from bot.db.models import PUMP, SLEEP
-    from bot.keyboards import TrackCB, UndoCB
+    from bot.keyboards import TimeCB, TrackCB, UndoCB
 
     dp, bot, talk, opened = wired
     await _tap(dp, bot, TrackCB(action="start", kind=SLEEP).pack())
     sleep_event = await repo.any_open_event(session, child.id)
-    await _tap(dp, bot, TrackCB(action="stop", kind=SLEEP).pack())
+    await _tap(dp, bot, TimeCB(action="stop", row_id=sleep_event.id).pack())
     await _tap(dp, bot, TrackCB(action="start", kind=PUMP).pack())
 
     await _tap(dp, bot, UndoCB(what="reopen", row_id=sleep_event.id).pack())

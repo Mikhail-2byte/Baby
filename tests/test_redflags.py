@@ -525,6 +525,8 @@ async def test_tracker_watch_notices_too_few_wet_diapers(
     from bot.services import ticker
     from bot.services import timeutil as tu
 
+    family.diapers_tracked = True
+    await session.commit()
     now = tu.now_utc()
     # Два за сутки при пороге в четыре, начиная с пятого дня жизни
     for _ in range(2):
@@ -551,6 +553,8 @@ async def test_tracker_watch_counts_a_sliding_day(session, family, child, mother
     from bot.services import ticker
     from bot.services import timeutil as tu
 
+    family.diapers_tracked = True
+    await session.commit()
     now = tu.now_utc()
     for _ in range(6):
         await repo.add_event(
@@ -615,6 +619,8 @@ async def test_tracker_watch_counts_dirty_as_evidence_of_logging(
     from bot.services import ticker
     from bot.services import timeutil as tu
 
+    family.diapers_tracked = True
+    await session.commit()
     now = tu.now_utc()
     for _ in range(3):
         await repo.add_event(

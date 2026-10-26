@@ -13,7 +13,7 @@ from bot import middlewares, texts
 from bot.config import settings
 from bot.db.session import engine
 from bot.handlers import routers
-from bot.services import kb, lock, panel, ticker
+from bot.services import kb, lock, panel, replay, ticker
 
 # Файл пишем сами, а не редиректом shell, и это не удобство. При `>> bot.log`
 # кодировку выбирает Python по локали Windows, а не по кодовой странице консоли:
@@ -159,7 +159,8 @@ async def main() -> None:
     try:
         me = await bot.get_me()
         log.info("Запуск @%s", me.username)
-        await bot.delete_webhook(drop_pending_updates=True)
+        await bot.delete_webhook(drop_pending_updates=False)
+        await replay.drain(bot, dp)
         await _publish_profile(bot)
 
         task = asyncio.create_task(ticker.run(bot), name="ticker")

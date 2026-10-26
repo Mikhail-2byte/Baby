@@ -180,12 +180,14 @@ async def test_broken_rrule_deactivates_instead_of_looping(
 
 
 @pytest.mark.asyncio
-async def test_stale_timer_is_closed_and_marked(session, child, mother, bot, monkeypatch):
+async def test_stale_timer_is_nudged_once_not_closed(session, family, child, mother, bot):
     """Таймер, висящий дольше порога, закрывается с пометкой «приблизительно».
 
     Пометка важнее самого закрытия: молча закрытый таймер выглядит как честно
     измеренный четырёхчасовой сон, а это не то, что стоит показывать педиатру.
     """
+    family.sleep_nudge_minutes = 180
+    await session.commit()
     now = tu.now_utc()
     event = await repo.start_event(
         session, child.id, mother.id, SLEEP, started_at=now - timedelta(hours=9)
@@ -194,12 +196,12 @@ async def test_stale_timer_is_closed_and_marked(session, child, mother, bot, mon
     await ticker.close_stale_timers(bot, session, now)
 
     await session.refresh(event)
-    assert event.ended_at is not None
-    assert event.estimated is True
-    # Закрыт по порогу, а не «сейчас»: девятичасовой сон выдумывать нельзя
-    assert event.ended_at == event.started_at + timedelta(hours=4)
+    assert event.ended_at is None
+    assert event.estimated is False
+    assert event.nudged_at == now
     assert len(bot.sent) == 1
-    assert "приблизительная" in bot.texts[0]
+    await ticker.close_stale_timers(bot, session, now + timedelta(hours=1))
+    assert len(bot.sent) == 1
 
 
 @pytest.mark.asyncio

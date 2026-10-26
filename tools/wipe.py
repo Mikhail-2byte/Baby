@@ -31,6 +31,8 @@ WIPE_ORDER = (
     # Цена названа вслух: сброс боевой базы уносит накопленную аналитику
     # целиком. Это правильно — семей, про которые она, больше нет, — но значит,
     # что отчёт перед сбросом надо выгрузить: `python -m tools.usage --csv`
+    "processed_messages",
+    "record_revisions",
     "usage",
     "alerts",
     "events",
@@ -61,6 +63,8 @@ KEPT = ("who_lms", "alembic_version")
 # первым молча. У событий, измерений и тревог своего `family_id` нет вовсе: они
 # висят на ребёнке, и это единственная причина, по которой условия разные.
 SCOPE = {
+    "processed_messages": "chat_id IN (SELECT chat_id FROM families WHERE id = ?)",
+    "record_revisions": "child_id IN (SELECT id FROM children WHERE family_id = ?)",
     "usage": "family_id = ?",
     "alerts": "child_id IN (SELECT id FROM children WHERE family_id = ?)",
     "events": "child_id IN (SELECT id FROM children WHERE family_id = ?)",

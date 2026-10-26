@@ -295,7 +295,8 @@ async def send_for(
         family,
         texts.checkin_card(CARD, family.checkin_hours),
         reply_markup=keyboards.checkin_card(
-            [(kind.kind, kind.title) for kind in CARD.kinds],
+            [(kind.kind, kind.title) for kind in CARD.kinds
+             if kind.kind in {"feed_breast", "sleep"}],
             nothing=CARD.nothing_label,
             mute=CARD.mute_label,
         ),

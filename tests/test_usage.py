@@ -45,8 +45,11 @@ from tests.conftest import AUTHOR, CHAT, ME, NOW, PRIVATE
 # был бы не дублем, а расхождением с отложенным сроком
 CASES = [
         ("trk:start:feed_breast:L", "trk:start:feed_breast"),
+        ("tm:stop:57:e:e", "tm:stop"),
         ("trk:add:diaper_wet:", "trk:add:diaper_wet"),
         ("undo:event:412", "undo:event"),
+        ("hist:undo:7:e", "hist:undo"),
+        ("ndg:feed:45", "ndg:feed"),
         ("rec:list:e:0:0:0:0:0:0", "rec:list:e"),
         ("rec:shift:e:57::::-15:0:0", "rec:shift:e"),
         ("rec:setkind:e:57:kind:sleep::0:0:0", "rec:setkind:e"),

@@ -22,7 +22,7 @@ from bot.db import repo
 from bot.db.models import (
     DIAPER_KINDS,
     FEED_BOTTLE,
-    PUMP,
+    FEED_BREAST,
     TIMED_KINDS,
     Child,
     Family,
@@ -30,7 +30,7 @@ from bot.db.models import (
 )
 from bot.filters import IN_GROUP_CB
 from bot.keyboards import PanelCB, TrackCB, UndoCB
-from bot.services import panel, pending
+from bot.services import panel, pending, revisions, tracker_guard
 from bot.services import timeutil as tu
 
 log = logging.getLogger(__name__)
@@ -54,7 +54,7 @@ def _last_id(call: CallbackQuery) -> int | None:
 
 async def _say(
     call: CallbackQuery, text: str, markup: InlineKeyboardMarkup | None = None
-) -> None:
+) -> Message | None:
     """Ответить в чат отдельным сообщением.
 
     Именно отдельным, а не всплывашкой: подтверждение должно остаться в ленте,
@@ -65,7 +65,8 @@ async def _say(
     клавиатуры. Одно сообщение обе разметки не носит, поэтому выбор, а не сумма.
     """
     if isinstance(call.message, Message):
-        await call.message.answer(text, reply_markup=markup or keyboards.home())
+        return await call.message.answer(text, reply_markup=markup or keyboards.home())
+    return None
 
 
 @router.callback_query(IN_GROUP_CB, TrackCB.filter())
@@ -83,6 +84,8 @@ async def track(
         return
 
     now = tu.now_utc()
+    if callback_data.kind == FEED_BREAST:
+        callback_data.side = ""
     handlers = {"start": _start, "stop": _stop, "add": _add}
     handler = handlers.get(callback_data.action)
     if handler is None:
@@ -91,8 +94,12 @@ async def track(
         await call.answer()
         return
 
-    await handler(call, callback_data, session, family, member, child, now)
-    panel.schedule(bot, family.id, _last_id(call))
+    try:
+        with revisions.actor(member.id):
+            async with tracker_guard.for_child(child.id):
+                await handler(call, callback_data, session, family, member, child, now)
+    finally:
+        panel.schedule(bot, family.id, _last_id(call))
 
 
 async def _start(
@@ -118,6 +125,14 @@ async def _start(
     # всего выше по чату. Молчание превратилось в тихую потерю: промахнувшись по
     # «начали» при идущем таймере, человек получал закрытый «сейчас» предыдущий
     # и отменить мог только новый
+    current = await repo.any_open_event(session, child.id)
+    if (
+        current is not None
+        and current.kind == data.kind
+        and (data.kind == FEED_BREAST or current.side == (data.side or None))
+    ):
+        await call.answer("Этот таймер уже идёт")
+        return
     closed = await repo.close_running(session, child.id, now)
 
     event = await repo.start_event(
@@ -136,9 +151,12 @@ async def _start(
     # «Закончить» рядом с «Отменить», а не только в панели: в эту секунду
     # человек смотрит на подтверждение, а панель уже выше по чату. И оно идёт
     # последним, чтобы кнопка окончания осталась под рукой
-    await _say(
+    card = await _say(
         call, texts.started(event, family.tz), keyboards.running(data.kind, row_id=event.id)
     )
+    if card is not None:
+        event.card_message_id = card.message_id
+        await session.commit()
 
 
 async def _stop(
@@ -150,24 +168,10 @@ async def _stop(
     child: Child,
     now: datetime,
 ) -> None:
-    running = await repo.any_open_event(session, child.id)
-    if running is None:
-        # Обычно это двойной тап или нажатие по устаревшей панели: таймер уже
-        # закрыт, и говорить об этом громко незачем
-        await call.answer("Таймер уже закрыт")
-        return
-
-    await repo.close_event(session, running, now)
-    await call.answer("Записал")
-    await _say(
-        call, texts.finished(running, family.tz), keyboards.stopped(running.id)
+    # Старый TrackCB не содержит id. Не даём вчерашней кнопке закрыть новый таймер.
+    await call.answer(
+        "Эта старая кнопка не привязана к записи. Откройте актуальную панель.", show_alert=True
     )
-
-    if running.kind == PUMP:
-        pending.remember(
-            family.chat_id, call.from_user.id, pending.PUMP_ML, running.id
-        )
-        await _say(call, ASK_TEXT[pending.PUMP_ML])
 
 
 async def _add(
@@ -226,35 +230,36 @@ async def undo(
         await call.answer(texts.NO_CHILD, show_alert=True)
         return
 
-    if callback_data.what == "reopen":
-        await _reopen(call, callback_data.row_id, session, bot, family, child)
-        return
+    async with tracker_guard.for_child(child.id):
+        if callback_data.what == "reopen":
+            await _reopen(call, callback_data.row_id, session, bot, family, child)
+            return
 
-    # `row_id` приходит с клиента, а id сквозные по всей базе: без сверки с
-    # ребёнком чат, знающий номер, стирал бы чужой дневник. Долго это было
-    # почти теорией — пока экран правки не начал раздавать номера записей в
-    # чат пачками
-    if callback_data.what == "event":
-        event = await repo.get_event(session, callback_data.row_id)
-        found = event is not None and event.child_id == child.id
-        if found and event is not None:
-            await repo.delete_event(session, event)
-    else:
-        measurement = await repo.get_measurement(session, callback_data.row_id)
-        found = measurement is not None and measurement.child_id == child.id
-        if found and measurement is not None:
-            await repo.delete_measurement(session, measurement)
+        # `row_id` приходит с клиента, а id сквозные по всей базе: без сверки с
+        # ребёнком чат, знающий номер, стирал бы чужой дневник. Долго это было
+        # почти теорией — пока экран правки не начал раздавать номера записей в
+        # чат пачками
+        if callback_data.what == "event":
+            event = await repo.get_event(session, callback_data.row_id)
+            found = event is not None and event.child_id == child.id
+            if found and event is not None:
+                await repo.delete_event(session, event)
+        else:
+            measurement = await repo.get_measurement(session, callback_data.row_id)
+            found = measurement is not None and measurement.child_id == child.id
+            if found and measurement is not None:
+                await repo.delete_measurement(session, measurement)
 
-    if not found:
-        # Запись уже удалили — скорее всего вторым тапом по той же кнопке
-        await call.answer(texts.NOTHING_TO_UNDO, show_alert=True)
-        return
+        if not found:
+            # Запись уже удалили — скорее всего вторым тапом по той же кнопке
+            await call.answer(texts.NOTHING_TO_UNDO, show_alert=True)
+            return
 
-    await call.answer(texts.UNDONE)
-    if isinstance(call.message, Message):
-        # Убираем кнопку, чтобы второй тап не спрашивал про уже удалённое
-        await call.message.edit_reply_markup(reply_markup=None)
-    panel.schedule(bot, family.id, _last_id(call))
+        await call.answer(texts.UNDONE)
+        if isinstance(call.message, Message):
+            # Убираем кнопку, чтобы второй тап не спрашивал про уже удалённое
+            await call.message.edit_reply_markup(reply_markup=None)
+        panel.schedule(bot, family.id, _last_id(call))
 
 
 async def _reopen(
@@ -283,6 +288,9 @@ async def _reopen(
         return
 
     await repo.reopen_event(session, event)
+    from bot.handlers.timing import render_card
+
+    await render_card(bot, family, event, session=session)
     await call.answer(texts.REOPENED)
     if isinstance(call.message, Message):
         await call.message.edit_reply_markup(reply_markup=None)
@@ -291,7 +299,23 @@ async def _reopen(
 
 @router.callback_query(IN_GROUP_CB, PanelCB.filter())
 async def refresh(
-    call: CallbackQuery, callback_data: PanelCB, bot: Bot, family: Family
+    call: CallbackQuery,
+    callback_data: PanelCB,
+    bot: Bot,
+    family: Family,
+    session: AsyncSession,
 ) -> None:
     await call.answer()
-    panel.schedule(bot, family.id, _last_id(call))
+    if callback_data.action == "more":
+        await _say(call, "Редкие действия", keyboards.more())
+    elif callback_data.action == "quiet":
+        family.diapers_tracked = False
+        await repo.set_checkin(session, family, 0, tu.now_utc())
+        await _say(
+            call, "Опросы отключены, подгузники не учитываются в этом чате. "
+            "Вернуть опросы можно через /remind."
+        )
+    elif callback_data.action == "show":
+        await panel.refresh(bot, family.id, force_new=True)
+    else:
+        panel.schedule(bot, family.id, _last_id(call))

@@ -95,3 +95,55 @@ def test_schema_matches_the_models(migrated):
         "схема в миграциях разошлась с models.py — сделайте "
         "`alembic revision --autogenerate`. Расхождения: " + repr(diff)
     )
+
+
+def test_timer_card_migration_keeps_history_and_family_preferences(tmp_path, monkeypatch):
+    import sqlite3
+
+    path = tmp_path / "old.db"
+    monkeypatch.setattr("bot.config.settings.db_path", path)
+    config = _config(path)
+    command.upgrade(config, "1da3278e4719")
+    with sqlite3.connect(path) as connection:
+        connection.executescript("""
+            INSERT INTO families(id, chat_id, tz, digest_dow, digest_time,
+                                 checkin_hours, checkin_last_at)
+            VALUES (1, -1001, 'Asia/Yekaterinburg', 0, '10:00', 6, '2026-10-26 08:00:00');
+            INSERT INTO children(id, family_id, name, sex, born_at, archived)
+            VALUES (1, 1, 'Тест', 'f', '2026-09-01 00:00:00', 0);
+            INSERT INTO members(id, family_id, tg_user_id, display_name)
+            VALUES (1, 1, 222, 'Тест');
+            INSERT INTO events(id, child_id, author_id, kind, started_at, ended_at, estimated, side)
+            VALUES (1, 1, 1, 'feed_breast', '2026-10-26 08:00:00', '2026-10-26 08:20:00', 0, 'L');
+            INSERT INTO measurements(id, child_id, author_id, kind, taken_at, value, note)
+            VALUES (1, 1, 1, 'weight', '2026-10-25 08:00:00', 4300, 'Исходная запись');
+        """)
+        columns = ",".join(row[1] for row in connection.execute("PRAGMA table_info(events)"))
+        family_columns = ",".join(
+            row[1] for row in connection.execute("PRAGMA table_info(families)")
+        )
+        before = connection.execute("SELECT * FROM events").fetchall()
+        preferences = connection.execute("SELECT * FROM families").fetchall()
+        weights = connection.execute("SELECT * FROM measurements").fetchall()
+    command.upgrade(config, "head")
+    with sqlite3.connect(path) as connection:
+        assert connection.execute(f"SELECT {columns} FROM events").fetchall() == before
+        assert connection.execute("SELECT card_message_id, nudged_at FROM events").fetchall() == [
+            (None, None)
+        ]
+        assert (
+            connection.execute(f"SELECT {family_columns} FROM families").fetchall() == preferences
+        )
+        assert connection.execute("SELECT diapers_tracked FROM families").fetchone() == (1,)
+        assert connection.execute("SELECT * FROM measurements").fetchall() == weights
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+        for table in ("events", "measurements"):
+            ddl = connection.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (table,)
+            ).fetchone()[0]
+            assert "AUTOINCREMENT" in ddl.upper()
+
+    command.downgrade(config, "1da3278e4719")
+    with sqlite3.connect(path) as connection:
+        assert connection.execute("SELECT * FROM events").fetchall() == before
+        assert connection.execute("SELECT * FROM measurements").fetchall() == weights

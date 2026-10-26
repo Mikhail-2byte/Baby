@@ -105,17 +105,20 @@ async def test_panel_reissued_when_it_scrolled_away(
 
 
 @pytest.mark.asyncio
-async def test_yesterday_panel_is_reissued(
+async def test_yesterday_panel_is_edited_without_repinning(
     session_maker, session, family, child, bot, monkeypatch
 ):
-    """Панель за вчера перевыпускается, даже если она последняя в чате."""
+    """Смена дня не создаёт новую панель и служебное сообщение закрепления."""
     monkeypatch.setattr(panel, "Session", session_maker)
     await panel.refresh(bot, family.id)
 
     await panel.refresh(
         bot, family.id, now=tu.now_utc() + timedelta(days=1)
     )
-    assert len(bot.sent) == 2
+    assert len(bot.sent) == 1
+    assert len(bot.edited) == 1
+    assert bot.pinned == [101]
+    assert bot.unpinned == []
 
 
 @pytest.mark.asyncio
@@ -191,7 +194,10 @@ async def test_panel_reflects_logged_events(
         )
 
     await panel.refresh(bot, family.id, now=now)
-    assert "3 мокрых" in bot.texts[0]
+    assert "Подгузники" not in bot.texts[0]
+    from bot.services import stats
+
+    assert (await stats.day(session, child, family.tz, now=now)).wet == 3
 
 
 @pytest.mark.asyncio
@@ -265,57 +271,34 @@ def test_the_panel_does_not_duplicate_the_keyboard_below():
         assert not (labels & keyboards.HOME_LABELS), labels & keyboards.HOME_LABELS
 
 
-def test_an_instant_event_survives_a_running_timer():
-    """Бутылочка и подгузники доступны при идущем таймере, кормление — нет.
-
-    Мгновенное событие таймеру не мешает: `track._add` его не трогает вовсе.
-    Пока «🍼 Бутылочка» стояла в ряду кормлений, её прятало любое включённое
-    сцеживание — то есть кнопка пропадала по причине, не имеющей к ней
-    отношения.
-    """
-    labels = {
-        button.text
-        for row in keyboards.panel(running_kind="pump").inline_keyboard
-        for button in row
-    }
-    assert "🍼 Бутылочка" in labels
-    assert "💧 Мокрый" in labels
-    assert "🤱 Левая" not in labels, "кормление грудью — таймер, ему место уступают"
+def test_unused_events_do_not_reappear_during_a_timer():
+    """Активный таймер не возвращает скрытые виды событий на панель."""
+    labels = {button.text for row in keyboards.panel(
+        running_kind="pump", running_id=7
+    ).inline_keyboard for button in row}
+    assert labels == {"⏹ Закончить сейчас", "🕐 Указать время окончания"}
 
 
 def test_the_panel_keeps_its_own_finish_button():
-    """Панель кнопку остановки не отдала — она главный экран.
-
-    «Закончить» появилось под подтверждением начала, но не вместо панели:
-    человек, вернувшийся к чату через час, ищет её именно там.
-    """
-    labels = {
-        button.text
-        for row in keyboards.panel(running_kind="sleep").inline_keyboard
-        for button in row
-    }
-    assert "⏹ Закончить" in labels
+    labels = {button.text for row in keyboards.panel(
+        running_kind="sleep", running_id=7
+    ).inline_keyboard for button in row}
+    assert "⏹ Закончить сейчас" in labels
 
 
-def test_the_start_confirmation_can_finish_and_undo():
-    """Под сообщением о начале — обе кнопки, и обе рабочие.
+def test_the_start_confirmation_has_two_bound_actions():
+    from bot.keyboards import TimeCB
 
-    Отмена нужна от промаха, окончание — от того, ради чего таймер заведён.
-    Одна вместо другой не годится: промахнуться и закончить — разные события,
-    и второе оставляет запись, а первое нет.
-    """
-    from bot.keyboards import TrackCB, UndoCB
-
-    row = keyboards.running("sleep", row_id=7).inline_keyboard[0]
-    assert [b.text for b in row] == ["⏹ Закончить", "↩️ Отменить"]
-
-    stop = TrackCB.unpack(row[0].callback_data)
-    assert (stop.action, stop.kind) == ("stop", "sleep")
-    undo = UndoCB.unpack(row[1].callback_data)
-    assert (undo.what, undo.row_id) == ("event", 7)
+    buttons = [button for row in keyboards.running("sleep", row_id=7).inline_keyboard
+               for button in row]
+    assert [b.text for b in buttons] == ["⏹ Закончить сейчас", "🕐 Указать время окончания"]
+    callbacks = [TimeCB.unpack(b.callback_data) for b in buttons]
+    assert [(cb.action, cb.row_id) for cb in callbacks] == [("stop", 7), ("ask", 7)]
 
 
-def test_a_voice_card_offers_only_finishing():
-    """У карточки голосового отменять нечего: записей под ней может быть много."""
+def test_a_card_without_row_id_cannot_stop_an_arbitrary_timer():
+    from bot.keyboards import PanelCB
+
     row = keyboards.running("pump").inline_keyboard[0]
-    assert [b.text for b in row] == ["⏹ Закончить"]
+    assert [b.text for b in row] == ["📋 Открыть панель"]
+    assert PanelCB.unpack(row[0].callback_data).action == "show"

@@ -38,6 +38,10 @@ TEMP_C = "temp_c"
 # висит фильтром по этому ожиданию и пропускает апдейт дальше, если ожидания
 # нет, — иначе он съел бы голое число и ввод веса перестал бы работать молча
 QUESTION = "question"
+TIME_START = "time_start"
+TIME_END = "time_end"
+TIME_POINT = "time_point"
+TIME_KINDS = frozenset({TIME_START, TIME_END, TIME_POINT})
 
 # Десять минут: достаточно, чтобы дойти до весов и вернуться, и мало, чтобы
 # случайное число через час попало не туда
@@ -55,18 +59,27 @@ class Ask:
     # запись, а не правится существующая
     row_id: int | None
     asked_at: datetime
+    snapshot: str | tuple[datetime, datetime | None] | None = None
+    prompt_id: int | None = None
 
 
 _asks: dict[tuple[int, int], Ask] = {}
 
 
-def remember(chat_id: int, user_id: int, what: str, row_id: int | None = None) -> None:
+def remember(
+    chat_id: int, user_id: int, what: str, row_id: int | None = None, *,
+    snapshot: str | tuple[datetime, datetime | None] | None = None,
+    prompt_id: int | None = None,
+) -> None:
     if len(_asks) >= MAX_ENTRIES:
         # Вытесняем самое старое, а не чистим всё: чужое незаконченное ожидание
         # не повод ронять текущее
         oldest = min(_asks, key=lambda key: _asks[key].asked_at)
         del _asks[oldest]
-    _asks[(chat_id, user_id)] = Ask(what=what, row_id=row_id, asked_at=tu.now_utc())
+    _asks[(chat_id, user_id)] = Ask(
+        what=what, row_id=row_id, asked_at=tu.now_utc(),
+        snapshot=snapshot, prompt_id=prompt_id,
+    )
 
 
 def take(chat_id: int, user_id: int, now: datetime | None = None) -> Ask | None:

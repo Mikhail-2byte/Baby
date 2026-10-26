@@ -30,14 +30,17 @@ inline-кнопками. Вторая копия «выпустить панел
 import logging
 
 from aiogram import Bot, F, Router
+from aiogram.filters import Command
 from aiogram.types import Message
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot import keyboards
+from bot.db import repo
 from bot.db.models import Child, Family
 from bot.filters import IN_GROUP
 from bot.handlers import qa, views
 from bot.services import panel, sending
+from bot.services import timeutil as tu
 
 log = logging.getLogger(__name__)
 
@@ -111,3 +114,21 @@ async def tapped(
     """
     await ACTIONS[message.text or ""](message, bot, session, family, child)
     await sending.delete_one(bot, family, message.message_id)
+
+
+@router.message(IN_GROUP, Command("quiet"))
+async def quiet(message: Message, session: AsyncSession, family: Family) -> None:
+    """Явно меняет только текущий чат, не настройки всех семей в базе."""
+    family.diapers_tracked = False
+    await repo.set_checkin(session, family, 0, tu.now_utc())
+    await message.answer(
+        "Простой режим включён в этом чате: опросы отключены, "
+        "подгузники не учитываются. Вернуть опросы можно через /remind."
+    )
+
+
+@router.message(IN_GROUP, Command("timers"))
+async def timers(message: Message, family: Family) -> None:
+    from bot.handlers.journal import show_settings
+
+    await show_settings(message, family)

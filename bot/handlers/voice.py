@@ -1,10 +1,7 @@
 """Голосовые: расшифровка, триаж, разбор, карточка подтверждения (этап 7).
 
-Единственный путь свободного ввода в этом боте. Разбора печатного текста нет и
-не будет: печатать в три часа ночи одной рукой хуже, чем сказать вслух, а два
-входных канала означали бы два пути разбора, две причины отказа и две копии
-карточки. Текстовый путь остаётся прежним — кнопки, голое число в ответ на
-вопрос бота, кнопка «❓ Вопрос».
+Голосовой путь свободного ввода. Короткие печатные записи и исправление
+времени обрабатывает handlers/timing.py локально, без модели.
 
 Голосовое обрабатывается **сразу**, без кнопки-приглашения. Это разворот
 относительно Family_planer, где приглашение было и где в докстроке записано
@@ -52,7 +49,18 @@ from bot.db.models import TIMED_KINDS, WEIGHT, Child, Family, Member
 from bot.filters import IN_GROUP, IN_GROUP_CB
 from bot.handlers import alarm, measure, qa
 from bot.keyboards import VoiceCB
-from bot.services import dictation, llm, numerals, panel, qa_log
+from bot.services import (
+    dictation,
+    llm,
+    numerals,
+    panel,
+    qa_log,
+    records,
+    replay,
+    revisions,
+    time_input,
+    tracker_guard,
+)
 from bot.services import timeutil as tu
 from bot.services import voice as stt
 
@@ -189,7 +197,7 @@ async def dictate(
         await message.answer(texts.NO_CHILD, reply_markup=keyboards.home())
         return
 
-    now = tu.now_utc()
+    now = replay.message_moment(message, tu.now_utc())
     now_local = tu.to_local(now, family.tz)
     result = await dictation.interpret(
         text,
@@ -267,19 +275,30 @@ async def tap(
         await call.answer(texts.NO_CHILD, show_alert=True)
         return
 
-    lines = await _save(session, family, member, child, draft)
-    await call.answer("Записал")
-    # Раньше перерисовки карточки: записи уже в базе, и сбой рендера не должен
-    # оставить панель без них
-    panel.schedule(bot, family.id, call.message.message_id)
-    # Голосом тоже можно открыть таймер («начала кормить»), и тогда карточка —
-    # последнее, на что человек смотрит. Кнопка отмены здесь не нужна: записей
-    # под карточкой может быть несколько, а отменять их поштучно нечем
-    running = await repo.any_open_event(session, child.id)
-    await call.message.edit_text(
-        texts.voice_saved(lines),
-        reply_markup=keyboards.running(running.kind) if running else None,
-    )
+    async with tracker_guard.for_child(child.id):
+        try:
+            with revisions.actor(member.id):
+                lines = await _save(session, family, member, child, draft)
+        except (time_input.TimeInputError, ValueError) as exc:
+            await call.answer("Записи не изменены", show_alert=False)
+            await call.message.answer(str(exc))
+            return
+        panel.schedule(bot, family.id, call.message.message_id)
+        await call.answer("Записал")
+        # Раньше перерисовки карточки: записи уже в базе, и сбой рендера не должен
+        # оставить панель без них
+        # Голосом тоже можно открыть таймер («начала кормить»), и тогда карточка —
+        # последнее, на что человек смотрит. Кнопка отмены здесь не нужна: записей
+        # под карточкой может быть несколько, а отменять их поштучно нечем
+        running = await repo.any_open_event(session, child.id)
+        await call.message.edit_text(
+            texts.voice_saved(lines),
+            reply_markup=keyboards.running(running.kind, row_id=running.id) if running else None,
+        )
+
+        if running is not None and len(draft.records) == 1 and draft.records[0].open_timer:
+            running.card_message_id = call.message.message_id
+            await session.commit()
 
 
 async def _save(
@@ -294,61 +313,83 @@ async def _save(
     Строки собираются теми же `started`/`finished`/`logged`, что у кнопок: чат
     обязан говорить о кормлении одно и то же, пришло оно с кнопки или с голоса.
     """
-    lines: list[str] = []
-    for record in draft.records:
-        started_at = tu.to_utc(record.at, family.tz)
+    now = tu.now_utc()
+    current = await repo.any_open_event(session, child.id)
+    current_start = current.started_at if current is not None else None
+    for item in draft.records:
+        began = tu.to_utc(item.at, family.tz)
+        ended = (
+            began + timedelta(minutes=item.minutes)
+            if (item.minutes is not None and item.kind in TIMED_KINDS)
+            else None
+        )
+        if not records.fits(began, ended, born_at=child.born_at, now=now):
+            raise time_input.TimeInputError(
+                "Не записал: проверьте начало и окончание голосовой записи."
+            )
+        if item.open_timer:
+            if current_start is not None and began <= current_start:
+                raise time_input.TimeInputError(
+                    "Эта запись началась раньше текущего таймера. "
+                    "Сначала уточните текущую запись — автоматически закрывать её не буду."
+                )
+            current_start = began
+    async with repo.atomic(session):
+        lines: list[str] = []
+        for record in draft.records:
+            started_at = tu.to_utc(record.at, family.tz)
 
-        if record.kind == WEIGHT:
-            lines += await _save_weight(session, family, member, child, record)
-            continue
+            if record.kind == WEIGHT:
+                lines += await _save_weight(session, family, member, child, record)
+                continue
 
-        if record.open_timer:
-            # Тот же случай, что кнопка «начали»: сперва закрываем идущий
-            closed = await repo.close_running(session, child.id, started_at)
-            if closed is not None:
-                lines.append(texts.closed_previous(closed, family.tz))
-            event = await repo.start_event(
+            if record.open_timer:
+                # Тот же случай, что кнопка «начали»: сперва закрываем идущий
+                closed = await repo.close_running(session, child.id, started_at)
+                if closed is not None:
+                    lines.append(texts.closed_previous(closed, family.tz))
+                event = await repo.start_event(
+                    session,
+                    child.id,
+                    member.id,
+                    record.kind,
+                    started_at=started_at,
+                    side=None if record.kind == "feed_breast" else record.side,
+                    subtype=record.subtype,
+                    source_chat_id=family.chat_id,
+                    source_message_id=draft.source_message_id,
+                )
+                lines.append(texts.started(event, family.tz))
+                continue
+
+            # Длительность складывается в UTC, а не в локальном времени. Сейчас в
+            # России перехода на летнее время нет и оба варианта совпадают — то есть
+            # это ровно та ошибка, которая обнаружилась бы раз в полгода
+            ended_at = (
+                started_at + timedelta(minutes=record.minutes)
+                if record.minutes is not None and record.kind in TIMED_KINDS
+                else None
+            )
+            event = await repo.add_event(
                 session,
                 child.id,
                 member.id,
                 record.kind,
                 started_at=started_at,
-                side=record.side,
+                ended_at=ended_at,
+                value_num=record.value,
+                side=None if record.kind == "feed_breast" else record.side,
                 subtype=record.subtype,
+                note=record.note,
                 source_chat_id=family.chat_id,
                 source_message_id=draft.source_message_id,
             )
-            lines.append(texts.started(event, family.tz))
-            continue
-
-        # Длительность складывается в UTC, а не в локальном времени. Сейчас в
-        # России перехода на летнее время нет и оба варианта совпадают — то есть
-        # это ровно та ошибка, которая обнаружилась бы раз в полгода
-        ended_at = (
-            started_at + timedelta(minutes=record.minutes)
-            if record.minutes is not None and record.kind in TIMED_KINDS
-            else None
-        )
-        event = await repo.add_event(
-            session,
-            child.id,
-            member.id,
-            record.kind,
-            started_at=started_at,
-            ended_at=ended_at,
-            value_num=record.value,
-            side=record.side,
-            subtype=record.subtype,
-            note=record.note,
-            source_chat_id=family.chat_id,
-            source_message_id=draft.source_message_id,
-        )
-        lines.append(
-            texts.finished(event, family.tz)
-            if ended_at is not None
-            else texts.logged(event, family.tz)
-        )
-    return lines
+            lines.append(
+                texts.finished(event, family.tz)
+                if ended_at is not None
+                else texts.logged(event, family.tz)
+            )
+        return lines
 
 
 async def _save_weight(

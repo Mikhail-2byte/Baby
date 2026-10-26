@@ -35,7 +35,7 @@ from bot.db.models import TIMED_KINDS, Child, Event, Family, Member
 from bot.filters import IN_GROUP_CB
 from bot.handlers import remind
 from bot.keyboards import CheckinCB
-from bot.services import checkin, panel
+from bot.services import checkin, panel, records, tracker_guard
 from bot.services import timeutil as tu
 
 log = logging.getLogger(__name__)
@@ -77,7 +77,8 @@ async def _card(call: CallbackQuery, family: Family) -> None:
         call,
         texts.checkin_card(checkin.CARD, hours),
         keyboards.checkin_card(
-            [(kind.kind, kind.title) for kind in checkin.CARD.kinds],
+            [(kind.kind, kind.title) for kind in checkin.CARD.kinds
+             if kind.kind in {"feed_breast", "sleep"}],
             nothing=checkin.CARD.nothing_label,
             mute=checkin.CARD.mute_label,
         ),
@@ -358,10 +359,7 @@ async def _still_running(
     """«Ещё идёт» — открыть таймер задним числом.
 
     Единственный ответ, у которого конца нет вовсе: «уснула час назад и спит до
-    сих пор». Дальше работает уже написанное: тикер закроет таймер на отметке
-    «плюс четыре часа» с пометкой «приблизительная» и **скажет об этом вслух**.
-    Догадка остаётся догадкой и объявляется — в отличие от длительности,
-    подставленной из файла, которую никто бы не увидел.
+    сих пор». Таймер завершается человеком; тикер может только напомнить.
 
     Предыдущий таймер закрывается моментом начала нового, и закрывается ДО
     создания: `any_open_event` сортирует по `started_at desc`, и вызов после
@@ -375,16 +373,32 @@ async def _still_running(
         return
 
     started_at = now - timedelta(minutes=shift.minutes)
-    closed = await repo.close_running(session, child.id, started_at)
-    event = await repo.start_event(
-        session,
-        child.id,
-        member.id,
-        kind.kind,
-        started_at=started_at,
-        source_chat_id=family.chat_id,
-        source_message_id=_last_id(call),
-    )
+    async with tracker_guard.for_child(child.id):
+        current = await repo.any_open_event(session, child.id)
+        if current is not None:
+            await session.refresh(current)
+        if current is not None and started_at <= current.started_at:
+            await call.answer()
+            await _say(
+                call, "Эта запись началась раньше текущего таймера или одновременно с ним. "
+                "Сначала уточните текущую запись через «Изменить». Ничего не менял."
+            )
+            return
+        if not records.fits(started_at, None, born_at=child.born_at, now=now):
+            await call.answer(texts.CHECKIN_STALE, show_alert=True)
+            return
+        async with repo.atomic(session):
+            closed = await repo.close_running(session, child.id, started_at)
+            event = await repo.start_event(
+                session,
+                child.id,
+                member.id,
+                kind.kind,
+                started_at=started_at,
+                source_chat_id=family.chat_id,
+                source_message_id=_last_id(call),
+            )
+        panel.schedule(bot, family.id, _last_id(call))
     if closed is not None:
         await _say(call, texts.closed_previous(closed, family.tz))
     await _written(call, bot, family, event)

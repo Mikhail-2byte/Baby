@@ -21,7 +21,7 @@ from bot.config import settings
 from bot.db import repo
 from bot.db.models import Child, Family
 from bot.filters import IN_GROUP, IN_PRIVATE
-from bot.services import backup, panel, sending
+from bot.services import backup, panel, pending, sending
 from bot.services import timeutil as tu
 
 log = logging.getLogger(__name__)
@@ -225,8 +225,12 @@ async def show_panel(message: Message, bot: Bot, family: Family) -> None:
 
 
 @router.message(IN_GROUP, Command("cancel"))
-async def cancel(message: Message, state: FSMContext) -> None:
-    if await state.get_state() is None:
+async def cancel(message: Message, state: FSMContext, family: Family) -> None:
+    waiting = (pending.peek(family.chat_id, message.from_user.id)
+               if message.from_user is not None else None)
+    if message.from_user is not None:
+        pending.forget(family.chat_id, message.from_user.id)
+    if await state.get_state() is None and waiting is None:
         await message.answer(texts.NOTHING_TO_CANCEL, reply_markup=keyboards.home())
         return
     await state.clear()

@@ -320,3 +320,12 @@ async def wired(session_maker, session, family, child, mother, monkeypatch):
 
     for router in order:
         router._parent_router = None
+
+
+@pytest.fixture(autouse=True)
+def _tracker_guards():
+    from bot.services import tracker_guard
+
+    tracker_guard._locks.clear()
+    yield
+    tracker_guard._locks.clear()

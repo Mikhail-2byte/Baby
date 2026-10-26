@@ -39,6 +39,7 @@ from bot.services import timeutil as tu
 class Span:
     """Итог по одному периоду. Все длительности — после обрезки по границам."""
 
+    diapers_tracked: bool = False
     feeds: int = 0
     feed_time: timedelta = timedelta()
     bottle_ml: float = 0.0
@@ -76,7 +77,8 @@ async def collect(
     """Свести все события ребёнка за период в один объект."""
     moment = now or tu.now_utc()
     events = await repo.events_between(session, child.id, start, end)
-    span = Span()
+    family = await session.get(Family, child.family_id)
+    span = Span(diapers_tracked=bool(family and family.diapers_tracked))
 
     for event in events:
         if event.kind in FEED_KINDS:

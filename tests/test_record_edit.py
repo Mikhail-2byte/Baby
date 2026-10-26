@@ -437,7 +437,7 @@ async def test_a_mistaken_side_is_fixed_by_pressing_the_right_one(
 
     await session.refresh(event)
     assert event.kind == FEED_BREAST
-    assert event.side == RIGHT
+    assert event.side is None
 
 
 def test_no_choice_crosses_the_shape_boundary():
@@ -726,6 +726,8 @@ async def test_an_auto_closed_timer_is_fixed_from_its_own_message(
     """
     from bot.config import settings
 
+    family.sleep_nudge_minutes = 180
+    await session.commit()
     started = tu.now_utc() - timedelta(hours=settings.open_timer_max_hours + 1)
     event = await repo.start_event(
         session, child.id, mother.id, SLEEP, started_at=started
@@ -733,12 +735,16 @@ async def test_an_auto_closed_timer_is_fixed_from_its_own_message(
 
     await ticker.close_stale_timers(bot, session, tu.now_utc())
 
-    assert any("приблизительная" in text for text in bot.texts)
+    await session.refresh(event)
+    assert event.ended_at is None
+    assert event.estimated is False
     markup = bot.kwargs[-1].get("reply_markup")
-    assert markup is not None, "сообщение о закрытом таймере обязано нести кнопку"
-    data = RecordCB.unpack(markup.inline_keyboard[0][0].callback_data)
-    assert (data.row_id, data.field) == (event.id, "e")
-    assert data.action == "card", "экран не имеет права затереть свидетельство в ленте"
+    assert markup is not None
+    from bot.keyboards import TimeCB
+    values = [TimeCB.unpack(button.callback_data)
+              for row in markup.inline_keyboard for button in row]
+    assert {value.row_id for value in values} == {event.id}
+    assert {value.action for value in values} == {"stop", "ask"}
 
 
 def test_the_promise_in_the_auto_closed_text_is_keepable():

@@ -220,7 +220,11 @@ class FamilyMiddleware(BaseMiddleware):
                     session, family.id, user.id, _display_name(user)
                 )
 
-            result = await handler(event, data)
+            from bot.services import revisions
+
+            member = data.get("member")
+            with revisions.actor(member.id if member is not None else None):
+                result = await handler(event, data)
 
             message = _message_of(event)
             if (

@@ -107,6 +107,10 @@ class Family(Base):
     # зелёных тестах, потому что они строят схему через `create_all`
     checkin_hours: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
     checkin_last_at: Mapped[datetime | None] = mapped_column(DateTime)
+    # Старые семьи сохраняют прежний учёт до явного /quiet; новые — простой дневник.
+    diapers_tracked: Mapped[bool] = mapped_column(Boolean, default=False, server_default="1")
+    feed_nudge_minutes: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    sleep_nudge_minutes: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
 
     # Живая панель: закреплённое сообщение, которое правится на каждый тап.
     # `panel_day` — локальный день, за который она выпущена. Именно день, а не
@@ -180,6 +184,11 @@ class Event(Base):
     """
 
     __tablename__ = "events"
+    __table_args__ = {"sqlite_autoincrement": True}
+
+    # Сообщение бота с карточкой; source_message_id остаётся источником записи.
+    card_message_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    nudged_at: Mapped[datetime | None] = mapped_column(DateTime)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     child_id: Mapped[int] = mapped_column(ForeignKey("children.id"), index=True)
@@ -221,6 +230,7 @@ class Measurement(Base):
     """Вес, рост, окружность головы. Точки на графике центилей."""
 
     __tablename__ = "measurements"
+    __table_args__ = {"sqlite_autoincrement": True}
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     child_id: Mapped[int] = mapped_column(ForeignKey("children.id"), index=True)
@@ -367,3 +377,28 @@ class Usage(Base):
     # у вопроса тут вся цепочка моделей, у тапа по подгузнику — двадцать
     # миллисекунд. Отчёт считает медианы по `kind`
     ms: Mapped[int] = mapped_column(Integer, default=0)
+
+
+class ProcessedMessage(Base):
+    """Идемпотентность текстовых изменений, записывается в их транзакции."""
+
+    __tablename__ = "processed_messages"
+    chat_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    message_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+
+class RecordRevision(Base):
+    """Снимки до/после; журнал сохраняется и после удаления записи."""
+
+    __tablename__ = "record_revisions"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    child_id: Mapped[int] = mapped_column(ForeignKey("children.id"), index=True)
+    actor_id: Mapped[int | None] = mapped_column(ForeignKey("members.id"))
+    what: Mapped[str] = mapped_column(String(1))
+    row_id: Mapped[int] = mapped_column(Integer, index=True)
+    before_json: Mapped[str] = mapped_column(Text)
+    after_json: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    undone_at: Mapped[datetime | None] = mapped_column(DateTime)
+    undo_actor_id: Mapped[int | None] = mapped_column(ForeignKey("members.id"))

@@ -93,6 +93,14 @@ def _fill(path: Path, family_id: int = 1, chat_id: int = CHAT_ID) -> None:
             f"handled, ms) VALUES ({fid}, '{now}', {fid}, {fid}, 'button', 'pnl:refresh', 1, 12)"
         )
         conn.execute(
+            "INSERT INTO processed_messages(chat_id, message_id) VALUES (?, 1)", (chat_id,)
+        )
+        conn.execute(
+            "INSERT INTO record_revisions(child_id, actor_id, what, row_id, "
+            "before_json, after_json, undo_actor_id) VALUES (?, ?, 'e', ?, '{}', '{}', ?)",
+            (fid, fid, fid, fid),
+        )
+        conn.execute(
             "INSERT OR IGNORE INTO who_lms (sex, indicator, age_days, l, m, s) "
             "VALUES ('f', 'weight', 0, 0.3809, 3.2322, 0.14171)"
         )
