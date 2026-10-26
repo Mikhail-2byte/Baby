@@ -44,6 +44,10 @@ class HistoryCB(CallbackData, prefix="hist"):
     what: str = "e"
 
 
+class ExportCB(CallbackData, prefix="exp"):
+    days: int
+
+
 class NudgeCB(CallbackData, prefix="ndg"):
     kind: str
     minutes: int = -1

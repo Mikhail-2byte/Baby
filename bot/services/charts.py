@@ -107,7 +107,8 @@ def _style(axes: Axes) -> None:
 
 
 async def collect_weight(
-    session: AsyncSession, child: Child
+    session: AsyncSession, child: Child, *,
+    since: datetime | None = None, until: datetime | None = None,
 ) -> tuple[list[tuple[int, float]], list[Band], tuple[float, float] | None]:
     """Точки взвешиваний, коридоры ВОЗ на тот же диапазон и центиль последней.
 
@@ -119,6 +120,9 @@ async def collect_weight(
     знает. Иначе ленивая подгрузка уехала бы в чужой поток вместе с сессией.
     """
     rows = await repo.measurements(session, child.id, WEIGHT)
+    rows = [row for row in rows
+            if (since is None or row.taken_at >= since)
+            and (until is None or row.taken_at < until)]
     if not rows:
         return [], [], None
 
@@ -277,10 +281,11 @@ class DayRhythm:
 
 
 async def collect_rhythm(
-    session: AsyncSession, child: Child, tz: str, now: datetime, days: int = 7
+    session: AsyncSession, child: Child, tz: str, now: datetime, days: int = 7,
+    *, ending_on: date | None = None,
 ) -> list[DayRhythm]:
     """Последние `days` суток, каждое событие обрезано по границам своих суток."""
-    today = tu.local_today(tz, now)
+    today = ending_on or tu.local_today(tz, now)
     result: list[DayRhythm] = []
 
     for offset in range(days - 1, -1, -1):
@@ -315,7 +320,9 @@ def _hours(moment: datetime, start: datetime) -> float:
     return (moment - start).total_seconds() / 3600
 
 
-def draw_rhythm(child_name: str, rhythm: list[DayRhythm]) -> bytes:
+def draw_rhythm(
+    child_name: str, rhythm: list[DayRhythm], *, partial_day: date | None = None
+) -> bytes:
     """Полная шкала суток; кормления и сон на отдельных дорожках каждой даты."""
     height = max(3.4, 0.72 * len(rhythm) + 1.9)
     figure = Figure(figsize=(12.0, height), dpi=DPI, facecolor=SURFACE)
@@ -383,9 +390,11 @@ def draw_rhythm(child_name: str, rhythm: list[DayRhythm]) -> bytes:
         loc="upper left", bbox_to_anchor=(0.0, -0.10), ncol=4,
         frameon=False, fontsize=9, labelcolor=INK_MUTED,
     )
+    note = "Местное время семьи. Пустые участки: записей нет."
+    if any(entry.day == partial_day for entry in rhythm):
+        note += " Текущие сутки показаны не полностью."
     figure.text(
-        0.23, 0.025, "Местное время семьи. Пустые участки: записей нет. "
-        "Текущие сутки показаны не полностью.",
+        0.23, 0.025, note,
         fontsize=8, color=INK_MUTED, family=FONT_FAMILY,
     )
     figure.subplots_adjust(left=0.23, right=0.97, top=0.85, bottom=0.17)
@@ -398,4 +407,6 @@ async def rhythm_png(
     rhythm = await collect_rhythm(session, child, family.tz, now, days)
     if not any(entry.has_data() for entry in rhythm):
         return None
-    return await asyncio.to_thread(draw_rhythm, child.name, rhythm)
+    return await asyncio.to_thread(
+        draw_rhythm, child.name, rhythm, partial_day=tu.local_today(family.tz, now)
+    )

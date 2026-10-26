@@ -796,11 +796,12 @@ def day_summary(
         feed_parts.append(f"{bottle_ml:g} мл из бутылочки")
     lines.append("🍼 Кормления: " + ", ".join(feed_parts))
 
-    if sleep_count:
-        line = (
-            f"😴 Сон: {duration(sleep_total)} за "
-            f"{sleep_count} {plural(sleep_count, 'раз', 'раза', 'раз')}"
-        )
+    if sleep_total:
+        line = f"😴 Сон: {duration(sleep_total)}"
+        if sleep_count:
+            line += f" за {sleep_count} {plural(sleep_count, 'раз', 'раза', 'раз')}"
+        else:
+            line += " (начался до периода)"
         if longest_sleep:
             line += f", самый долгий {duration(longest_sleep)}"
         lines.append(line)
@@ -1292,7 +1293,8 @@ HELP = """👶 <b>Что я умею</b>
 Пока не подтвердите, не запишу ничего. Голосом же можно и спросить.
 
 <b>Считать</b> — /today за сутки, /week за неделю с графиками.
-Вес — с центилями ВОЗ. /export — выгрузка для педиатра.
+Вес — с центилями ВОЗ. /export — выгрузка для педиатра за выбранный период.
+Свои даты: /export 20.10.2026 25.10.2026 (обе даты включены).
 /stage — что происходит на этой неделе.
 
 <b>Напоминать</b> — /remind. Кормление по интервалу, витамин D,

@@ -18,11 +18,17 @@ import asyncio
 import csv
 import io
 import logging
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 
 from aiogram import Router
-from aiogram.filters import Command
-from aiogram.types import BufferedInputFile, Message
+from aiogram.filters import Command, CommandObject
+from aiogram.types import (
+    BufferedInputFile,
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+)
 from matplotlib import image as mpimg
 from matplotlib.backends.backend_pdf import PdfPages
 from matplotlib.figure import Figure
@@ -31,7 +37,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from bot import keyboards, texts
 from bot.db import repo
 from bot.db.models import MEASURE_KINDS, Child, Event, Family, Measurement
-from bot.filters import IN_GROUP
+from bot.filters import IN_GROUP, IN_GROUP_CB
+from bot.keyboards import ExportCB
 from bot.services import charts, growth, stats
 from bot.services import timeutil as tu
 
@@ -48,15 +55,95 @@ WINDOW_DAYS = 400
 
 @router.message(IN_GROUP, Command("export"))
 async def export(
-    message: Message, session: AsyncSession, family: Family, child: Child | None
+    message: Message, session: AsyncSession, family: Family, child: Child | None,
+    command: CommandObject | None = None,
 ) -> None:
     if child is None:
         await message.answer(texts.NO_CHILD, reply_markup=keyboards.home())
         return
 
+    if command is not None and command.args:
+        try:
+            first, last = parse_dates(command.args, tu.local_today(family.tz))
+        except ValueError as exc:
+            await message.answer(str(exc))
+            return
+        await _send_export(message, session, family, child, first, last)
+        return
+    labels = [(1, "Сегодня"), (-1, "Вчера"), (7, "7 дней"), (30, "30 дней")]
+    buttons = [InlineKeyboardButton(text=label, callback_data=ExportCB(days=days).pack())
+               for days, label in labels]
+    await message.answer(
+        "За какой период подготовить выгрузку для врача?\n"
+        "CSV, сводка и графики будут за одни и те же даты.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            buttons[:2], buttons[2:],
+            [InlineKeyboardButton(text="Другие даты", callback_data=ExportCB(days=0).pack())],
+        ]),
+    )
+
+
+def parse_dates(value: str, today: date) -> tuple[date, date]:
+    """Одна дата или две включительно; принимаем русский и ISO-формат."""
+    parts = value.split()
+    if len(parts) not in {1, 2}:
+        raise ValueError("Укажите даты: /export 20.10.2026 25.10.2026")
+    dates = []
+    for part in parts:
+        try:
+            parsed = (datetime.strptime(part, "%d.%m.%Y").date()
+                      if "." in part else date.fromisoformat(part))
+        except ValueError as exc:
+            raise ValueError("Неверная дата. Пример: /export 20.10.2026 25.10.2026") from exc
+        dates.append(parsed)
+    first, last = dates[0], dates[-1]
+    if first > last:
+        raise ValueError("Начало периода должно быть не позже окончания.")
+    if last > today:
+        raise ValueError("Выгрузка доступна по сегодняшний день включительно.")
+    if (last - first).days >= WINDOW_DAYS:
+        raise ValueError(f"Выберите не больше {WINDOW_DAYS} дней за одну выгрузку.")
+    return first, last
+
+
+@router.callback_query(IN_GROUP_CB, ExportCB.filter())
+async def choose_period(
+    call: CallbackQuery, callback_data: ExportCB, session: AsyncSession,
+    family: Family, child: Child | None,
+) -> None:
+    if child is None:
+        await call.answer(texts.NO_CHILD, show_alert=True)
+        return
+    if not isinstance(call.message, Message):
+        await call.answer()
+        return
+    await call.answer()
+    if callback_data.days == 0:
+        await call.message.answer(
+            "Отправьте команду с датами начала и окончания включительно:\n"
+            "<code>/export 20.10.2026 25.10.2026</code>\n"
+            "За один день: <code>/export 25.10.2026</code>\n"
+            f"Даты — по времени семьи, максимум {WINDOW_DAYS} дней."
+        )
+        return
+    if callback_data.days not in {-1, 1, 7, 30}:
+        return
+    today = tu.local_today(family.tz)
+    last = today - timedelta(days=1) if callback_data.days == -1 else today
+    first = last - timedelta(days=max(callback_data.days, 1) - 1)
+    await _send_export(call.message, session, family, child, first, last)
+
+
+async def _send_export(
+    message: Message, session: AsyncSession, family: Family, child: Child,
+    first: date, last: date,
+) -> None:
     now = tu.now_utc()
-    since = now - timedelta(days=WINDOW_DAYS)
-    events = await repo.events_between(session, child.id, since, now)
+    since, _ = tu.day_bounds(first, family.tz)
+    _, until = tu.day_bounds(last, family.tz)
+    period = f"{first:%d.%m.%Y} - {last:%d.%m.%Y}"
+    events = [event for event in await repo.events_between(session, child.id, since, until)
+              if event.started_at <= now]
     measures: list[Measurement] = []
     for kind in MEASURE_KINDS:
         # Тем же окном, что и события: врачу нужна одна хронология, а не
@@ -64,26 +151,28 @@ async def export(
         measures.extend(
             m
             for m in await repo.measurements(session, child.id, kind)
-            if since <= m.taken_at <= now
+            if since <= m.taken_at < until and m.taken_at <= now
         )
 
     if not events and not measures:
-        await message.answer(texts.EXPORT_EMPTY, reply_markup=keyboards.home())
+        await message.answer(f"За {period} записей нет.", reply_markup=keyboards.home())
         return
 
-    stamp = tu.to_local(now, family.tz).strftime("%Y-%m-%d")
+    stamp = f"{first:%Y-%m-%d}_{last:%Y-%m-%d}"
     # В поток: на четырёхстах днях это тысячи строк плюс сортировка, а
     # блокировать event loop ради выгрузки незачем — тот же довод, что у графиков
-    payload = await asyncio.to_thread(_csv, child, family.tz, events, measures)
+    payload = await asyncio.to_thread(
+        _csv, child, family.tz, events, measures, since=since, until=min(until, now)
+    )
     await message.answer_document(
         BufferedInputFile(payload, f"{_slug(child.name)}-{stamp}.csv"),
-        caption=texts.EXPORT_CAPTION.format(
+        caption=f"Период: {period}\n" + texts.EXPORT_CAPTION.format(
             events=len(events), measures=len(measures)
         ),
     )
 
     try:
-        report = await _pdf(session, child, family, now)
+        report = await _pdf(session, child, family, now, first=first, last=last)
     except Exception:
         # CSV уже ушёл, данные у человека есть — PDF это удобство, а не
         # содержание выгрузки
@@ -105,7 +194,8 @@ def _slug(name: str) -> str:
 
 
 def _csv(
-    child: Child, tz: str, events: list[Event], measures: list[Measurement]
+    child: Child, tz: str, events: list[Event], measures: list[Measurement], *,
+    since: datetime | None = None, until: datetime | None = None,
 ) -> bytes:
     """Одна таблица на события и измерения: врачу нужна хронология, а не схема."""
     buffer = io.StringIO()
@@ -124,27 +214,36 @@ def _csv(
     rows: list[tuple[datetime, list]] = []
 
     for event in events:
-        local = tu.to_local(event.started_at, tz)
+        began = max(event.started_at, since) if since else event.started_at
+        ended = min(event.ended_at, until) if event.ended_at and until else event.ended_at
+        local = tu.to_local(began, tz)
+        notes = [event.note] if event.note else []
+        if began != event.started_at:
+            original = tu.to_local(event.started_at, tz)
+            notes.append(f"Начало вне периода: {original:%d.%m.%Y %H:%M}")
+        if event.ended_at is not None and ended != event.ended_at:
+            original = tu.to_local(event.ended_at, tz)
+            notes.append(f"Окончание вне периода: {original:%d.%m.%Y %H:%M}")
         minutes = ""
-        if event.ended_at is not None:
-            minutes = str(int((event.ended_at - event.started_at).total_seconds() // 60))
+        if ended is not None:
+            minutes = str(int((ended - began).total_seconds() // 60))
             if event.estimated:
                 # Пометка обязана доехать до врача: разница между «спала два
                 # часа» и «таймер висел с вечера» для него существенна
                 minutes += " прибл."
         rows.append(
             (
-                event.started_at,
+                began,
                 [
                     f"{local:%d.%m.%Y}", f"{local:%H:%M}",
-                    growth.age_days(child, event.started_at),
+                    growth.age_days(child, began),
                     texts.KIND_NAMES.get(event.kind, event.kind),
                     event.subtype or "",
                     minutes,
                     f"{event.value_num:g}" if event.value_num is not None else "",
                     texts.SIDE_NAMES.get(event.side or "", ""),
                     event.author.display_name if event.author else "",
-                    event.note or "",
+                    "; ".join(notes),
                 ],
             )
         )
@@ -176,31 +275,45 @@ def _csv(
 
 
 async def _pdf(
-    session: AsyncSession, child: Child, family: Family, now: datetime
+    session: AsyncSession, child: Child, family: Family, now: datetime, *,
+    first: date | None = None, last: date | None = None,
 ) -> bytes:
-    """Три страницы: сводка, вес с коридорами, ритм суток."""
-    total, days = await stats.week(session, child, family.tz, now=now)
-    summary = _plain(texts.week_summary(child, total, days, plain=True))
+    """Сводка и графики выбранного периода; ритм разбит на недели."""
+    last = last or tu.local_today(family.tz, now)
+    first = first or last - timedelta(days=6)
+    since, _ = tu.day_bounds(first, family.tz)
+    _, until = tu.day_bounds(last, family.tz)
+    period = f"{first:%d.%m.%Y} - {last:%d.%m.%Y}"
+    total = await stats.collect(
+        session, child, since, min(until, now + timedelta(microseconds=1)), now
+    )
+    summary = _plain(texts.day_summary_from_span(child, total, "за выбранный период"))
     header = _plain(texts.baby_card(child, now, family.tz))
 
-    weight_data = await charts.collect_weight(session, child)
-    rhythm_data = await charts.collect_rhythm(session, child, family.tz, now)
+    weight_data = await charts.collect_weight(
+        session, child, since=since, until=min(until, now + timedelta(microseconds=1))
+    )
+    rhythm_data = await charts.collect_rhythm(
+        session, child, family.tz, now, days=(last - first).days + 1, ending_on=last,
+    )
 
     def build() -> bytes:
         buffer = io.BytesIO()
         with PdfPages(buffer) as pdf:
-            pdf.savefig(_cover(header, summary, now))
+            pdf.savefig(_cover(header, summary, now, period))
             points, bands, evaluated = weight_data
             if points:
                 pdf.savefig(
                     _figure_from_png(
-                        charts.draw_weight(child.name, points, bands, evaluated)
+                        charts.draw_weight(child.name, points, bands, evaluated), period,
                     )
                 )
             if any(entry.has_data() for entry in rhythm_data):
-                pdf.savefig(
-                    _figure_from_png(charts.draw_rhythm(child.name, rhythm_data))
-                )
+                for offset in range(0, len(rhythm_data), 7):
+                    chunk = rhythm_data[offset:offset + 7]
+                    pdf.savefig(_figure_from_png(charts.draw_rhythm(
+                        child.name, chunk, partial_day=tu.local_today(family.tz, now)
+                    ), period))
         return buffer.getvalue()
 
     return await asyncio.to_thread(build)
@@ -234,11 +347,12 @@ def _plain(html: str) -> str:
     )
 
 
-def _cover(header: str, summary: str, now: datetime) -> Figure:
-    """Титульная страница: кто, сколько лет и итоги последней недели."""
+def _cover(header: str, summary: str, now: datetime, period: str = "") -> Figure:
+    """Титульная страница: ребёнок, выбранные даты и итоги периода."""
     figure = Figure(figsize=(8.27, 11.69), dpi=150, facecolor="white")  # A4
     figure.text(0.08, 0.94, header, fontsize=14, va="top", family="DejaVu Sans")
-    figure.text(0.08, 0.80, summary, fontsize=11, va="top", family="DejaVu Sans")
+    figure.text(0.08, 0.79, f"Период: {period}", fontsize=12, va="top", family="DejaVu Sans")
+    figure.text(0.08, 0.73, summary, fontsize=11, va="top", family="DejaVu Sans")
     figure.text(
         0.08, 0.05,
         f"Выгрузка из семейного трекера, {now:%d.%m.%Y}. "
@@ -248,7 +362,7 @@ def _cover(header: str, summary: str, now: datetime) -> Figure:
     return figure
 
 
-def _figure_from_png(payload: bytes) -> Figure:
+def _figure_from_png(payload: bytes, period: str = "") -> Figure:
     """Готовый PNG графика — отдельной страницей PDF.
 
     Перерисовывать графики во второй раз под другой размер холста незачем:
@@ -256,7 +370,10 @@ def _figure_from_png(payload: bytes) -> Figure:
     альбомной ориентации повторяет их пропорции почти точно.
     """
     figure = Figure(figsize=(11.69, 8.27), dpi=150, facecolor="white")
-    axes = figure.add_axes((0.04, 0.04, 0.92, 0.92))
+    if period:
+        figure.text(0.04, 0.97, f"Период: {period}", fontsize=10,
+                    va="top", family="DejaVu Sans")
+    axes = figure.add_axes((0.04, 0.04, 0.92, 0.88 if period else 0.92))
     axes.imshow(mpimg.imread(io.BytesIO(payload), format="png"))
     axes.axis("off")
     return figure

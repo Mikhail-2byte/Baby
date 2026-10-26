@@ -50,6 +50,7 @@ CASES = [
         ("undo:event:412", "undo:event"),
         ("hist:undo:7:e", "hist:undo"),
         ("ndg:feed:45", "ndg:feed"),
+        ("exp:7", "exp"),
         ("rec:list:e:0:0:0:0:0:0", "rec:list:e"),
         ("rec:shift:e:57::::-15:0:0", "rec:shift:e"),
         ("rec:setkind:e:57:kind:sleep::0:0:0", "rec:setkind:e"),
