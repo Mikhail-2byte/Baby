@@ -62,7 +62,7 @@ def test_every_home_button_has_an_action():
     и часть кнопок начнёт вести себя иначе, чем соседние.
     """
     shown = {button.text for row in keyboards.home().keyboard for button in row}
-    assert shown == set(home.ACTIONS)
+    assert shown | set(keyboards.LEGACY_HOME_LABELS) == set(home.ACTIONS)
     assert shown == set(keyboards.HOME_LABELS)
 
 
@@ -753,7 +753,7 @@ async def test_the_panel_never_carries_the_keyboard(
 
 
 @pytest.mark.asyncio
-async def test_starting_a_timer_offers_to_finish_it_right_there(wired):
+async def test_starting_a_timer_does_not_send_a_duplicate_card(wired, session, child):
     """Жалоба из чата: «кнопка завершения где-то сверху в панели».
 
     Так и было: подтверждение «Сцеживание — начали в 23:40» несло только
@@ -771,17 +771,10 @@ async def test_starting_a_timer_offers_to_finish_it_right_there(wired):
 
     await _tap(dp, bot, TrackCB(action="start", kind=SLEEP).pack())
 
-    assert talk.markups, "бот не подтвердил начало"
-    labels = [
-        button.text
-        for markup in talk.markups
-        if markup is not None and hasattr(markup, "inline_keyboard")
-        for row in markup.inline_keyboard
-        for button in row
-    ]
-    assert "⏹ Закончить сейчас" in labels, labels
-    assert "🕐 Указать время окончания" in labels, labels
-    assert "↩️ Отменить" not in labels, labels
+    from bot.db import repo
+
+    assert talk.markups == [None]  # только ответ на callback; карточку рисует panel.schedule
+    assert (await repo.any_open_event(session, child.id)).kind == SLEEP
 
 
 # --- Случайный тап ----------------------------------------------------------
@@ -865,4 +858,7 @@ async def test_starting_over_a_running_timer_says_so(wired, session, child):
     await _tap(dp, bot, TrackCB(action="start", kind=PUMP).pack())
 
     said = " ".join(talk.sent[before:])
-    assert "Закрыл предыдущее" in said, talk.sent[before:]
+    assert "Завершить текущий таймер" in said, talk.sent[before:]
+    from bot.db import repo
+
+    assert (await repo.any_open_event(session, child.id)).kind == SLEEP

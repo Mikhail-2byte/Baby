@@ -28,7 +28,16 @@ from bot.db.models import (
 )
 from bot.filters import IN_GROUP, IN_GROUP_CB
 from bot.keyboards import TimeCB
-from bot.services import panel, pending, records, replay, revisions, time_input, tracker_guard
+from bot.services import (
+    panel,
+    pending,
+    records,
+    replay,
+    revisions,
+    sending,
+    time_input,
+    tracker_guard,
+)
 from bot.services import timeutil as tu
 
 log = logging.getLogger(__name__)
@@ -110,16 +119,12 @@ async def render_card(
     session: AsyncSession | None = None,
 ) -> bool:
     """Обновить прежнюю карточку. Сбой Telegram не отменяет сохранённую запись."""
-    text = texts.finished(event, family.tz)
     if event.ended_at is None:
-        text = texts.started(event, family.tz)
-    markup = (
-        keyboards.stopped(event.id)
-        if event.ended_at
-        else keyboards.running(event.kind, row_id=event.id)
-    )
-    if not controls:
-        markup = None
+        # Активным таймером управляет только панель, включая возврат после правки.
+        panel.schedule(bot, family.id)
+        return True
+    text = texts.finished(event, family.tz)
+    markup = keyboards.stopped(event.id) if controls else None
     if event.card_message_id is not None:
         try:
             await bot.edit_message_text(
@@ -139,6 +144,8 @@ async def render_card(
     if fallback is not None:
         receipt = await fallback.answer(text, reply_markup=markup)
         if session is not None:
+            if family.panel_message_id == event.card_message_id:
+                family.panel_message_id = receipt.message_id
             event.card_message_id = receipt.message_id
             await session.commit()
     return False
@@ -277,18 +284,17 @@ async def save_time(
         panel.schedule(bot, family.id, message.message_id)
         pending.forget(family.chat_id, message.from_user.id)
         if row.kind in TIMED_KINDS:
-            await render_card(bot, family, row, controls=False)
-            summary = texts.finished(row, family.tz) if end else texts.started(row, family.tz)
+            await render_card(bot, family, row, fallback=message, session=session)
+            if row.ended_at is None and ask.prompt_id is not None:
+                local = tu.to_local(row.started_at, family.tz)
+                await sending.edit(
+                    bot, family, ask.prompt_id, f"✓ Время начала сохранено: {local:%d.%m %H:%M}",
+                    session=session,
+                )
         else:
-            summary = texts.logged(row, family.tz)
-        markup = (
-            keyboards.running(row.kind, row_id=row.id)
-            if (row.kind in TIMED_KINDS and row.ended_at is None)
-            else keyboards.stopped(row.id)
-        )
-        receipt = await message.answer(summary, reply_markup=markup)
-        row.card_message_id = receipt.message_id
-        await session.commit()
+            await message.answer(
+                texts.logged(row, family.tz), reply_markup=keyboards.stopped(row.id),
+            )
 
 
 @router.message(IN_GROUP, IsTimeInput())

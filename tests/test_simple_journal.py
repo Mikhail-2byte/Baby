@@ -32,11 +32,11 @@ async def feeding(session, child, mother):
 
 
 @pytest.mark.asyncio
-async def test_legacy_side_button_starts_generic_feeding(wired, session, child):
+async def test_side_button_preserves_selected_side(wired, session, child):
     dp, bot, _, _ = wired
     await _tap(dp, bot, TrackCB(action="start", kind=FEED_BREAST, side="R"))
     event = await repo.any_open_event(session, child.id)
-    assert event is not None and event.side is None
+    assert event is not None and event.side == "R"
 
 
 @pytest.mark.asyncio
@@ -207,7 +207,7 @@ async def test_startup_does_not_ack_batch_after_processing_failure():
 def test_main_panel_does_not_offer_removed_actions():
     values = [button.text for row in keyboards.panel(running_kind=None).inline_keyboard
               for button in row]
-    assert values == ["🤱 Кормление", "😴 Сон", "⋯ Ещё"]
+    assert values == ["Левая грудь", "Правая грудь", "Начать сон", "⋯ Ещё"]
 
 
 @pytest.mark.asyncio

@@ -54,8 +54,8 @@ def test_edit_uses_record_day_not_today():
 
 
 @pytest.mark.parametrize(("text", "kind", "side"), [
-    ("кормили левой с 13:00 до 13:25", "feed_breast", None),
-    ("кормила правой грудью с 13:00 до 13:25", "feed_breast", None),
+    ("кормили левой с 13:00 до 13:25", "feed_breast", "L"),
+    ("кормила правой грудью с 13:00 до 13:25", "feed_breast", "R"),
     ("кормление с 13:00 до 13:25", "feed_breast", None),
     ("сон с 13:00 до 13:25", "sleep", None),
 ])

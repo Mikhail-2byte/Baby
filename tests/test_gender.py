@@ -118,7 +118,7 @@ def test_the_panel_button_is_a_noun_like_the_others() -> None:
         for row in keyboards.panel(running_kind=None).inline_keyboard
         for button in row
     ]
-    assert any("Сон" in label for label in labels)
+    assert any("сон" in label.lower() for label in labels)
     assert not any("Уснула" in label for label in labels)
 
 

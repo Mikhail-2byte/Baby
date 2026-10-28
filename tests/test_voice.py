@@ -401,7 +401,7 @@ def test_a_full_record_survives():
     assert one.kind == FEED_BREAST
     assert one.at == datetime(2026, 9, 14, 1, 40)
     assert one.minutes == 20
-    assert one.side is None
+    assert one.side == LEFT
     assert not one.open_timer
 
 
@@ -551,9 +551,9 @@ def test_the_value_means_what_the_kind_says(kind, value, expected):
     assert records[0].value == expected
 
 
-def test_new_feeding_ignores_side_but_preserves_legacy_pump():
+def test_feeding_preserves_explicit_side_and_rejects_invalid_values():
     _, records = dictation.normalize(_raw(side="l"), NOW)
-    assert records[0].side is None
+    assert records[0].side == LEFT
 
     _, records = dictation.normalize(
         {"intent": "record", "records": [{"kind": DIAPER_WET, "side": "L"}]}, NOW
@@ -1623,7 +1623,7 @@ async def test_a_tap_writes_the_event_with_its_fields(wired, session, child, fam
 
     event = await repo.last_event(session, child.id, {FEED_BREAST})
     assert event is not None
-    assert event.side is None
+    assert event.side == LEFT
     assert event.started_at == tu.to_utc(at, family.tz)
     # Конец считает код, а не модель: `minutes` плюс начало
     assert event.ended_at == event.started_at + timedelta(minutes=20)

@@ -5,6 +5,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from datetime import datetime
+from hashlib import sha256
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -47,6 +48,10 @@ def snapshot(row: Event | Measurement) -> str:
         data[key] = value
     return json.dumps(data, ensure_ascii=False, sort_keys=True)
 
+
+def timer_stamp(row: Event) -> str:
+    """Короткая версия снимка для ограниченных 64 байтами Telegram-кнопок."""
+    return sha256(f"{row.id}:{snapshot(row)}".encode()).hexdigest()[:10]
 
 
 def stage(session: AsyncSession, row: Event | Measurement, before: str) -> None:

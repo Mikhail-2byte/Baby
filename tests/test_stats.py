@@ -191,8 +191,8 @@ async def test_panel_shows_running_timer(session, child, mother, family, now):
         started_at=now - timedelta(minutes=12), side="L",
     )
     text = await stats.panel_text(session, family, child, now)
-    assert "идёт 12 мин" in text
-    assert "левая" in text
+    assert "прошло 12 мин" in text
+    assert "левая грудь" in text.lower()
 
 
 @pytest.mark.asyncio

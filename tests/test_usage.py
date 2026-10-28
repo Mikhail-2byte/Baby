@@ -46,6 +46,7 @@ from tests.conftest import AUTHOR, CHAT, ME, NOW, PRIVATE
 CASES = [
         ("trk:start:feed_breast:L", "trk:start:feed_breast"),
         ("tm:stop:57:e:e", "tm:stop"),
+        ("timer:switch:57:feed_breast:R:a1b2c3d4e5", "timer:switch"),
         ("trk:add:diaper_wet:", "trk:add:diaper_wet"),
         ("undo:event:412", "undo:event"),
         ("hist:undo:7:e", "hist:undo"),

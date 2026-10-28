@@ -557,7 +557,8 @@ async def _setkind(
     if row is None or not isinstance(row, Event):
         await call.answer(texts.RECORD_GONE, show_alert=True)
         return
-    if not records.allows(row, data.kind):
+    if (not records.allows(row, data.kind)
+            or (records.carries_side(data.kind) and data.side not in {"", "L", "R"})):
         await call.answer(texts.RECORD_WRONG_KIND, show_alert=True)
         return
 
@@ -569,7 +570,7 @@ async def _setkind(
         was_name += f" ({texts.SIDE_NAMES[row.side]})"
     lost = row.value_num
 
-    side, value_num = records.after_kind_change(data.kind, "")
+    side, value_num = records.after_kind_change(data.kind, data.side)
     await repo.set_event_kind(session, row, kind=data.kind, side=side, value_num=value_num)
 
     dropped = (

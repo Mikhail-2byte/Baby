@@ -22,6 +22,8 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from bot.db.models import (
     FEED_BREAST,
+    LEFT,
+    RIGHT,
     SLEEP,
 )
 
@@ -64,6 +66,16 @@ class TimeCB(CallbackData, prefix="tm"):
 
 class PanelCB(CallbackData, prefix="pnl"):
     action: str
+
+
+class TimerCB(CallbackData, prefix="timer"):
+    """Действие с конкретным снимком активного таймера."""
+
+    action: str
+    row_id: int
+    kind: str = ""
+    side: str = ""
+    stamp: str = ""
 
 
 class MeasureCB(CallbackData, prefix="msr"):
@@ -266,10 +278,11 @@ class CheckinCB(CallbackData, prefix="ci"):
 #
 # «❓ Вопрос» и «📊 Сутки» дословно повторяют подписи на панели намеренно: одно
 # действие — одно имя. Правя подпись там, надо править и здесь.
-HOME_PANEL = "📋 Панель"
+HOME_PANEL = "Текущий таймер / Панель"
 HOME_ASK = "❓ Вопрос"
 HOME_TODAY = "📊 Сутки"
 HOME_LABELS = frozenset({HOME_PANEL, HOME_ASK, HOME_TODAY})
+LEGACY_HOME_LABELS = frozenset({"📋 Панель"})
 
 
 def home() -> ReplyKeyboardMarkup:
@@ -287,8 +300,8 @@ def home() -> ReplyKeyboardMarkup:
     """
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text=HOME_PANEL), KeyboardButton(text=HOME_ASK)],
-            [KeyboardButton(text=HOME_TODAY)],
+            [KeyboardButton(text=HOME_PANEL)],
+            [KeyboardButton(text=HOME_TODAY), KeyboardButton(text=HOME_ASK)],
         ],
         resize_keyboard=True,
         is_persistent=True,
@@ -346,17 +359,22 @@ def start_card() -> InlineKeyboardMarkup:
     )
 
 
-def panel(*, running_kind: str | None, running_id: int | None = None) -> InlineKeyboardMarkup:
+def panel(
+    *, running_kind: str | None, running_id: int | None = None,
+    side: str | None = None, stamp: str = "",
+) -> InlineKeyboardMarkup:
     """Только повседневные действия; старые callback-классы не меняем."""
     if running_kind is not None:
-        return running(running_kind, row_id=running_id)
+        return running(running_kind, row_id=running_id, side=side, stamp=stamp)
     return InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="🤱 Кормление", callback_data=TrackCB(
-                action="start", kind=FEED_BREAST).pack()),
+            InlineKeyboardButton(text="Левая грудь", callback_data=TrackCB(
+                action="start", kind=FEED_BREAST, side=LEFT).pack()),
+            InlineKeyboardButton(text="Правая грудь", callback_data=TrackCB(
+                action="start", kind=FEED_BREAST, side=RIGHT).pack()),
         ],
         [
-            InlineKeyboardButton(text="😴 Сон", callback_data=TrackCB(
+            InlineKeyboardButton(text="Начать сон", callback_data=TrackCB(
                 action="start", kind=SLEEP).pack()),
             InlineKeyboardButton(text="⋯ Ещё", callback_data=PanelCB(action="more").pack()),
         ],
@@ -372,6 +390,8 @@ def more() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="⚙️ Напоминания", callback_data=RemindCB(action="back").pack())],
         [InlineKeyboardButton(
             text="🔕 Отключить опросы", callback_data=PanelCB(action="quiet").pack())],
+        [InlineKeyboardButton(text="К таймеру / Панели", callback_data=PanelCB(
+            action="show").pack())],
     ])
 
 
@@ -388,18 +408,68 @@ def _fix_button(what: str, row_id: int) -> InlineKeyboardButton:
     )
 
 
-def running(kind: str, *, row_id: int | None = None) -> InlineKeyboardMarkup:
+def running(
+    kind: str, *, row_id: int | None = None, side: str | None = None, stamp: str = "",
+) -> InlineKeyboardMarkup:
     """Окончание всегда привязано к записи, а не к любому текущему таймеру."""
     if row_id is None:
         return InlineKeyboardMarkup(inline_keyboard=[[
             InlineKeyboardButton(
                 text="📋 Открыть панель", callback_data=PanelCB(action="show").pack())
         ]])
+    second = []
+    if kind == FEED_BREAST and stamp:
+        other = RIGHT if side == LEFT else LEFT
+        second.append(InlineKeyboardButton(
+            text="Сменить на " + ("правую" if other == RIGHT else "левую"),
+            callback_data=TimerCB(action="switch", row_id=row_id, kind=kind,
+                                  side=other, stamp=stamp).pack(),
+        ))
+    second.append(InlineKeyboardButton(text="⋯", callback_data=TimerCB(
+        action="menu", row_id=row_id, stamp=stamp).pack()))
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="⏹ Закончить сейчас", callback_data=TimeCB(
+        [InlineKeyboardButton(text=(
+            "Завершить кормление" if kind == FEED_BREAST else "Завершить сон"
+            if kind == SLEEP else "Завершить таймер"
+        ), callback_data=TimeCB(
             action="stop", row_id=row_id).pack())],
-        [InlineKeyboardButton(text="🕐 Указать время окончания", callback_data=TimeCB(
+        second,
+    ])
+
+
+def timer_menu(row_id: int, kind: str, stamp: str) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(text="Изменить время начала", callback_data=TimeCB(
+            action="ask", row_id=row_id, field="s").pack())],
+        [InlineKeyboardButton(text="Указать время окончания", callback_data=TimeCB(
             action="ask", row_id=row_id, field="e").pack())],
+        [InlineKeyboardButton(text="История", callback_data=RecordCB(action="list").pack()),
+         InlineKeyboardButton(text="Настройки", callback_data=NudgeCB(kind="menu").pack())],
+        [InlineKeyboardButton(text="Вес", callback_data=MeasureCB(kind="weight").pack()),
+         InlineKeyboardButton(text="⋯ Ещё", callback_data=PanelCB(action="more").pack())],
+    ]
+    targets = [(FEED_BREAST, LEFT, "Левая грудь"), (FEED_BREAST, RIGHT, "Правая грудь")]
+    if kind != SLEEP:
+        targets = [(SLEEP, "", "Начать сон")]
+    rows.append([InlineKeyboardButton(text=label, callback_data=TimerCB(
+        action="switch", row_id=row_id, kind=target, side=side, stamp=stamp).pack())
+        for target, side, label in targets])
+    rows.extend([
+        [InlineKeyboardButton(text="Удалить ошибочный старт", callback_data=RecordCB(
+            action="ask", what="e", row_id=row_id).pack())],
+        [InlineKeyboardButton(text="К таймеру", callback_data=PanelCB(action="show").pack())],
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def timer_transition(row_id: int, kind: str, side: str, stamp: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Завершить и начать " + (
+            "сон" if kind == SLEEP else "кормление" if kind == FEED_BREAST else "сцеживание"
+        ), callback_data=TimerCB(action="confirm", row_id=row_id, kind=kind,
+                                side=side, stamp=stamp).pack())],
+        [InlineKeyboardButton(text="Продолжить текущий таймер", callback_data=TimerCB(
+            action="cancel", row_id=row_id, stamp=stamp).pack())],
     ])
 
 

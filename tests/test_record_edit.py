@@ -437,7 +437,7 @@ async def test_a_mistaken_side_is_fixed_by_pressing_the_right_one(
 
     await session.refresh(event)
     assert event.kind == FEED_BREAST
-    assert event.side is None
+    assert event.side == RIGHT
 
 
 def test_no_choice_crosses_the_shape_boundary():
@@ -742,9 +742,10 @@ async def test_an_auto_closed_timer_is_fixed_from_its_own_message(
     assert markup is not None
     from bot.keyboards import TimeCB
     values = [TimeCB.unpack(button.callback_data)
-              for row in markup.inline_keyboard for button in row]
+              for row in markup.inline_keyboard for button in row
+              if button.callback_data.startswith("tm:")]
     assert {value.row_id for value in values} == {event.id}
-    assert {value.action for value in values} == {"stop", "ask"}
+    assert {value.action for value in values} == {"ask"}
 
 
 def test_the_promise_in_the_auto_closed_text_is_keepable():

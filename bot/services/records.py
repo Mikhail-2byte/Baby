@@ -30,7 +30,9 @@ from bot.db.models import (
     FEED_BREAST,
     FEED_SOLID,
     INSTANT_KINDS,
+    LEFT,
     PUMP,
+    RIGHT,
     SLEEP,
     TIMED_KINDS,
     Event,
@@ -91,6 +93,8 @@ class Choice:
 # кнопки, которую имели в виду, а не выбором из чужого списка, — поэтому
 # порядок здесь тот же, что в `keyboards.panel`, и менять его вразнобой нельзя.
 TIMED_CHOICES: tuple[Choice, ...] = (
+    Choice(FEED_BREAST, LEFT, "Левая грудь"),
+    Choice(FEED_BREAST, RIGHT, "Правая грудь"),
     Choice(FEED_BREAST, "", "🤱 Кормление"),
     Choice(SLEEP, "", "😴 Сон"),
     Choice(PUMP, "", "🥛 Сцеживание"),

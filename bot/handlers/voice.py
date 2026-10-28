@@ -96,6 +96,7 @@ class Draft:
     source_message_id: int
     now_local: datetime
     heard: str
+    expected_timer: str | None = None
 
 
 def _remember(key: tuple[int, int], draft: Draft) -> None:
@@ -120,6 +121,7 @@ async def dictate(
     bot: Bot,
     family: Family,
     child: Child | None,
+    session: AsyncSession,
 ) -> None:
     """Голосовое: скачать → расшифровать → цифры → триаж → разбор → карточка."""
     if not stt.available():
@@ -218,13 +220,21 @@ async def dictate(
         await message.answer(texts.VOICE_UNCLEAR, reply_markup=keyboards.home())
         return
 
+    current = await repo.any_open_event(session, child.id)
+    expected_timer = revisions.timer_stamp(current) if current is not None else ""
+    explanation = ""
+    if current is not None and any(record.open_timer for record in result.records):
+        explanation = (
+            "\n\nПри сохранении текущий таймер завершится временем начала новой записи. "
+            "Если это не переход, нажмите «Не то»."
+        )
     card = await message.answer(
-        texts.voice_card(result.records, now_local, text),
+        texts.voice_card(result.records, now_local, text) + explanation,
         reply_markup=keyboards.voice_card(),
     )
     _remember(
         (message.chat.id, card.message_id),
-        Draft(family.id, result.records, message.message_id, now_local, text),
+        Draft(family.id, result.records, message.message_id, now_local, text, expected_timer),
     )
 
 
@@ -287,18 +297,12 @@ async def tap(
         await call.answer("Записал")
         # Раньше перерисовки карточки: записи уже в базе, и сбой рендера не должен
         # оставить панель без них
-        # Голосом тоже можно открыть таймер («начала кормить»), и тогда карточка —
-        # последнее, на что человек смотрит. Кнопка отмены здесь не нужна: записей
-        # под карточкой может быть несколько, а отменять их поштучно нечем
-        running = await repo.any_open_event(session, child.id)
+        # Единственное управление открытым таймером рисует панель: голосовая
+        # квитанция не создаёт второй набор кнопок остановки.
         await call.message.edit_text(
             texts.voice_saved(lines),
-            reply_markup=keyboards.running(running.kind, row_id=running.id) if running else None,
+            reply_markup=None,
         )
-
-        if running is not None and len(draft.records) == 1 and draft.records[0].open_timer:
-            running.card_message_id = call.message.message_id
-            await session.commit()
 
 
 async def _save(
@@ -315,6 +319,13 @@ async def _save(
     """
     now = tu.now_utc()
     current = await repo.any_open_event(session, child.id)
+    if any(record.open_timer for record in draft.records) and draft.expected_timer is not None:
+        actual = revisions.timer_stamp(current) if current is not None else ""
+        if actual != draft.expected_timer:
+            raise time_input.TimeInputError(
+                "Таймер изменился после разбора голосового. Записи не изменены; "
+                "откройте панель или отправьте голосовое ещё раз."
+            )
     current_start = current.started_at if current is not None else None
     for item in draft.records:
         began = tu.to_utc(item.at, family.tz)
@@ -354,7 +365,7 @@ async def _save(
                     member.id,
                     record.kind,
                     started_at=started_at,
-                    side=None if record.kind == "feed_breast" else record.side,
+                    side=record.side,
                     subtype=record.subtype,
                     source_chat_id=family.chat_id,
                     source_message_id=draft.source_message_id,
@@ -378,7 +389,7 @@ async def _save(
                 started_at=started_at,
                 ended_at=ended_at,
                 value_num=record.value,
-                side=None if record.kind == "feed_breast" else record.side,
+                side=record.side,
                 subtype=record.subtype,
                 note=record.note,
                 source_chat_id=family.chat_id,

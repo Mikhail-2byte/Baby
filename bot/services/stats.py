@@ -186,8 +186,10 @@ async def panel_text(
 
     today = await day(session, child, family.tz, now=now)
     running = await repo.any_open_event(session, child.id)
-    last_feed = await repo.last_event(session, child.id, FEED_KINDS)
-    last_sleep = await repo.last_event(session, child.id, frozenset({SLEEP}))
+    last_feed = await repo.last_event(session, child.id, FEED_KINDS, completed_only=True)
+    last_sleep = await repo.last_event(
+        session, child.id, frozenset({SLEEP}), completed_only=True,
+    )
     weight = await repo.last_measurement(session, child.id, WEIGHT)
 
     note = None

@@ -137,4 +137,4 @@ def interval(text: str, *, now: datetime, tz: str, born_at: datetime) -> Interva
     kind = "sleep" if verb in {"сон", "спала", "спал"} else "feed_breast"
     if kind == "sleep" and side is not None:
         raise TimeInputError("Для сна сторона груди не нужна: «сон с 13:10 до 14:00».")
-    return Interval(kind, None, start, end)
+    return Interval(kind, {"левой": "L", "правой": "R"}.get(side), start, end)

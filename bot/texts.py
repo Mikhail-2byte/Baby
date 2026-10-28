@@ -251,35 +251,41 @@ def panel(
     weight_note: str | None,
 ) -> str:
     """Главный экран. Всё, что нужно знать в три часа ночи, без прокрутки."""
-    head = f"👶 <b>{child.name}</b> · {age_phrase(child, now)}"
+    if running is not None:
+        return timer_card(running, tz, now)
+    head = f"<b>{child.name}</b> · сегодня"
     if weight is not None:
         head += f" · {weight_str(weight.value)}"
         if weight_note:
             head += f" ({weight_note})"
-
     lines = [head, ""]
 
-    if running is not None:
-        icon = KIND_ICONS.get(running.kind, "⏱")
-        name = KIND_NAMES.get(running.kind, running.kind)
-        went = duration(now - running.started_at)
-        side = f", {SIDE_NAMES[running.side]}" if running.side else ""
-        lines.append(f"{icon} <b>{name.capitalize()}: идёт {went}</b>{side}")
-    else:
-        lines.append("⏱ Сейчас ничего не идёт")
-
     if last_feed is not None:
-        when = ago(last_feed.ended_at or last_feed.started_at, now)
         ended = tu.to_local(last_feed.ended_at or last_feed.started_at, tz)
-        lines.append(f"🤱 Кормление: {ended:%H:%M} · {when}, за сутки {feeds_today}")
+        side = {"L": "левая грудь", "R": "правая грудь"}.get(
+            last_feed.side or "", "сторона не указана",
+        )
+        label = side if last_feed.kind == FEED_BREAST else KIND_NAMES[last_feed.kind]
+        lines.append(f"Последнее кормление: {label} · {ended:%H:%M}")
     else:
-        lines.append("🤱 Кормлений сегодня ещё не было")
+        lines.append("Кормлений пока нет")
 
     if last_sleep is not None and last_sleep.ended_at is not None:
         slept = duration(last_sleep.ended_at - last_sleep.started_at)
-        lines.append(f"😴 Последний сон: {slept}, {ago(last_sleep.ended_at, now)}")
+        lines.append(f"Последний сон: {slept} · {ago(last_sleep.ended_at, now)}")
 
     return "\n".join(lines)
+
+
+def timer_card(event: Event, tz: str, now: datetime) -> str:
+    label = KIND_NAMES.get(event.kind, event.kind).capitalize()
+    if event.kind == FEED_BREAST:
+        label = {"L": "Левая грудь", "R": "Правая грудь"}.get(event.side or "", label)
+    local = tu.to_local(event.started_at, tz)
+    icon = KIND_ICONS.get(event.kind, "⏱")
+    date = "%d.%m %H:%M" if local.date() != tu.to_local(now, tz).date() else "%H:%M"
+    return (f"{icon} <b>{label}</b>\n"
+            f"Начали в {local.strftime(date)} · прошло {duration(now - event.started_at)}")
 
 
 # --- Подтверждения записи -------------------------------------------------
@@ -303,6 +309,10 @@ def finished(event: Event, tz: str) -> str:
     end = tu.to_local(event.ended_at or event.started_at, tz)
     dates = "%d.%m %H:%M" if start.date() != end.date() else "%H:%M"
     interval = f"{start.strftime(dates)}–{end.strftime(dates)}"
+    if event.kind in {FEED_BREAST, SLEEP}:
+        label = "Кормление" if event.kind == FEED_BREAST else "Сон"
+        detail = {"L": " · левая грудь", "R": " · правая грудь"}.get(event.side or "", "")
+        return f"✓ <b>{label}{detail}</b>\n{interval} · {went}"
     return f"{KIND_ICONS.get(event.kind, '⏱')} {name.capitalize()}{side} — {interval} · {went}"
 
 
@@ -1265,16 +1275,18 @@ OWNER_ONLY = (
 
 HELP = """👶 <b>Что я умею</b>
 
-<b>Кнопки под полем ввода</b> — «📋 Панель», «❓ Вопрос», «📊 Сутки».
+<b>Кнопки под полем ввода</b> — «Текущий таймер / Панель», «❓ Вопрос», «📊 Сутки».
 Видны всегда, набирать команду не надо. Нажатие убираю из чата сам,
 если дали права администратора. Скрыли клавиатуру — вернёт /help.
 
-<b>Записывать</b> — на панели «🤱 Кормление» и «😴 Сон».
+<b>Записывать</b> — на панели «Левая грудь», «Правая грудь» и «Начать сон».
 Вес, историю и настройки найдёте в «⋯ Ещё».
+Во время кормления можно сменить грудь. Начать сон — после подтверждения.
+Карточку таймера вернёт нижняя кнопка; на прежнем месте её кнопки отключаются.
 
 <b>Забыли выключить?</b> Напишите «закончили в 14:35» или
 «закончили 20 минут назад». Для сна — «проснулась в 16:20».
-Можно нажать «Указать время окончания» и ответить просто «14:35».
+В меню «⋯» таймера можно нажать «Указать время окончания» и ответить «14:35».
 Без запроса голое время не меняет записи.
 
 <b>Без таймера</b> — «кормили с 14:10 до 14:35» или
@@ -1283,7 +1295,7 @@ HELP = """👶 <b>Что я умею</b>
 <b>Исправить</b> — «✏️ Изменить» под записью, затем начало или конец.
 Время вводится текстом. История: «📊 Сутки» → «📋 Записи».
 Там же можно удалить запись, продолжить таймер, посмотреть историю правок
-или отменить последнюю правку. Сторону груди больше не спрашиваю.
+или отменить последнюю правку. В «Вид» можно исправить сторону груди.
 Отменить ввод — «отмена» или /cancel.
 
 <b>Слушать</b> — просто пришлите голосовое, нажимать ничего не надо.

@@ -8,7 +8,7 @@ from sqlalchemy import func, select
 from bot import keyboards
 from bot.db import repo
 from bot.db.models import FEED_BREAST, LEFT, SLEEP, Event
-from bot.keyboards import PanelCB, TimeCB, TrackCB
+from bot.keyboards import PanelCB, TimeCB, TimerCB, TrackCB
 from bot.services import pending
 from bot.services import timeutil as tu
 from tests.test_record_edit import AUTHOR, CHAT, _feed, _tap
@@ -34,17 +34,18 @@ async def count_events(session, child):
     )
 
 
-def test_idle_panel_has_three_buttons_only():
+def test_idle_panel_has_sides_sleep_and_more():
     labels = [b.text for row in keyboards.panel(running_kind=None).inline_keyboard for b in row]
-    assert labels == ["🤱 Кормление", "😴 Сон", "⋯ Ещё"]
+    assert labels == ["Левая грудь", "Правая грудь", "Начать сон", "⋯ Ещё"]
 
 
 def test_running_controls_are_bound_to_a_record():
     controls = keyboards.panel(running_kind=FEED_BREAST, running_id=23)
-    values = [TimeCB.unpack(b.callback_data) for row in controls.inline_keyboard for b in row]
+    values = [(TimeCB if b.callback_data.startswith("tm:") else TimerCB).unpack(b.callback_data)
+              for row in controls.inline_keyboard for b in row]
     assert len(values) == 2
     assert {item.row_id for item in values} == {23}
-    assert {item.action for item in values} == {"stop", "ask"}
+    assert {item.action for item in values} == {"stop", "menu"}
     assert all(len(b.callback_data.encode()) <= 64 for row in controls.inline_keyboard for b in row)
 
 
@@ -225,7 +226,7 @@ async def test_double_start_is_idempotent(wired, session, child):
     await _tap(dp, bot, TrackCB(action="start", kind=FEED_BREAST, side=LEFT))
     await _tap(dp, bot, TrackCB(action="start", kind=FEED_BREAST, side=LEFT))
     assert await count_events(session, child) == 1
-    assert (await repo.any_open_event(session, child.id)).card_message_id == 999
+    assert (await repo.any_open_event(session, child.id)).side == LEFT
 
 
 @pytest.mark.asyncio

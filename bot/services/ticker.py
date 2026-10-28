@@ -38,7 +38,17 @@ from bot.db.models import (
     Reminder,
 )
 from bot.db.session import Session
-from bot.services import backup, checkin, digest, growth, panel, redflags, sending, tracker_guard
+from bot.services import (
+    backup,
+    checkin,
+    digest,
+    growth,
+    panel,
+    redflags,
+    revisions,
+    sending,
+    tracker_guard,
+)
 from bot.services import timeutil as tu
 
 log = logging.getLogger(__name__)
@@ -204,7 +214,9 @@ async def close_stale_timers(
             status, _ = await sending.send(
                 bot, family, f"{name}: таймер ещё идёт? Если уже закончили, "
                 "укажите фактическое время. Сам таймер не завершаю.",
-                reply_markup=keyboards.running(event.kind, row_id=event.id), session=session,
+                reply_markup=keyboards.timer_menu(
+                    event.id, event.kind, revisions.timer_stamp(event),
+                ), session=session,
             )
             if status in {sending.OK, sending.FORBIDDEN, sending.BROKEN}:
                 event.nudged_at = moment

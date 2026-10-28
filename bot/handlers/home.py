@@ -81,6 +81,7 @@ async def _today(
 # ничего, а молчание бота на им же предложенную кнопку хуже отсутствия кнопки
 ACTIONS = {
     keyboards.HOME_PANEL: _open_panel,
+    "📋 Панель": _open_panel,  # клавиатура, оставшаяся у второго родителя до обновления
     keyboards.HOME_ASK: _ask,
     keyboards.HOME_TODAY: _today,
 }

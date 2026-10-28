@@ -58,7 +58,7 @@ def _interrupts_the_wizard(event: TelegramObject) -> bool:
     if not isinstance(event, Message):
         return False
     text = (event.text or "").strip()
-    if text in keyboards.HOME_LABELS:
+    if text in keyboards.HOME_LABELS | keyboards.LEGACY_HOME_LABELS:
         return True
     if not text.startswith("/"):
         return False

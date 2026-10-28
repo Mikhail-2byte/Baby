@@ -22,7 +22,7 @@ from bot.db.models import (
     RecordRevision,
 )
 from bot.filters import IN_GROUP_CB
-from bot.keyboards import HistoryCB, NudgeCB
+from bot.keyboards import HistoryCB, NudgeCB, PanelCB
 from bot.services import panel, records, revisions, tracker_guard
 from bot.services import timeutil as tu
 
@@ -54,7 +54,9 @@ def settings_screen(family: Family) -> tuple[str, InlineKeyboardMarkup]:
                     text="🤱 Кормление", callback_data=NudgeCB(kind="feed").pack()
                 ),
                 InlineKeyboardButton(text="😴 Сон", callback_data=NudgeCB(kind="sleep").pack()),
-            ]
+            ],
+            [InlineKeyboardButton(text="К таймеру / Панели", callback_data=PanelCB(
+                action="show").pack())],
         ]
     )
     return text, markup
@@ -89,7 +91,9 @@ async def settings_tap(
             for minutes in CHOICES[data.kind]
         ]
         markup = InlineKeyboardMarkup(
-            inline_keyboard=[buttons[i : i + 2] for i in range(0, len(buttons), 2)]
+            inline_keyboard=[buttons[i : i + 2] for i in range(0, len(buttons), 2)] + [[
+                InlineKeyboardButton(text="Назад", callback_data=NudgeCB(kind="menu").pack()),
+            ]]
         )
         await call.answer()
         await call.message.edit_text("Когда один раз напомнить о таймере?", reply_markup=markup)

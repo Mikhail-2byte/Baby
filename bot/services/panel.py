@@ -28,7 +28,7 @@ from bot.config import settings
 from bot.db import repo
 from bot.db.models import Family
 from bot.db.session import Session
-from bot.services import sending, stats
+from bot.services import revisions, sending, stats, tracker_guard
 from bot.services import timeutil as tu
 
 log = logging.getLogger(__name__)
@@ -90,12 +90,11 @@ async def refresh(
 ) -> None:
     """Пересобрать панель семьи: отредактировать или выпустить новую.
 
-    `last_message_id` — самое свежее сообщение чата, какое мы видели. По нему
-    считается, далеко ли уехала панель.
+    `last_message_id` сохранён для совместимости вызывающих. Переписка больше
+    не вызывает автоматический перенос панели.
 
-    `force_new` — выпустить новую, не пытаясь править старую. Нужен `/panel`:
-    человек попросил панель явно, значит он её не видит, и правка невидимого
-    сообщения выглядела бы как «бот не ответил».
+    `force_new` — отключить старые кнопки и выпустить панель внизу по явному
+    запросу. Обычные обновления только редактируют существующее сообщение.
     """
     # Сначала лок, потом сессия: стоять в очереди, держа соединение SQLite,
     # незачем — тикер пишет в ту же базу
@@ -103,29 +102,35 @@ async def refresh(
         family = await repo.get_family_by_id(session, family_id)
         if family is None:
             return
-        await _redraw(
-            bot, session, family, last_message_id, now or tu.now_utc(),
-            force_new=force_new,
-        )
+        child = await repo.active_child(session, family.id)
+        if child is None:
+            await _redraw(bot, session, family, last_message_id, now or tu.now_utc(),
+                          force_new=force_new)
+        else:
+            async with tracker_guard.for_child(child.id):
+                await session.refresh(family)
+                await _redraw(bot, session, family, last_message_id, now or tu.now_utc(),
+                              force_new=force_new)
 
 
 async def refresh_stale(
     bot: Bot, session: AsyncSession, now: datetime | None = None
 ) -> None:
-    """Обновить панели, оставшиеся за вчерашний день, без перевыпуска.
-
-    В обычный тик не делает ни одного обращения к Telegram — только читает
-    семьи. Отправка случается ровно один раз за локальные сутки.
-
-    Семьям без панели её здесь не заводим: панель появляется от первой же
-    записи или от `/panel`.
-    """
+    """Раз в тик обновить активные таймеры и восстановить завершённые карточки."""
     moment = now or tu.now_utc()
     for family in await repo.all_families(session):
-        if family.panel_message_id is None:
+        child = await repo.active_child(session, family.id)
+        running = await repo.any_open_event(session, child.id) if child else None
+        if running is None and family.panel_message_id is None:
             continue
-        if family.panel_day == tu.local_today(family.tz, moment):
-            continue
+        if (running is None and family.panel_message_id is not None
+                and family.panel_day == tu.local_today(family.tz, moment)):
+            owner = (
+                await repo.event_for_card(session, child.id, family.panel_message_id)
+                if child else None
+            )
+            if owner is None or owner.ended_at is None:
+                continue
         # Именно schedule, а не await refresh: у тикера открыта своя сессия, и
         # вложенная транзакция к SQLite — прямой путь к «database is locked»
         schedule(bot, family.id)
@@ -159,6 +164,8 @@ async def _build(
     return text, keyboards.panel(
         running_kind=running.kind if running else None,
         running_id=running.id if running else None,
+        side=running.side if running else None,
+        stamp=revisions.timer_stamp(running) if running else "",
     )
 
 
@@ -171,10 +178,40 @@ async def _redraw(
     *,
     force_new: bool = False,
 ) -> None:
-    text, markup = await _build(session, family, now)
+    child = await repo.active_child(session, family.id)
+    running = await repo.any_open_event(session, child.id) if child else None
+    if child is not None and family.panel_message_id is not None:
+        owner = await repo.event_for_card(session, child.id, family.panel_message_id)
+        if owner is not None and owner.ended_at is not None:
+            status = await sending.edit(
+                bot, family, family.panel_message_id, texts.finished(owner, family.tz),
+                keyboards.stopped(owner.id), session=session,
+            )
+            if status not in (sending.OK, sending.NOT_FOUND):
+                return  # ссылка остаётся в БД: следующий тик повторит завершение
+            await _pin(bot, family, family.panel_message_id, pin=False)
+            await repo.set_panel(session, family, None, None)
 
-    stale = force_new or _outdated(family, now, last_message_id)
-    if family.panel_message_id is not None and not stale:
+    text, markup = await _build(session, family, now)
+    # У старой версии была отдельная карточка старта с дублирующей остановкой.
+    if running is not None and running.card_message_id not in (None, family.panel_message_id):
+        status = await sending.edit(
+            bot, family, running.card_message_id, texts.started(running, family.tz),
+            session=session,
+        )
+        if status not in (sending.OK, sending.NOT_FOUND):
+            return
+        running.card_message_id = None
+        await session.commit()
+
+    if force_new and family.panel_message_id is not None:
+        status = await sending.edit(
+            bot, family, family.panel_message_id, text, session=session,
+        )
+        if status not in (sending.OK, sending.NOT_FOUND):
+            return  # не создаём второй набор управляющих кнопок при сбое уборки
+
+    if family.panel_message_id is not None and not force_new:
         status = await sending.edit(
             bot, family, family.panel_message_id, text, markup, session=session
         )
@@ -184,6 +221,8 @@ async def _redraw(
             # на каждый
             log.info("Панель #%s: правка, %s", family.panel_message_id, status)
             if status == sending.OK:
+                if running is not None:
+                    running.card_message_id = family.panel_message_id
                 await repo.set_panel(
                     session, family, family.panel_message_id, tu.local_today(family.tz, now)
                 )
@@ -194,19 +233,9 @@ async def _redraw(
         # правили сообщение старого чата, в новом его нет
 
     await _publish(bot, session, family, text, markup, now)
-
-
-def _outdated(family: Family, now: datetime, last_message_id: int | None) -> bool:
-    """Панель невидима: уехала вверх по истории.
-
-    `last_message_id` — оценка снизу: тап по inline-кнопке сообщений в чат не
-    добавляет, а `call.message` может быть старым. Недооценка лишь откладывает
-    перевыпуск до следующей правки, переоценки не бывает.
-    """
-    # Новый день: редактируем закреп, а не создаём служебный шум.
-    if last_message_id is None or family.panel_message_id is None:
-        return False
-    return last_message_id - family.panel_message_id > settings.panel_max_messages
+    if running is not None and family.panel_message_id is not None:
+        running.card_message_id = family.panel_message_id
+        await session.commit()
 
 
 async def _publish(

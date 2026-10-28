@@ -91,7 +91,7 @@ KINDS = frozenset(
 )
 
 # Виды, у которых бывает сторона
-SIDED_KINDS = frozenset({PUMP})
+SIDED_KINDS = frozenset({FEED_BREAST, PUMP})
 # Виды, у которых `value` — миллилитры
 ML_KINDS = frozenset({FEED_BOTTLE, PUMP})
 

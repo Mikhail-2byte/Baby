@@ -1,13 +1,7 @@
-"""Кнопки записи на панели — главный путь ввода данных.
+"""Старт и смена таймера. Одна карточка, переход с подтверждением.
 
-Всё здесь подчинено одному требованию: один тап, ночью, одной рукой, не глядя.
-Отсюда несколько решений, которые иначе выглядели бы странно:
-
-* тап по «начали», когда таймер уже идёт, не ругается, а закрывает предыдущий
-  и открывает новый — потому что чаще всего это и имелось в виду;
-* у каждой записи есть кнопка отмены: промах по соседней кнопке в темноте —
-  обычное дело, а лишнее кормление заметно искажает неделю;
-* ответ человеку уходит раньше, чем перерисовывается панель.
+Смена груди привязана к снимку записи; переход между видами таймера требует
+подтверждения. После сохранения обновление единственной карточки делает panel.
 """
 
 import logging
@@ -23,13 +17,17 @@ from bot.db.models import (
     DIAPER_KINDS,
     FEED_BOTTLE,
     FEED_BREAST,
+    LEFT,
+    PUMP,
+    RIGHT,
     TIMED_KINDS,
     Child,
+    Event,
     Family,
     Member,
 )
 from bot.filters import IN_GROUP_CB
-from bot.keyboards import PanelCB, TrackCB, UndoCB
+from bot.keyboards import PanelCB, TimerCB, TrackCB, UndoCB
 from bot.services import panel, pending, revisions, tracker_guard
 from bot.services import timeutil as tu
 
@@ -84,8 +82,6 @@ async def track(
         return
 
     now = tu.now_utc()
-    if callback_data.kind == FEED_BREAST:
-        callback_data.side = ""
     handlers = {"start": _start, "stop": _stop, "add": _add}
     handler = handlers.get(callback_data.action)
     if handler is None:
@@ -94,12 +90,13 @@ async def track(
         await call.answer()
         return
 
+    family_id = family.id
     try:
         with revisions.actor(member.id):
             async with tracker_guard.for_child(child.id):
                 await handler(call, callback_data, session, family, member, child, now)
     finally:
-        panel.schedule(bot, family.id, _last_id(call))
+        panel.schedule(bot, family_id, _last_id(call))
 
 
 async def _start(
@@ -111,52 +108,99 @@ async def _start(
     child: Child,
     now: datetime,
 ) -> None:
-    if data.kind not in TIMED_KINDS:
+    if data.kind not in TIMED_KINDS or data.side not in {"", LEFT, RIGHT}:
         await call.answer()
         return
 
-    # Идущий таймер закрываем, а не отказываем. Отказ («сначала закончите
-    # предыдущее») в три часа ночи означает, что человек нажмёт ещё раз,
-    # не поймёт, почему ничего не происходит, и бросит запись вовсе.
-    #
-    # И говорим об этом вслух. Раньше кнопка закрывала молча, и в докстроке
-    # стояло почему: «панель меняется под пальцем, закрытие видно сразу». Довод
-    # сломался вместе с интерфейсом — с клавиатурой под полем ввода панель чаще
-    # всего выше по чату. Молчание превратилось в тихую потерю: промахнувшись по
-    # «начали» при идущем таймере, человек получал закрытый «сейчас» предыдущий
-    # и отменить мог только новый
     current = await repo.any_open_event(session, child.id)
-    if (
-        current is not None
-        and current.kind == data.kind
-        and (data.kind == FEED_BREAST or current.side == (data.side or None))
-    ):
+    if current is not None and current.kind == data.kind:
+        if current.side != (data.side or None) and data.kind == FEED_BREAST:
+            await call.answer("Смените грудь на актуальной карточке таймера", show_alert=True)
+            return
         await call.answer("Этот таймер уже идёт")
         return
-    closed = await repo.close_running(session, child.id, now)
+    if current is not None:
+        await call.answer()
+        await _say(call, f"Завершить текущий таймер и начать {texts.KIND_NAMES[data.kind]}?",
+                   keyboards.timer_transition(current.id, data.kind, data.side,
+                                              revisions.timer_stamp(current)))
+        return
+    await _begin(call, data.kind, data.side, session, family, member, child, now)
 
-    event = await repo.start_event(
-        session,
-        child.id,
-        member.id,
-        data.kind,
-        started_at=now,
-        side=data.side or None,
-        source_chat_id=family.chat_id,
-        source_message_id=_last_id(call),
-    )
-    await call.answer("Пошло время")
-    if closed is not None:
-        await _say(call, texts.closed_previous(closed, family.tz))
-    # «Закончить» рядом с «Отменить», а не только в панели: в эту секунду
-    # человек смотрит на подтверждение, а панель уже выше по чату. И оно идёт
-    # последним, чтобы кнопка окончания осталась под рукой
-    card = await _say(
-        call, texts.started(event, family.tz), keyboards.running(data.kind, row_id=event.id)
-    )
-    if card is not None:
-        event.card_message_id = card.message_id
-        await session.commit()
+
+async def _begin(
+    call: CallbackQuery, kind: str, side: str, session: AsyncSession,
+    family: Family, member: Member, child: Child, now: datetime,
+) -> None:
+    async with repo.atomic(session):
+        await repo.close_running(session, child.id, now)
+        await repo.start_event(
+            session, child.id, member.id, kind, started_at=now,
+            side=(side or None) if kind in {FEED_BREAST, PUMP} else None,
+            source_chat_id=family.chat_id, source_message_id=_last_id(call),
+        )
+    await call.answer("Таймер начался")
+
+
+@router.callback_query(IN_GROUP_CB, TimerCB.filter())
+async def timer(
+    call: CallbackQuery, callback_data: TimerCB, session: AsyncSession,
+    bot: Bot, family: Family, member: Member, child: Child | None,
+) -> None:
+    if child is None:
+        await call.answer(texts.NO_CHILD, show_alert=True)
+        return
+    data = callback_data
+    family_id = family.id
+    try:
+        async with tracker_guard.for_child(child.id):
+            row = await session.get(Event, data.row_id, populate_existing=True)
+            current = await repo.any_open_event(session, child.id)
+            if (row is None or row.child_id != child.id or row.ended_at is not None
+                    or current is None or current.id != row.id
+                    or row.kind not in TIMED_KINDS
+                    or (data.stamp and data.stamp != revisions.timer_stamp(row))):
+                await call.answer("Таймер изменился. Откройте актуальную панель.", show_alert=True)
+                return
+            if data.action == "menu":
+                await call.answer()
+                await _say(call, "Действия с таймером", keyboards.timer_menu(
+                    row.id, row.kind, revisions.timer_stamp(row),
+                ))
+                return
+            if data.action == "cancel":
+                await call.answer("Таймер продолжается")
+                if isinstance(call.message, Message):
+                    await call.message.edit_text("Таймер продолжается", reply_markup=None)
+                return
+            if (data.action not in {"switch", "confirm"} or not data.stamp
+                    or data.kind not in TIMED_KINDS
+                    or data.side not in (
+                        {LEFT, RIGHT} if data.kind == FEED_BREAST else
+                        {"", LEFT, RIGHT} if data.kind == PUMP else {""}
+                    )):
+                await call.answer("Откройте актуальную панель", show_alert=True)
+                return
+            if row.kind == data.kind and row.side == (data.side or None):
+                await call.answer("Этот таймер уже идёт")
+                return
+            if data.action == "switch" and row.kind != data.kind:
+                await call.answer()
+                await _say(
+                    call, f"Завершить текущий таймер и начать {texts.KIND_NAMES[data.kind]}?",
+                    keyboards.timer_transition(row.id, data.kind, data.side, data.stamp),
+                )
+                return
+            now = tu.now_utc()
+            if now <= row.started_at:
+                await call.answer("Подождите секунду после старта таймера")
+                return
+            with revisions.actor(member.id):
+                await _begin(call, data.kind, data.side, session, family, member, child, now)
+            if data.action == "confirm" and isinstance(call.message, Message):
+                await call.message.edit_text("Переход выполнен", reply_markup=None)
+    finally:
+        panel.schedule(bot, family_id)
 
 
 async def _stop(

@@ -701,14 +701,26 @@ async def events_between(
 
 
 async def last_event(
-    session: AsyncSession, child_id: int, kinds: frozenset[str] | set[str]
+    session: AsyncSession, child_id: int, kinds: frozenset[str] | set[str],
+    *, completed_only: bool = False,
 ) -> Event | None:
+    filters = [Event.child_id == child_id, Event.kind.in_(kinds)]
+    if completed_only:
+        filters.append(or_(Event.kind.not_in(TIMED_KINDS), Event.ended_at.is_not(None)))
     return await session.scalar(
         select(Event)
-        .where(Event.child_id == child_id, Event.kind.in_(kinds))
+        .where(*filters)
         .order_by(Event.started_at.desc())
         .limit(1)
     )
+
+
+async def event_for_card(
+    session: AsyncSession, child_id: int, message_id: int,
+) -> Event | None:
+    return await session.scalar(select(Event).where(
+        Event.child_id == child_id, Event.card_message_id == message_id,
+    ).order_by(Event.id.desc()).limit(1))
 
 
 async def count_events_since(

@@ -89,19 +89,19 @@ async def test_burst_of_taps_makes_one_edit(
 
 
 @pytest.mark.asyncio
-async def test_panel_reissued_when_it_scrolled_away(
+async def test_panel_does_not_reissue_itself_after_chat_messages(
     session_maker, session, family, child, bot, monkeypatch
 ):
-    """Уехавшая вверх панель выпускается заново, а старая откалывается."""
+    """Переписка не вызывает автоматического переноса панели вниз."""
     monkeypatch.setattr(panel, "Session", session_maker)
     await panel.refresh(bot, family.id)
 
     far = 101 + panel.settings.panel_max_messages + 5
     await panel.refresh(bot, family.id, last_message_id=far)
 
-    assert len(bot.sent) == 2
-    assert bot.unpinned == [101]
-    assert bot.pinned == [101, 102]
+    assert len(bot.sent) == 1
+    assert bot.unpinned == []
+    assert bot.pinned == [101]
 
 
 @pytest.mark.asyncio
@@ -232,7 +232,8 @@ async def test_force_new_issues_a_fresh_panel(
     await panel.refresh(bot, family.id, force_new=True)
 
     assert len(bot.sent) == 2
-    assert bot.edited == []
+    assert len(bot.edited) == 1
+    assert bot.edit_kwargs[0]["reply_markup"] is None
 
 
 # --- Раскладка --------------------------------------------------------------
@@ -276,24 +277,25 @@ def test_unused_events_do_not_reappear_during_a_timer():
     labels = {button.text for row in keyboards.panel(
         running_kind="pump", running_id=7
     ).inline_keyboard for button in row}
-    assert labels == {"⏹ Закончить сейчас", "🕐 Указать время окончания"}
+    assert labels == {"Завершить таймер", "⋯"}
 
 
 def test_the_panel_keeps_its_own_finish_button():
     labels = {button.text for row in keyboards.panel(
         running_kind="sleep", running_id=7
     ).inline_keyboard for button in row}
-    assert "⏹ Закончить сейчас" in labels
+    assert "Завершить сон" in labels
 
 
 def test_the_start_confirmation_has_two_bound_actions():
-    from bot.keyboards import TimeCB
+    from bot.keyboards import TimeCB, TimerCB
 
     buttons = [button for row in keyboards.running("sleep", row_id=7).inline_keyboard
                for button in row]
-    assert [b.text for b in buttons] == ["⏹ Закончить сейчас", "🕐 Указать время окончания"]
-    callbacks = [TimeCB.unpack(b.callback_data) for b in buttons]
-    assert [(cb.action, cb.row_id) for cb in callbacks] == [("stop", 7), ("ask", 7)]
+    assert [b.text for b in buttons] == ["Завершить сон", "⋯"]
+    stop, menu = TimeCB.unpack(buttons[0].callback_data), TimerCB.unpack(buttons[1].callback_data)
+    assert (stop.action, stop.row_id) == ("stop", 7)
+    assert (menu.action, menu.row_id) == ("menu", 7)
 
 
 def test_a_card_without_row_id_cannot_stop_an_arbitrary_timer():
