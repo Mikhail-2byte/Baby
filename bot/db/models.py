@@ -402,3 +402,53 @@ class RecordRevision(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
     undone_at: Mapped[datetime | None] = mapped_column(DateTime)
     undo_actor_id: Mapped[int | None] = mapped_column(ForeignKey("members.id"))
+
+
+class Moment(Base):
+    """Семейное воспоминание; не участвует в медицинской статистике."""
+
+    __tablename__ = "moments"
+    __table_args__ = {"sqlite_autoincrement": True}
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    child_id: Mapped[int] = mapped_column(ForeignKey("children.id"), index=True)
+    author_id: Mapped[int] = mapped_column(ForeignKey("members.id"))
+    on_date: Mapped[date] = mapped_column(Date, index=True)
+    title: Mapped[str] = mapped_column(Text, default="")
+    description: Mapped[str] = mapped_column(Text, default="")
+    topic: Mapped[str] = mapped_column(String(24), default="other")
+    version: Mapped[int] = mapped_column(Integer, default=1)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    photos: Mapped[list["MomentPhoto"]] = relationship(
+        lazy="selectin", order_by="MomentPhoto.position"
+    )
+
+
+class MomentPhoto(Base):
+    __tablename__ = "moment_photos"
+    __table_args__ = (
+        UniqueConstraint("moment_id", "position"), {"sqlite_autoincrement": True},
+    )
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    moment_id: Mapped[int] = mapped_column(ForeignKey("moments.id"), index=True)
+    position: Mapped[int] = mapped_column(Integer)
+    caption: Mapped[str] = mapped_column(Text, default="")
+    file_id: Mapped[str] = mapped_column(Text)
+    file_unique_id: Mapped[str] = mapped_column(Text)
+    local_path: Mapped[str] = mapped_column(Text)
+    media_group_id: Mapped[str | None] = mapped_column(Text)
+
+
+class MomentDraft(Base):
+    """Один сохраняемый черновик на автора в семье; id защищает старые кнопки."""
+
+    __tablename__ = "moment_drafts"
+    __table_args__ = (
+        UniqueConstraint("family_id", "author_id"), {"sqlite_autoincrement": True},
+    )
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    family_id: Mapped[int] = mapped_column(ForeignKey("families.id"), index=True)
+    child_id: Mapped[int] = mapped_column(ForeignKey("children.id"), index=True)
+    author_id: Mapped[int] = mapped_column(ForeignKey("members.id"))
+    payload: Mapped[str] = mapped_column(Text)
+    saved_id: Mapped[int | None] = mapped_column(Integer)
+    command_message_id: Mapped[int | None] = mapped_column(BigInteger)

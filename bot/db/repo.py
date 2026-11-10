@@ -9,11 +9,13 @@
 потерять запись о кормлении.
 """
 
+import json
 import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from datetime import date, datetime, timedelta
+from typing import Any
 
 from sqlalchemy import and_, delete, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -27,6 +29,9 @@ from bot.db.models import (
     Family,
     Measurement,
     Member,
+    Moment,
+    MomentDraft,
+    MomentPhoto,
     ProcessedMessage,
     RecordRevision,
     Reminder,
@@ -1057,3 +1062,127 @@ async def add_usage(
         )
     )
     await _commit(session)
+
+
+# --- Моменты -------------------------------------------------------------
+
+
+async def moment_draft(
+    session: AsyncSession, family_id: int, author_id: int,
+) -> MomentDraft | None:
+    return await session.scalar(select(MomentDraft).where(
+        MomentDraft.family_id == family_id, MomentDraft.author_id == author_id,
+    ).execution_options(populate_existing=True))
+
+
+async def put_moment_draft(
+    session: AsyncSession, family_id: int, child_id: int, author_id: int,
+    data: dict[str, Any], command_message_id: int | None = None,
+) -> MomentDraft:
+    old = await moment_draft(session, family_id, author_id)
+    if old is not None:
+        await session.delete(old)
+        await session.flush()
+    draft = MomentDraft(
+        family_id=family_id, child_id=child_id, author_id=author_id,
+        payload=json.dumps(data, ensure_ascii=False), command_message_id=command_message_id,
+    )
+    session.add(draft)
+    await _commit(session)
+    return draft
+
+
+async def update_moment_draft(
+    session: AsyncSession, draft: MomentDraft, data: dict[str, Any],
+) -> None:
+    draft.payload = json.dumps(data, ensure_ascii=False)
+    await _commit(session)
+
+
+async def drop_moment_draft(session: AsyncSession, draft: MomentDraft) -> None:
+    await session.delete(draft)
+    await _commit(session)
+
+
+async def get_moment(session: AsyncSession, child_id: int, row_id: int) -> Moment | None:
+    return await session.scalar(select(Moment).where(
+        Moment.id == row_id, Moment.child_id == child_id,
+    ).execution_options(populate_existing=True))
+
+
+async def list_moments(
+    session: AsyncSession, child_id: int, *, topic: str = "", query: str = "",
+    first: date | None = None, last: date | None = None,
+    offset: int = 0, limit: int | None = None, ascending: bool = False,
+) -> list[Moment]:
+    statement = select(Moment).where(Moment.child_id == child_id)
+    if topic:
+        statement = statement.where(Moment.topic == topic)
+    if first is not None:
+        statement = statement.where(Moment.on_date >= first)
+    if last is not None:
+        statement = statement.where(Moment.on_date <= last)
+    # SQLite lower/LIKE не умеют кириллицу. casefold выполняется ниже одинаково
+    # для всех текстовых полей; семейные альбомы невелики.
+    order = (Moment.on_date, Moment.id) if ascending else (
+        Moment.on_date.desc(), Moment.id.desc(),
+    )
+    found = list(await session.scalars(statement.order_by(*order)))
+    if query:
+        needle = query.casefold()
+        found = [m for m in found if needle in "\n".join([
+            m.title, m.description, *(p.caption for p in m.photos),
+        ]).casefold()]
+    return found[offset:] if limit is None else found[offset:offset + limit]
+
+
+async def save_moment(
+    session: AsyncSession, draft: MomentDraft, data: dict[str, Any],
+) -> Moment:
+    if draft.saved_id is not None:
+        saved = await get_moment(session, draft.child_id, draft.saved_id)
+        if saved is None:
+            raise ValueError("Эта запись уже удалена.")
+        return saved
+    target = data.get("target")
+    if target:
+        moment = await get_moment(session, draft.child_id, target)
+        if moment is None or moment.version != data["version"]:
+            raise ValueError("Запись уже изменена или удалена. Откройте её заново.")
+        moment.version += 1
+        await session.execute(delete(MomentPhoto).where(MomentPhoto.moment_id == moment.id))
+        await session.flush()
+    else:
+        moment = Moment(child_id=draft.child_id, author_id=draft.author_id)
+        session.add(moment)
+    moment.on_date = date.fromisoformat(data["date"])
+    moment.title = data["title"]
+    moment.description = data["description"]
+    moment.topic = data["topic"]
+    await session.flush()
+    for position, photo in enumerate(data["photos"]):
+        session.add(MomentPhoto(
+            moment_id=moment.id, position=position, caption=photo["caption"],
+            file_id=photo["file_id"], file_unique_id=photo["file_unique_id"],
+            local_path=photo["path"], media_group_id=photo.get("group"),
+        ))
+    draft.saved_id = moment.id
+    await _commit(session)
+    await session.refresh(moment, ["photos"])
+    return moment
+
+
+async def delete_moment(session: AsyncSession, moment: Moment) -> list[str]:
+    paths = [p.local_path for p in moment.photos]
+    drafts = list(await session.scalars(select(MomentDraft).where(
+        MomentDraft.child_id == moment.child_id,
+    )))
+    for draft in drafts:
+        data = json.loads(draft.payload)
+        if draft.saved_id == moment.id or data.get("target") == moment.id:
+            paths.extend(p["path"] for p in data.get("photos", []) if p.get("path"))
+            await session.delete(draft)
+    await session.execute(delete(MomentPhoto).where(MomentPhoto.moment_id == moment.id))
+    await session.delete(moment)
+    await _commit(session)
+    return paths

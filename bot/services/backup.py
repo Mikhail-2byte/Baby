@@ -14,13 +14,16 @@
 ровно как подменяет `ticker.Session`.
 """
 
+import asyncio
 import logging
 import os
+import shutil
 from datetime import date, datetime
 from pathlib import Path
 
 from bot.config import settings
 from bot.db.session import engine
+from bot.services import moment_files
 from bot.services import timeutil as tu
 
 log = logging.getLogger(__name__)
@@ -92,11 +95,11 @@ async def run_daily(now: datetime | None = None) -> Path | None:
 
     today = tu.local_today(settings.tz_default, now)
     dest = path_for(today)
-    if dest.exists() or _failed_on == today:
+    if (dest.exists() and dest.with_suffix(".album").exists()) or _failed_on == today:
         return None
 
     try:
-        await snapshot(dest)
+        await bundle(dest)
     except Exception:
         _failed_on = today
         log.exception("Бэкап за %s не снят — до конца суток больше не пробуем", today)
@@ -105,6 +108,17 @@ async def run_daily(now: datetime | None = None) -> Path | None:
     log.info("Бэкап: %s", dest.name)
     rotate(settings.backup_keep)
     return dest
+
+
+async def bundle(dest: Path) -> list[Path]:
+    """Согласованный комплект. snapshot() остаётся прежним API для инструментов."""
+    from bot.services.moment_export import backup_parts
+
+    async with moment_files.storage_lock:
+        await snapshot(dest)
+        return await asyncio.to_thread(
+            backup_parts, dest, moment_files.root(), dest.with_suffix(".album"),
+        )
 
 
 def rotate(keep: int) -> None:
@@ -119,6 +133,11 @@ def rotate(keep: int) -> None:
         found = sorted(DIR.glob(f"{PREFIX}*{SUFFIX}"))
         for stale in found[:-keep]:
             stale.unlink()
+            album = stale.with_suffix(".album").resolve()
+            if not album.is_relative_to(DIR.resolve()) or album == DIR.resolve():
+                raise ValueError("Каталог копии выходит за пределы backups")
+            if album.exists():
+                shutil.rmtree(album)
             log.info("Бэкап удалён по ротации: %s", stale.name)
     except Exception:
         log.exception("Ротация бэкапов не удалась")

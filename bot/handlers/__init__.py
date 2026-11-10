@@ -72,6 +72,7 @@ from bot.handlers import (
     home,
     journal,
     measure,
+    moments,
     qa,
     record,
     remind,
@@ -83,6 +84,8 @@ from bot.handlers import (
 
 routers: list[Router] = [
     common.router,
+    # Только явные команды/ответы альбома. Внутри сохраняется alarm.assess/respond.
+    moments.router,
     alarm.router,
     home.router,
     views.router,

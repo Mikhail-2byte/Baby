@@ -20,9 +20,14 @@
 
 from __future__ import annotations
 
+import shutil
 import sqlite3
+from pathlib import Path
 
 WIPE_ORDER = (
+    "moment_photos",
+    "moment_drafts",
+    "moments",
     # `usage` первой: она ссылается и на `families`, и на `members`, а на неё
     # не ссылается никто. Чистить её обязательно — оставленная при удалённых
     # семьях, она дала бы висячие ключи, и `reset.py` честно напечатал бы их в
@@ -63,6 +68,10 @@ KEPT = ("who_lms", "alembic_version")
 # первым молча. У событий, измерений и тревог своего `family_id` нет вовсе: они
 # висят на ребёнке, и это единственная причина, по которой условия разные.
 SCOPE = {
+    "moment_photos": "moment_id IN (SELECT id FROM moments WHERE child_id IN "
+                     "(SELECT id FROM children WHERE family_id = ?))",
+    "moment_drafts": "family_id = ?",
+    "moments": "child_id IN (SELECT id FROM children WHERE family_id = ?)",
     "processed_messages": "chat_id IN (SELECT chat_id FROM families WHERE id = ?)",
     "record_revisions": "child_id IN (SELECT id FROM children WHERE family_id = ?)",
     "usage": "family_id = ?",
@@ -93,14 +102,39 @@ def _check() -> None:
 _check()
 
 
+def _photo_directories(conn: sqlite3.Connection, family_id: int | None = None) -> list[Path]:
+    db = next((row[2] for row in conn.execute("PRAGMA database_list") if row[1] == "main"), "")
+    if not db:
+        return []
+    base = (Path(db).parent / "moments").resolve()
+    statement = "SELECT id FROM children"
+    children = conn.execute(statement if family_id is None else statement + " WHERE family_id = ?",
+                            () if family_id is None else (family_id,))
+    result = []
+    for (child_id,) in children:
+        path = (base / str(child_id)).resolve()
+        if not path.is_relative_to(base) or path == base:
+            raise ValueError("Каталог фотографий выходит за пределы хранилища")
+        result.append(path)
+    return result
+
+
+def _remove_directories(paths: list[Path]) -> None:
+    for path in paths:
+        if path.exists():
+            shutil.rmtree(path)
+
+
 def wipe(conn: sqlite3.Connection) -> dict[str, int]:
     """Удалить все семейные данные. Коммитит сам, соединение не закрывает."""
     conn.execute("PRAGMA foreign_keys = ON")
+    photos = _photo_directories(conn)
     wiped: dict[str, int] = {}
     for table in WIPE_ORDER:
         cursor = conn.execute(f"DELETE FROM {table}")  # noqa: S608 — имена свои
         wiped[table] = cursor.rowcount
     conn.commit()
+    _remove_directories(photos)
     return wiped
 
 
@@ -113,6 +147,7 @@ def wipe_family(conn: sqlite3.Connection, family_id: int) -> dict[str, int]:
     первой же таблице, на которую кто-то ссылается.
     """
     conn.execute("PRAGMA foreign_keys = ON")
+    photos = _photo_directories(conn, family_id)
     wiped: dict[str, int] = {}
     for table in WIPE_ORDER:
         cursor = conn.execute(
@@ -121,4 +156,5 @@ def wipe_family(conn: sqlite3.Connection, family_id: int) -> dict[str, int]:
         )
         wiped[table] = cursor.rowcount
     conn.commit()
+    _remove_directories(photos)
     return wiped

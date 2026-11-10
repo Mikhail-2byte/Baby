@@ -4,3 +4,4 @@ pytest-asyncio>=0.24
 pytest-cov>=6.0
 ruff>=0.16
 mypy>=1.13
+pypdf>=5,<7

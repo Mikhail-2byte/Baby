@@ -68,6 +68,17 @@ def _backup_dir(tmp_path, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _moment_files(tmp_path, monkeypatch):
+    from bot.services import moment_files, moments
+
+    moments._album_hints.clear()
+    monkeypatch.setattr(moment_files, "root", lambda: tmp_path / "moments")
+    monkeypatch.setattr(moment_files, "storage_lock", asyncio.Lock())
+    yield
+    moments._album_hints.clear()
+
+
+@pytest.fixture(autouse=True)
 def _qa_log(tmp_path, monkeypatch):
     """Лог вопросов и счётчик квоты уводятся в tmp.
 

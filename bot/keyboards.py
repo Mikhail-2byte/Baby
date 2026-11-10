@@ -383,6 +383,7 @@ def panel(
 
 def more() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📖 Моменты", callback_data="mo:home:0:")],
         [InlineKeyboardButton(text="⚖️ Вес", callback_data=MeasureCB(kind="weight").pack()),
          InlineKeyboardButton(text="📖 История", callback_data=RecordCB(action="list").pack())],
         [InlineKeyboardButton(text="🕐 Напоминания о таймере", callback_data=NudgeCB(

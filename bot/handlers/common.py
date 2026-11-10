@@ -19,9 +19,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from bot import keyboards, texts
 from bot.config import settings
 from bot.db import repo
-from bot.db.models import Child, Family
+from bot.db.models import Child, Family, Member
 from bot.filters import IN_GROUP, IN_PRIVATE
-from bot.services import backup, panel, pending, sending
+from bot.services import backup, moment_files, moments, panel, pending, sending
 from bot.services import timeutil as tu
 
 log = logging.getLogger(__name__)
@@ -225,12 +225,19 @@ async def show_panel(message: Message, bot: Bot, family: Family) -> None:
 
 
 @router.message(IN_GROUP, Command("cancel"))
-async def cancel(message: Message, state: FSMContext, family: Family) -> None:
+async def cancel(
+    message: Message, state: FSMContext, family: Family,
+    session: AsyncSession | None = None, member: Member | None = None,
+) -> None:
     waiting = (pending.peek(family.chat_id, message.from_user.id)
                if message.from_user is not None else None)
     if message.from_user is not None:
         pending.forget(family.chat_id, message.from_user.id)
-    if await state.get_state() is None and waiting is None:
+    cancelled_moment = False
+    if session is not None and member is not None:
+        async with moment_files.storage_lock:
+            cancelled_moment = await moments.cancel(session, family.id, member.id)
+    if await state.get_state() is None and waiting is None and not cancelled_moment:
         await message.answer(texts.NOTHING_TO_CANCEL, reply_markup=keyboards.home())
         return
     await state.clear()
@@ -279,7 +286,7 @@ async def make_backup(message: Message, family: Family) -> None:
     day = tu.local_today(family.tz)
     dest = backup.path_for(day)
     try:
-        await backup.snapshot(dest)
+        parts = await backup.bundle(dest)
     except Exception:
         # Единственное место, где сбой бэкапа виден человеку: ежедневный молчит
         # в лог, а тот, кто нажал сам, обязан узнать, что файла не будет
@@ -290,6 +297,7 @@ async def make_backup(message: Message, family: Family) -> None:
         )
         return
 
-    await message.answer_document(
-        FSInputFile(dest), caption=f"Копия базы за {day.isoformat()}"
-    )
+    for part in parts:
+        await message.answer_document(
+            FSInputFile(part), caption=f"База и фотографии за {day.isoformat()} · {part.name}"
+        )

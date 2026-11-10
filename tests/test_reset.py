@@ -104,6 +104,20 @@ def _fill(path: Path, family_id: int = 1, chat_id: int = CHAT_ID) -> None:
             "INSERT OR IGNORE INTO who_lms (sex, indicator, age_days, l, m, s) "
             "VALUES ('f', 'weight', 0, 0.3809, 3.2322, 0.14171)"
         )
+        conn.execute(
+            "INSERT INTO moments(id, child_id, author_id, on_date, title, description, topic, "
+            "version) VALUES (?, ?, ?, ?, '', 'Первый переворот', 'achievement', 1)",
+            (fid, fid, fid, date.today().isoformat()),
+        )
+        conn.execute(
+            "INSERT INTO moment_photos(moment_id, position, caption, file_id, file_unique_id, "
+            "local_path) VALUES (?, 0, 'Памятный день', 'f', 'u', ?)",
+            (fid, f"{fid}/photo.jpg"),
+        )
+        conn.execute(
+            "INSERT INTO moment_drafts(family_id, child_id, author_id, payload) "
+            "VALUES (?, ?, ?, '{}')", (fid, fid, fid),
+        )
         conn.commit()
     finally:
         conn.close()
